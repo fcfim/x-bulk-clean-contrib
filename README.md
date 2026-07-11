@@ -31,13 +31,20 @@
 ## Install from source
 
 1. Download or clone this repository.
-2. Open `chrome://extensions` in Chrome.
-3. Enable **Developer mode**.
-4. Choose **Load unpacked**.
-5. Select the `openx-cleaner` folder.
+2. Open `chrome://extensions` in Google Chrome.
+3. Enable **Developer mode** (toggle in the top-right corner).
+4. Click **Load unpacked** (top-left corner).
+5. Select the `src` folder inside the cloned repository.
 6. Sign in to X, open the extension, and choose an action.
 
 Preview & Select mode requires Chrome 116 or newer.
+
+## Development & Packaging
+
+To bundle the extension into a clean ZIP archive ready for the Chrome Web Store:
+1. Make the packaging script executable (if not already): `chmod +x package.sh`
+2. Run `./package.sh` in the project root.
+3. This creates a release-ready `x-bulk-clean-v<version>.zip` excluding git metadata, documentation, and editor files.
 
 ## Important safety notes
 
