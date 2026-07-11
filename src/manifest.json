@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "name": "X Bulk Clean",
+  "version": "1.3.0",
+  "description": "Free bulk cleanup tools for X. Delete posts/replies, remove likes/reposts, manage follows, and export CSV backups locally.",
+  "author": "X Bulk Clean contributors",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "tabs",
+    "storage",
+    "unlimitedStorage",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://twitter.com/*",
+    "https://x.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_ui": {
+    "page": "history/history.html",
+    "open_in_tab": true
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}

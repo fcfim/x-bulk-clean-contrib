@@ -1,0 +1,21 @@
+# OS files
+.DS_Store
+Thumbs.db
+*.db
+
+# IDEs/Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+*.zip
