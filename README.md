@@ -5,6 +5,18 @@
 <h1 align="center">X Bulk Clean</h1>
 
 <p align="center">
+  <a href="https://chromewebstore.google.com/detail/bcpkijoolaciolfegopiaifmoedbolgg">
+    <img src="https://img.shields.io/chrome-web-store/v/bcpkijoolaciolfegopiaifmoedbolgg" alt="Chrome Web Store version">
+  </a>
+  <a href="https://chromewebstore.google.com/detail/bcpkijoolaciolfegopiaifmoedbolgg">
+    <img src="https://img.shields.io/chrome-web-store/users/bcpkijoolaciolfegopiaifmoedbolgg" alt="Chrome Web Store users">
+  </a>
+  <a href="https://github.com/agmmnn/x-bulk-clean/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/agmmnn/x-bulk-clean" alt="MIT License">
+  </a>
+</p>
+
+<p align="center">
   <a href="https://github.com/agmmnn/x-bulk-clean">github.com/agmmnn/x-bulk-clean</a>
 </p>
 
@@ -27,6 +39,14 @@
 - Export activity backups as CSV
 - Optional performance mode that reduces tweet-media rendering during automated runs
 - No analytics, payment service, or external backend
+
+## Install from Chrome Web Store
+
+The easiest way to install X Bulk Clean:
+
+1. Visit the [Chrome Web Store listing](https://chromewebstore.google.com/detail/bcpkijoolaciolfegopiaifmoedbolgg).
+2. Click **Add to Chrome**.
+3. Sign in to X, open the extension, and choose an action.
 
 ## Install from source
 
