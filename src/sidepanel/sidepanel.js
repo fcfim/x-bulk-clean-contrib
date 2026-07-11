@@ -392,13 +392,30 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     }
     return false;
   };
+  const detectIssue = () => {
+    const toast = document.querySelector('[data-testid="toast"]') || document.querySelector('[role="alert"]');
+    const text = (toast?.textContent || '').trim();
+    if (/rate.?limit|too many requests|please wait a few moments/i.test(text)) return 'Rate limited by X — wait a few moments before starting another job';
+    if (/try again|something went wrong|unable|locked|restrict|exceeded/i.test(text)) return text.slice(0, 200);
+    return null;
+  };
+  const stopIfIssue = async (waitMs = 0) => {
+    const deadline = Date.now() + waitMs;
+    do {
+      const issue = detectIssue();
+      if (issue) { await stop(issue); return true; }
+      if (Date.now() >= deadline) break;
+      await sleep(100);
+    } while (X.interval);
+    return false;
+  };
   const counts = () => ({ tweets: X.backup.tweets.length, replies: X.backup.replies.length, unliked: 0, unreposted: X.backup.unreposted.length, follows: 0, unfollows: X.backup.unfollows.length });
   const persist = async reason => {
     if (X.historySaved) return;
     X.historySaved = true;
     const completedAt = Date.now(), jobCounts = counts();
     const total = jobCounts.tweets + jobCounts.replies + jobCounts.unreposted + jobCounts.unfollows;
-    const status = /^Finished/i.test(reason || '') ? 'completed' : /Stopped by user/i.test(reason || '') ? 'stopped' : 'interrupted';
+    const status = /rate.?limit/i.test(reason || '') ? 'rate_limited' : /^Finished/i.test(reason || '') ? 'completed' : /Stopped by user/i.test(reason || '') ? 'stopped' : 'interrupted';
     const summary = { id: X.jobId, action, account, startedAt: X.startedAt, completedAt, durationMs: completedAt-X.startedAt, status, statusText: reason || 'Action finished', total, counts: jobCounts, selectedTotal: selected.size, skipped: Math.max(0, selected.size-total) };
     try {
       const stored = await chrome.storage.local.get(['jobHistory']);
@@ -422,13 +439,13 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     const object = type === 'unfollow' ? 'accounts' : type;
     shadow.innerHTML=`<style>*{box-sizing:border-box}.c{width:290px;padding:14px;border-radius:14px;background:rgba(20,20,20,.96);color:#fff;box-shadow:0 18px 48px rgba(0,0,0,.35);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.k{color:#8fd5ae;font-size:10px;font-weight:750;letter-spacing:.09em;text-transform:uppercase}h2{margin:6px 0 4px;font-size:16px}.a,.m{color:#aaa;font-size:11px}.m{margin-top:10px;font-variant-numeric:tabular-nums}button{width:100%;height:38px;margin-top:11px;border:1px solid rgba(255,90,85,.28);border-radius:8px;background:rgba(255,90,85,.12);color:#ff8580;font-weight:750;cursor:pointer}</style><section class="c"><div class="k">X Bulk Clean running</div><h2>${verb} selected ${object}</h2><div class="a"></div><div id="count" class="m">0 of ${selected.size} ${progressVerb}</div><button id="stop">Stop current action</button></section>`;
     shadow.querySelector('.a').textContent=account?.username?`@${account.username}`:'Active account';
-    shadow.getElementById('stop').addEventListener('click',()=>stop('Stopped by user'));
+    shadow.getElementById('stop').addEventListener('click',()=>/rate.?limit/i.test(X.issue||'')?X.overlayHost?.remove():stop('Stopped by user'));
     (document.body||document.documentElement).appendChild(host); X.overlayHost=host; updateOverlay(); X.overlayTimer=setInterval(updateOverlay,500);
   };
   const stop = async reason => {
     if (X.interval) clearInterval(X.interval); if (X.keepAlive) clearInterval(X.keepAlive); if (X.overlayTimer) clearInterval(X.overlayTimer);
     X.interval=null;X.keepAlive=null;X.issue=reason;X.performanceStyle?.remove();updateOverlay();
-    const shadow=X.overlayHost?.shadowRoot;if(shadow){shadow.querySelector('.k').textContent=reason;shadow.getElementById('stop').disabled=true;setTimeout(()=>X.overlayHost?.remove(),2200)}
+    const shadow=X.overlayHost?.shadowRoot;if(shadow){shadow.querySelector('.k').textContent=reason;const button=shadow.getElementById('stop');if(/rate.?limit/i.test(reason||'')){button.textContent='Dismiss';button.disabled=false}else{button.disabled=true;setTimeout(()=>X.overlayHost?.remove(),2200)}}
     await persist(reason);
   };
   window.__xCleanerStop=()=>stop('Stopped by user');
@@ -437,6 +454,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
   X.interval=setInterval(async()=>{
     if(X.busy||!X.interval)return;X.busy=true;
     try{
+      const issue=detectIssue();if(issue){await stop(issue);return}
       const candidates=[];
       if(type==='unfollow'){
         for(const cell of document.querySelectorAll('[data-testid="UserCell"]')){
@@ -464,7 +482,9 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
       for(const {id,control} of candidates){
         if(!X.interval)break;X.processed.add(id);const snap=selected.get(id);control.click();await sleep(600);
         if(type==='unfollow'){
-          if(await clickConfirm('confirmationSheetConfirm')){
+          const confirmed=await clickConfirm('confirmationSheetConfirm');
+          if(await stopIfIssue(confirmed?900:0))break;
+          if(confirmed){
             X.stats.unfollows++;X.backup.unfollows.push({username:snap.username||id,displayName:snap.displayName||snap.text||id,profileUrl:snap.url?.startsWith('/')?`https://x.com${snap.url}`:snap.url||`https://x.com/${id}`,action:'unfollowed',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
           }
           await sleep(850);

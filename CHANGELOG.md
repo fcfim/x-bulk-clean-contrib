@@ -12,6 +12,7 @@ All notable changes are documented here. Releases before `1.4.0` are not reconst
 - 🛡️ Active-account display, destructive-action confirmations, job locking, and an in-page progress overlay with stop control.
 - 📦 Persistent job history with per-job details, individual CSV downloads, and a single **Download all CSV** export.
 - ⚡ Performance mode for reducing media rendering while scans and cleanup jobs run.
+- 🔗 Quick access to the GitHub repository from the popup header.
 
 ### Changed 🎨
 
@@ -23,3 +24,4 @@ All notable changes are documented here. Releases before `1.4.0` are not reconst
 
 - 🔓 Quick Clean actions now end an existing Preview session only after confirmation instead of becoming blocked by a stale preview lock.
 - 🧠 Reply cleanup no longer needs a second main-profile scan; the Posts + replies mode keeps standalone items available for manual selection.
+- ⏸️ Rate Limit Guard stops follow and unfollow jobs immediately when X reports a rate limit, avoids counting failed actions, and records the job as rate limited.

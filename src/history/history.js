@@ -235,7 +235,7 @@ function createJobCard(job) {
   main.append(title, meta);
   const status = document.createElement('span');
   status.className = `status ${job.status || 'interrupted'}`;
-  status.textContent = job.status || 'interrupted';
+  status.textContent = (job.status || 'interrupted').replaceAll('_', ' ');
   const count = document.createElement('span');
   count.className = 'job-count';
   const number = document.createElement('strong');

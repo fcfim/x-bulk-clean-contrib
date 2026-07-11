@@ -375,7 +375,10 @@ function runWorker(action, performanceMode, account) {
       };
       avatar.src = account.avatarUrl;
     }
-    shadow.getElementById('jobStop').addEventListener('click', () => stopAll('Stopped by user'));
+    shadow.getElementById('jobStop').addEventListener('click', () => {
+      if (/rate.?limit/i.test(X.issue || '')) X.overlayHost?.remove();
+      else stopAll('Stopped by user');
+    });
     (document.body || document.documentElement).appendChild(host);
     X.overlayHost = host;
     updateJobOverlay();
@@ -390,8 +393,15 @@ function runWorker(action, performanceMode, account) {
     if (!shadow) return;
     shadow.querySelector('.card')?.classList.add('done');
     shadow.getElementById('jobState').textContent = reason || 'Action finished';
-    shadow.getElementById('jobStop').disabled = true;
-    setTimeout(() => X.overlayHost?.remove(), 2200);
+    const button = shadow.getElementById('jobStop');
+    if (/rate.?limit/i.test(reason || '')) {
+      shadow.querySelector('.card')?.classList.add('limited');
+      button.textContent = 'Dismiss';
+      button.disabled = false;
+    } else {
+      button.disabled = true;
+      setTimeout(() => X.overlayHost?.remove(), 2200);
+    }
   }
 
   function cleanUpPerformanceMode() {
@@ -520,6 +530,9 @@ function runWorker(action, performanceMode, account) {
     const toast = document.querySelector('[data-testid="toast"]') || document.querySelector('[role="alert"]');
     if (toast) {
       const text = (toast.textContent || '').trim();
+      if (/rate.?limit|too many requests|please wait a few moments/i.test(text)) {
+        return 'Rate limited by X — wait a few moments before starting another job';
+      }
       if (/try again|something went wrong|rate.?limit|unable|locked|restrict|exceeded|too many/i.test(text)) {
         return text.slice(0, 200);
       }
@@ -530,6 +543,20 @@ function runWorker(action, performanceMode, account) {
       return 'Login required';
     }
     return null;
+  }
+
+  async function stopIfIssue(waitMs = 0) {
+    const deadline = Date.now() + waitMs;
+    do {
+      const issue = detectIssue();
+      if (issue) {
+        await stopAll(issue);
+        return true;
+      }
+      if (Date.now() >= deadline) break;
+      await sleep(100);
+    } while (X.interval);
+    return false;
   }
 
   async function persistJob(reason) {
@@ -545,7 +572,9 @@ function runWorker(action, performanceMode, account) {
       unfollows: X.backup.unfollows.length
     };
     const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
-    const status = /^Finished/i.test(reason || '')
+    const status = /rate.?limit/i.test(reason || '')
+      ? 'rate_limited'
+      : /^Finished/i.test(reason || '')
       ? 'completed'
       : /Stopped by user/i.test(reason || '') ? 'stopped' : 'interrupted';
     const summary = {
@@ -884,6 +913,7 @@ function runWorker(action, performanceMode, account) {
           X.processed.add(key);
           const user = userSnap(cell);
           button.click();
+          if (await stopIfIssue(900)) break;
           X.stats.follows++;
           X.backup.follows.push({
             ...user,
@@ -943,7 +973,9 @@ function runWorker(action, performanceMode, account) {
           const user = userSnap(cell);
           button.click();
           await sleep(hidden() ? 700 : 500);
-          if (await clickConfirm('confirmationSheetConfirm')) {
+          const confirmed = await clickConfirm('confirmationSheetConfirm');
+          if (await stopIfIssue(confirmed ? 900 : 0)) break;
+          if (confirmed) {
             X.stats.unfollows++;
             X.backup.unfollows.push({ ...user, action: 'unfollowed', actionAt: new Date().toISOString() });
             await bumpAndCheckCap();
