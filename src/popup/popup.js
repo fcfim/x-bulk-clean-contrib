@@ -8,6 +8,7 @@ let isStarting = false;
 let clearHistoryTimer = null;
 let armedHistoryJob = null;
 let armedHistoryTimer = null;
+let previewSessionToEnd = null;
 
 const ACTION_LABELS = {
   delete: 'Deleting tweets',
@@ -50,9 +51,9 @@ const ACTION_CONFIRMATIONS = {
     icon: 'icon-repeat'
   },
   deleteReplies: {
-    title: 'Delete all replies?',
-    description: 'Replies will be permanently deleted as X Bulk Clean scans your Replies tab.',
-    button: 'Delete all replies',
+    title: 'Find replies safely',
+    description: 'Opens Preview & Select to identify normal and orphan replies before you choose what to delete.',
+    button: 'Open safe scan',
     icon: 'icon-message-x',
     danger: true
   },
@@ -1023,7 +1024,7 @@ function disableActionButtons(disabled) {
   if (moreActions) moreActions.inert = disabled;
 }
 
-async function openPreviewPanel() {
+async function openPreviewPanel(requestedType = null) {
   if (currentAction || isStarting) return;
   const tab = await findXTab();
   if (!tab) {
@@ -1031,6 +1032,7 @@ async function openPreviewPanel() {
     return;
   }
   try {
+    if (requestedType) await chrome.storage.local.set({ previewRequestedType: requestedType });
     await chrome.sidePanel.setOptions({ tabId: tab.id, path: 'sidepanel/sidepanel.html', enabled: true });
     await chrome.sidePanel.open({ tabId: tab.id });
     window.close();
@@ -1095,6 +1097,25 @@ async function findRunningWorker() {
   return null;
 }
 
+async function endPreviewSession(session) {
+  if (session?.tabId) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: session.tabId },
+        func: () => {
+          const preview = window.__xbcPreview;
+          if (preview?.interval) clearInterval(preview.interval);
+          preview?.style?.remove();
+          document.getElementById('__xbcPreviewPerformance')?.remove();
+          delete window.__xbcPreview;
+          delete window.__xbcPreviewStop;
+        }
+      });
+    } catch (_) {}
+  }
+  await chrome.storage.local.remove(['activePreviewSession']);
+}
+
 async function requestAction(action) {
   if (currentAction || isStarting || pendingAction) {
     updateStats(`${ACTION_LABELS[currentAction] || 'Another action is already running'}...`);
@@ -1106,17 +1127,19 @@ async function requestAction(action) {
     currentAction = stored.activeAction;
     disableActionButtons(true);
     updateStats(`${ACTION_LABELS[currentAction] || 'Processing'}...`);
+    window.close();
     return;
   }
-  if (stored.activePreviewSession) {
-    updateStats('A Preview & Select session is active. Open it or end that session before using Quick Clean.', action);
+  if (action === 'deleteReplies') {
+    await openPreviewPanel(stored.activePreviewSession ? null : 'replies');
     return;
   }
-
   pendingAction = action;
+  previewSessionToEnd = stored.activePreviewSession || null;
   const account = await renderCurrentAccount();
   if (!account?.username) {
     pendingAction = null;
+    previewSessionToEnd = null;
     updateStats('Open X and sign in before starting a cleanup.', action);
     return;
   }
@@ -1124,10 +1147,13 @@ async function requestAction(action) {
   const config = ACTION_CONFIRMATIONS[action];
   if (!config) {
     pendingAction = null;
+    previewSessionToEnd = null;
     return;
   }
   $('confirmTitle').textContent = config.title;
-  $('confirmDescription').textContent = config.description;
+  $('confirmDescription').textContent = previewSessionToEnd
+    ? `${config.description} Your current Preview & Select scan will end when this action starts.`
+    : config.description;
   $('confirmAccount').textContent = `@${account.username}`;
   $('confirmStart').textContent = config.button;
   $('confirmStart').classList.toggle('danger', !!config.danger);
@@ -1135,9 +1161,11 @@ async function requestAction(action) {
   $('confirmDialog').showModal();
 }
 
-async function startAction(action) {
+async function startAction(action, previewSession = null) {
   if (!action || currentAction || isStarting) return;
   isStarting = true;
+
+  if (previewSession) await endPreviewSession(previewSession);
 
   const existingWorker = await findRunningWorker();
   if (existingWorker) {
@@ -1151,6 +1179,7 @@ async function startAction(action) {
     });
     disableActionButtons(true);
     updateStats(`${ACTION_LABELS[currentAction] || 'Processing'}...`);
+    window.close();
     return;
   }
 
@@ -1174,6 +1203,7 @@ async function startAction(action) {
       isStarting = false;
       disableActionButtons(true);
       updateStats(`${ACTION_LABELS[currentAction] || 'Processing'}...`);
+      window.close();
       return;
     }
   } catch (_) {}
@@ -1199,6 +1229,7 @@ async function startAction(action) {
       func: runWorker,
       args: [action, performanceMode, currentAccount || null]
     });
+    window.close();
   } catch (e) {
     updateStats(`Could not start: ${e.message}`);
     disableActionButtons(false);
@@ -1454,16 +1485,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('followAllFollowers').addEventListener('click', () => requestAction('followAll'));
   $('bulkUnfollow').addEventListener('click', () => requestAction('bulkUnfollow'));
   $('stopAction').addEventListener('click', stopAction);
-  $('openPreview').addEventListener('click', openPreviewPanel);
+  $('openPreview').addEventListener('click', () => openPreviewPanel());
 
   $('confirmCancel').addEventListener('click', () => $('confirmDialog').close());
   $('confirmStart').addEventListener('click', () => {
     const action = pendingAction;
+    const previewSession = previewSessionToEnd;
     pendingAction = null;
+    previewSessionToEnd = null;
     $('confirmDialog').close();
-    startAction(action);
+    startAction(action, previewSession);
   });
-  $('confirmDialog').addEventListener('close', () => { pendingAction = null; });
+  $('confirmDialog').addEventListener('close', () => { pendingAction = null; previewSessionToEnd = null; });
 
   $('viewAllHistory').addEventListener('click', () => chrome.runtime.openOptionsPage());
   $('clearRecentHistory').addEventListener('click', async () => {

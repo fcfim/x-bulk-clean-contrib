@@ -44,12 +44,16 @@
       line-height: 1.4;
     }
     body[data-running="true"] .intro,
+    body[data-running="true"] .section-label,
     body[data-running="true"] .action-list,
     body[data-running="true"] .more-actions,
     body[data-running="true"] .preference {
       opacity: 0.42;
       pointer-events: none;
       user-select: none;
+    }
+    .intro, .section-label, .action-list, .more-actions, .preference {
+      transition: opacity 160ms ease;
     }
 
     button, input { font: inherit; }
@@ -187,7 +191,7 @@
     .account-card[data-state="missing"] .account-state { color: var(--ink-tertiary); }
     .account-card[data-state="missing"] .account-state-dot { background: var(--ink-tertiary); box-shadow: none; }
 
-    .intro { margin-bottom: 13px; }
+    .intro { margin-bottom: 12px; }
     .intro h1 {
       margin: 0 0 3px;
       font-size: 17px;
@@ -202,30 +206,41 @@
       text-wrap: pretty;
     }
 
+    .section-label {
+      margin: 15px 2px 7px;
+      color: var(--ink-tertiary);
+      font-size: 9px;
+      font-weight: 750;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+    }
     .action-list {
       display: grid;
       gap: 7px;
     }
     .preview-button {
       width: 100%;
-      min-height: 42px;
-      margin: 9px 0 0;
+      min-height: 58px;
+      padding: 9px 10px;
       display: flex;
       align-items: center;
-      justify-content: center;
-      gap: 7px;
-      border: 1px solid rgba(40,120,200,.16);
-      border-radius: var(--radius-md);
-      background: var(--blue-soft);
-      color: var(--blue);
-      font-size: 12px;
-      font-weight: 700;
+      gap: 10px;
+      border: 0;
+      border-radius: var(--radius-lg);
+      background: var(--ink);
+      color: #fff;
+      text-align: left;
+      box-shadow: 0 1px 2px rgba(15,15,15,.18), 0 8px 24px rgba(15,15,15,.10);
       cursor: pointer;
-      transition: transform 120ms var(--ease-out), background 140ms ease;
+      transition: transform 140ms var(--ease-out), box-shadow 160ms ease, background-color 160ms ease;
     }
-    .preview-button .icon { width: 15px; height: 15px; }
-    .preview-button:active:not(:disabled) { transform: scale(.96); }
+    .preview-button .action-icon { background: rgba(255,255,255,.12); color: #fff; }
+    .preview-button .action-title { color: #fff; }
+    .preview-button .action-description { color: rgba(255,255,255,.62); }
+    .preview-button .action-arrow { color: rgba(255,255,255,.55); }
+    .preview-button:active:not(:disabled) { transform: scale(.97); }
     .preview-button:disabled { opacity:.42;cursor:not-allowed; }
+    .preview-button:focus-visible { outline: 3px solid rgba(40,120,200,.22); outline-offset: 2px; }
     .action-button {
       width: 100%;
       min-height: 50px;
@@ -240,9 +255,9 @@
       text-align: left;
       cursor: pointer;
       box-shadow: 0 1px 2px rgba(15, 15, 15, 0.025);
-      transition: transform 120ms var(--ease-out), background 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+      transition: transform 140ms var(--ease-out), background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
     }
-    .action-button:active:not(:disabled) { transform: scale(0.96); }
+    .action-button:active:not(:disabled) { transform: scale(0.97); }
     .action-button:focus-visible {
       outline: 3px solid rgba(40, 120, 200, 0.16);
       outline-offset: 1px;
@@ -278,6 +293,7 @@
     .action-arrow {
       color: var(--ink-tertiary);
       transform: translateX(-1px);
+      transition: transform 160ms var(--ease-out), color 160ms ease;
     }
     .action-arrow .icon { width: 16px; height: 16px; }
 
@@ -287,6 +303,9 @@
         background: #fcfcfb;
         box-shadow: 0 3px 10px rgba(15, 15, 15, 0.06);
       }
+      .action-button:hover:not(:disabled) .action-arrow,
+      .preview-button:hover:not(:disabled) .action-arrow { transform: translateX(2px); }
+      .preview-button:hover:not(:disabled) { background: #292927; box-shadow: 0 2px 4px rgba(15,15,15,.18), 0 10px 28px rgba(15,15,15,.14); }
     }
 
     .more-actions {
@@ -308,6 +327,7 @@
       cursor: pointer;
       list-style: none;
       user-select: none;
+      transition: background-color 160ms ease, color 160ms ease;
     }
     .more-actions summary::-webkit-details-marker { display: none; }
     .summary-chevron {
@@ -324,9 +344,13 @@
       grid-template-columns: 1fr 1fr;
       gap: 6px;
       border-top: 1px solid var(--border);
+      opacity: 1;
+      transform: translateY(0);
+      transition: opacity 180ms var(--ease-out), transform 180ms var(--ease-out);
+      @starting-style { opacity: 0; transform: translateY(-5px); }
     }
     .secondary-actions .action-button {
-      min-height: 38px;
+      min-height: 40px;
       margin-top: 7px;
       padding: 0 9px;
       justify-content: center;
@@ -336,6 +360,9 @@
     }
     .secondary-actions .icon { width: 14px; height: 14px; flex: 0 0 14px; }
     .secondary-actions .wide { grid-column: 1 / -1; margin-top: 0; }
+    @media (hover: hover) and (pointer: fine) {
+      .more-actions summary:hover { background: var(--surface); color: var(--ink); }
+    }
 
     .preference {
       min-height: 48px;
@@ -387,8 +414,11 @@
       transform-origin: bottom right;
       transition: opacity 140ms var(--ease-out), transform 140ms var(--ease-out);
     }
-    .info:hover::after, .info:focus-visible::after { opacity: 1; transform: translateY(0) scale(1); }
+    .info:focus-visible::after { opacity: 1; transform: translateY(0) scale(1); }
     .info:focus-visible { outline: 3px solid rgba(40, 120, 200, 0.16); }
+    @media (hover: hover) and (pointer: fine) {
+      .info:hover::after { opacity: 1; transform: translateY(0) scale(1); }
+    }
 
     .switch { position: relative; width: 40px; height: 24px; flex: 0 0 40px; cursor: pointer; }
     .switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
@@ -424,6 +454,10 @@
       border-radius: var(--radius-lg);
       background: var(--surface);
       box-shadow: inset 0 0 0 1px var(--border);
+      opacity: 1;
+      transform: translateY(0);
+      transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out);
+      @starting-style { opacity: 0; transform: translateY(6px); }
     }
     .status-head {
       display: flex;
@@ -458,10 +492,10 @@
       font-size: 11px;
       font-weight: 700;
       cursor: pointer;
-      transition: transform 120ms var(--ease-out), background 140ms ease;
+      transition: transform 140ms var(--ease-out), background-color 160ms ease;
     }
     #stopAction .icon { width: 13px; height: 13px; margin-right: 4px; display: inline-block; vertical-align: -2px; }
-    #stopAction:active:not(:disabled) { transform: scale(0.96); }
+    #stopAction:active:not(:disabled) { transform: scale(0.97); }
     #stopAction:disabled { display: none; }
     .stat-item {
       display: none;
@@ -481,6 +515,10 @@
       border-radius: var(--radius-lg);
       background: var(--surface);
       box-shadow: inset 0 0 0 1px var(--border);
+      opacity: 1;
+      transform: translateY(0);
+      transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out);
+      @starting-style { opacity: 0; transform: translateY(6px); }
     }
     .history-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; }
     .history-title { font-size: 12px; font-weight: 750; }
@@ -494,7 +532,9 @@
       font-size: 10px;
       font-weight: 650;
       cursor: pointer;
+      transition: transform 140ms var(--ease-out), background-color 160ms ease, color 160ms ease;
     }
+    .history-clear:active { transform: scale(.97); }
     .history-clear[data-confirm="true"] { background: var(--red-soft); color: var(--red); }
     .history-list { display: grid; gap: 5px; }
     .history-row {
@@ -506,14 +546,15 @@
       border-radius: var(--radius-md);
       background: #fff;
       box-shadow: inset 0 0 0 1px var(--border);
+      transition: transform 160ms var(--ease-out), box-shadow 160ms ease;
     }
     .history-row-copy { min-width: 0; flex: 1; }
     .history-row-title { display: block; overflow: hidden; font-size: 11.5px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
     .history-row-meta { display: block; margin-top: 1px; color: var(--ink-tertiary); font-size: 9.5px; font-variant-numeric: tabular-nums; }
     .history-row-count { color: var(--green); font-size: 10px; font-weight: 750; font-variant-numeric: tabular-nums; }
     .history-icon-button {
-      width: 30px;
-      height: 30px;
+      width: 40px;
+      height: 40px;
       padding: 0;
       display: grid;
       place-items: center;
@@ -522,11 +563,11 @@
       background: transparent;
       color: var(--ink-tertiary);
       cursor: pointer;
+      transition: transform 140ms var(--ease-out), background-color 160ms ease, color 160ms ease;
     }
+    .history-icon-button:active { transform: scale(.97); }
     .history-icon-button .icon { width: 14px; height: 14px; }
-    .history-icon-button.remove:hover { background: var(--red-soft); color: var(--red); }
     .history-icon-button.remove.armed { background: var(--red-soft); color: var(--red); box-shadow: inset 0 0 0 1px rgba(199,61,55,.18); }
-    .history-icon-button.download:hover { background: var(--green-soft); color: var(--green); }
     #viewAllHistory {
       width: 100%;
       min-height: 36px;
@@ -540,7 +581,12 @@
       cursor: pointer;
       transition: transform 120ms var(--ease-out), background 140ms ease;
     }
-    #viewAllHistory:active { transform: scale(0.96); }
+    #viewAllHistory:active { transform: scale(0.97); }
+    @media (hover: hover) and (pointer: fine) {
+      .history-row:hover { transform: translateY(-1px); box-shadow: inset 0 0 0 1px var(--border), 0 4px 12px rgba(15,15,15,.05); }
+      .history-icon-button.remove:hover { background: var(--red-soft); color: var(--red); }
+      .history-icon-button.download:hover { background: var(--green-soft); color: var(--green); }
+    }
 
     .confirm-dialog {
       width: calc(100% - 32px);
@@ -551,8 +597,17 @@
       background: #fff;
       color: var(--ink);
       box-shadow: 0 18px 55px rgba(15, 15, 15, 0.24), 0 2px 8px rgba(15, 15, 15, 0.10);
+      opacity: 1;
+      transform: scale(1) translateY(0);
+      transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out), display 200ms allow-discrete, overlay 200ms allow-discrete;
+      @starting-style { opacity: 0; transform: scale(.96) translateY(6px); }
     }
-    .confirm-dialog::backdrop { background: rgba(20, 20, 18, 0.48); }
+    .confirm-dialog::backdrop {
+      background: rgba(20, 20, 18, 0.48);
+      opacity: 1;
+      transition: opacity 180ms ease, display 180ms allow-discrete, overlay 180ms allow-discrete;
+      @starting-style { opacity: 0; }
+    }
     .confirm-content { padding: 18px; }
     .confirm-icon {
       width: 38px;
@@ -604,9 +659,9 @@
       font-size: 12px;
       font-weight: 700;
       cursor: pointer;
-      transition: transform 120ms var(--ease-out), background 140ms ease, border-color 140ms ease;
+      transition: transform 140ms var(--ease-out), background-color 160ms ease, border-color 160ms ease;
     }
-    .confirm-actions button:active { transform: scale(0.96); }
+    .confirm-actions button:active { transform: scale(0.97); }
     #confirmCancel {
       border: 1px solid var(--border-strong);
       background: #fff;
@@ -629,7 +684,7 @@
     }
     .footer a {
       display: inline-flex;
-      min-height: 32px;
+      min-height: 40px;
       margin-top: 2px;
       padding: 0 8px;
       align-items: center;
@@ -649,7 +704,8 @@
     }
 
     @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+      *, *::before, *::after { scroll-behavior: auto !important; }
+      .secondary-actions, #stats, #historySection, .confirm-dialog { transform: none !important; transition-property: opacity, background-color, color !important; transition-duration: 100ms !important; }
     }
   </style>
 </head>
@@ -673,7 +729,7 @@
   </svg>
   <header class="header">
     <div class="brand"><img class="brand-logo" src="../icons/logo.png" alt="" /><span class="brand-name">X Bulk Clean</span></div>
-    <span class="version">v1.3.0</span>
+    <span class="version">v1.4.0</span>
   </header>
 
   <main>
@@ -692,9 +748,16 @@
 
     <div class="intro">
       <h1>What do you want to clean?</h1>
-      <p>Choose an action. X Bulk Clean handles the scrolling.</p>
+      <p>Review first, or start a quick cleanup. You stay in control.</p>
     </div>
 
+    <button id="openPreview" class="preview-button" type="button">
+      <span class="action-icon" aria-hidden="true"><svg class="icon"><use href="#icon-list-check"/></svg></span>
+      <span class="action-copy"><span class="action-title">Preview &amp; select</span><span class="action-description">Review exactly what will be removed</span></span>
+      <span class="action-arrow" aria-hidden="true"><svg class="icon"><use href="#icon-chevron-right"/></svg></span>
+    </button>
+
+    <div class="section-label">Quick clean</div>
     <div class="action-list" aria-label="Primary cleanup actions">
       <button id="startDelete" class="action-button danger">
         <span class="action-icon" aria-hidden="true"><svg class="icon"><use href="#icon-trash"/></svg></span>
@@ -713,12 +776,10 @@
       </button>
     </div>
 
-    <button id="openPreview" class="preview-button" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-list-check"/></svg>Preview &amp; select items</button>
-
     <details class="more-actions">
       <summary title="Delete replies or manage the accounts you follow">More cleanup actions <span class="summary-chevron" aria-hidden="true"><svg class="icon"><use href="#icon-chevron-down"/></svg></span></summary>
       <div class="secondary-actions">
-        <button id="startDeleteReplies" class="action-button" title="Delete every reply from your profile"><svg class="icon" aria-hidden="true"><use href="#icon-message-x"/></svg>Delete all replies</button>
+        <button id="startDeleteReplies" class="action-button" title="Safely find replies, including orphan replies, before deletion"><svg class="icon" aria-hidden="true"><use href="#icon-message-x"/></svg>Find &amp; delete replies</button>
         <button id="bulkUnfollow" class="action-button" title="Unfollow accounts from your Following list"><svg class="icon" aria-hidden="true"><use href="#icon-user-minus"/></svg>Bulk unfollow</button>
         <button id="followVerifiedFollowers" class="action-button" title="Follow verified accounts from your followers"><svg class="icon" aria-hidden="true"><use href="#icon-badge-check"/></svg>Follow verified</button>
         <button id="followAllFollowers" class="action-button" title="Follow back accounts from your followers"><svg class="icon" aria-hidden="true"><use href="#icon-users"/></svg>Follow all</button>

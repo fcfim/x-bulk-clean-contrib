@@ -26,6 +26,8 @@
 
 - Delete posts and replies
 - Preview tweets, replies, or reposts in Chrome's side panel and choose exactly what to delete or remove
+- Preview accounts from your Following page and unfollow only the selected accounts
+- Choose a one-pass reply scan: clearly identified replies only, or all posts and replies from `/with_replies` for manual review of possible orphan replies
 - Filter scanned results by text and date, then select all, none, or invert the selection
 - Remove likes and reposts
 - Follow followers or verified followers

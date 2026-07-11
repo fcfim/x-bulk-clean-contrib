@@ -10,6 +10,7 @@ let cleanupRunning = false;
 
 const $ = (id) => document.getElementById(id);
 const selectedType = () => document.querySelector('input[name="previewType"]:checked')?.value || 'tweets';
+const selectedReplyScope = () => document.querySelector('input[name="replyScope"]:checked')?.value || 'fast';
 
 async function findActiveXTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -87,11 +88,35 @@ function showError(message) {
   $('errorMessage').style.display = message ? 'block' : 'none';
 }
 
+function updateSetupOptions() {
+  const type = selectedType();
+  const replies = type === 'replies';
+  const all = replies && selectedReplyScope() === 'all';
+  $('replyScope').classList.toggle('visible', replies);
+  $('replyScopeNote').classList.toggle('visible', all);
+  document.querySelectorAll('.date-filter').forEach(filter => { filter.hidden = type === 'unfollow'; });
+  const copy = type === 'tweets'
+    ? { title: 'Tweet cleanup', body: 'Review posts from your profile before you delete them.', tone: 'danger', start: 'Scan tweets' }
+    : type === 'replies'
+      ? { title: all ? 'Posts + replies' : 'Replies only', body: all ? 'One pass through your Replies page. Review every selected item carefully.' : 'Scan clearly identified replies from your Replies page.', tone: all ? 'danger' : 'blue', start: 'Scan replies' }
+      : type === 'reposts'
+        ? { title: 'Repost cleanup', body: 'Review reposts from your timeline before removing them.', tone: 'blue', start: 'Scan reposts' }
+        : { title: 'Following cleanup', body: 'Review accounts from your Following page before you unfollow them.', tone: 'danger', start: 'Scan following' };
+  $('modeSummary').dataset.tone = copy.tone;
+  $('modeSummary').querySelector('strong').textContent = copy.title;
+  $('modeSummary').querySelector('span').textContent = copy.body;
+  $('startScan').textContent = copy.start;
+}
+
+function typeLabel(type = selectedType()) {
+  return type === 'unfollow' ? 'following accounts' : type === 'reposts' ? 'reposts' : type === 'replies' ? 'replies' : 'tweets';
+}
+
 async function ensurePreviewPage(type) {
   activeTab = await findActiveXTab();
   if (!activeTab || !activeAccount?.username) return null;
   const domain = activeTab.url.includes('twitter.com') ? 'twitter.com' : 'x.com';
-  const path = type === 'replies' ? '/with_replies' : '';
+  const path = type === 'replies' ? '/with_replies' : type === 'unfollow' ? '/following' : '';
   const target = `https://${domain}/${activeAccount.username}${path}`;
   const current = (activeTab.url || '').replace(/[?#].*$/, '').replace(/\/$/, '');
   if (current !== target) {
@@ -102,14 +127,14 @@ async function ensurePreviewPage(type) {
   return chrome.tabs.get(activeTab.id);
 }
 
-function startPreviewScanner(type, account, performanceMode) {
+function startPreviewScanner(type, account, performanceMode, replyScope = 'fast') {
   if (window.__xCleaner?.interval) return { ok: false, error: 'A cleanup job is already running.' };
   const previous = window.__xbcPreview;
   if (previous?.interval) clearInterval(previous.interval);
   if (previous?.style) previous.style.remove();
 
   const P = window.__xbcPreview = {
-    type,
+    type, replyScope,
     account,
     items: [],
     seen: new Set(),
@@ -131,6 +156,13 @@ function startPreviewScanner(type, account, performanceMode) {
   const me = ownHandle();
   const tweetId = article => article.querySelector('a[href*="/status/"]')?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1] || null;
   const authorHandle = article => article.querySelector('[data-testid="User-Name"] a[role="link"][href^="/"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
+  const userHandle = cell => {
+    for (const link of cell.querySelectorAll('a[role="link"][href^="/"]')) {
+      const handle = link.getAttribute('href')?.replace(/^\//, '').split('/')[0];
+      if (/^[A-Za-z0-9_]{1,15}$/.test(handle || '')) return handle;
+    }
+    return null;
+  };
   const isMine = article => !me || authorHandle(article) === me;
   const hasConnector = cell => {
     if (!cell) return false;
@@ -181,8 +213,23 @@ function startPreviewScanner(type, account, performanceMode) {
     P.busy = true;
     try {
       let added = 0;
-      const articles = document.querySelectorAll('article[data-testid="tweet"]');
-      for (const article of articles) {
+      if (type === 'unfollow') {
+        for (const cell of document.querySelectorAll('[data-testid="UserCell"]')) {
+          const username = userHandle(cell);
+          const id = username?.toLowerCase();
+          if (!id || P.seen.has(id)) continue;
+          const leafTexts = Array.from(cell.querySelectorAll('span')).filter(span => span.children.length === 0).map(span => (span.textContent || '').trim()).filter(Boolean);
+          const displayName = leafTexts.find(text => text !== `@${username}` && !text.startsWith('@') && !/^(following|unfollow)$/i.test(text)) || username;
+          const bio = Array.from(cell.querySelectorAll('div[dir="auto"]'))
+            .map(element => (element.textContent || '').trim())
+            .filter(text => text && !/^click to unfollow/i.test(text))
+            .at(-1) || '';
+          const avatar = cell.querySelector('[data-testid^="UserAvatar-Container"] img[src], img[src*="profile_images"]');
+          P.seen.add(id);
+          P.items.push({ id, type: 'account', classification: 'unfollow', text: `${displayName} @${username}`, displayName, username, bio, avatarUrl: avatar?.currentSrc || avatar?.src || '', date: '', author: username, url: `/${username}`, hasMedia: false, selected: true });
+          added++;
+        }
+      } else for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
         const id = tweetId(article);
         if (!id || P.seen.has(id)) continue;
         const repost = !!article.querySelector('[data-testid="unretweet"]');
@@ -190,13 +237,17 @@ function startPreviewScanner(type, account, performanceMode) {
         if (type === 'reposts') {
           if (!repost) continue;
         } else {
-          if (!isMine(article) || (type === 'replies') !== reply) continue;
+          if (!isMine(article)) continue;
+          if (type === 'replies' && repost) continue;
+          if (type === 'tweets' && reply) continue;
+          if (type === 'replies' && replyScope === 'fast' && !reply) continue;
         }
         const link = article.querySelector(`a[href*="/status/${id}"]`) || article.querySelector('a[href*="/status/"]');
         P.seen.add(id);
         P.items.push({
           id,
-          type: type === 'reposts' ? 'repost' : reply ? 'reply' : 'tweet',
+          type: type === 'reposts' ? 'repost' : reply ? 'reply' : type === 'replies' ? 'post or orphan reply' : 'tweet',
+          classification: type === 'replies' ? (reply ? 'definite' : 'standalone') : type,
           text: article.querySelector('[data-testid="tweetText"]')?.textContent || '',
           date: article.querySelector('time')?.getAttribute('datetime') || '',
           author: authorHandle(article) || me || '',
@@ -225,6 +276,7 @@ function readPreviewState(includeItems = false) {
   if (!P) return null;
   return {
     type: P.type,
+    replyScope: P.replyScope,
     account: P.account,
     running: !!P.interval,
     paused: !!P.paused,
@@ -276,13 +328,14 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
   if (window.__xCleaner?.interval) return { ok: false, error: 'Another cleanup is already running.' };
   if (window.__xbcPreview?.interval) clearInterval(window.__xbcPreview.interval);
   window.__xbcPreview?.style?.remove();
-  const action = type === 'replies' ? 'deleteReplies' : type === 'reposts' ? 'unrepost' : 'delete';
+  const action = type === 'replies' ? 'deleteReplies' : type === 'reposts' ? 'unrepost' : type === 'unfollow' ? 'bulkUnfollow' : 'delete';
   const selected = new Map((selectedItems || []).map(item => [item.id, item]));
   const X = window.__xCleaner = {
     action,
     stats: type === 'replies'
       ? { repliesDeleted: 0, repliesFound: selected.size }
-      : type === 'reposts' ? { unreposts: 0, foundReposts: selected.size } : { deleted: 0, found: selected.size },
+      : type === 'reposts' ? { unreposts: 0, foundReposts: selected.size }
+        : type === 'unfollow' ? { unfollows: 0, foundFollowing: selected.size } : { deleted: 0, found: selected.size },
     backup: { tweets: [], replies: [], unliked: [], unreposted: [], follows: [], unfollows: [] },
     processed: new Set(), interval: null, keepAlive: null, busy: false, issue: null,
     emptyCycles: 0, successCount: 0, startedAt: Date.now(), historySaved: false, historyPersisted: false,
@@ -294,6 +347,13 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
   const me = ownHandle();
   const tweetId = article => article.querySelector('a[href*="/status/"]')?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1] || null;
   const authorHandle = article => article.querySelector('[data-testid="User-Name"] a[role="link"][href^="/"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
+  const userHandle = cell => {
+    for (const link of cell.querySelectorAll('a[role="link"][href^="/"]')) {
+      const handle = link.getAttribute('href')?.replace(/^\//, '').split('/')[0];
+      if (/^[A-Za-z0-9_]{1,15}$/.test(handle || '')) return handle.toLowerCase();
+    }
+    return null;
+  };
   const hasConnector = cell => {
     const divs = cell?.querySelectorAll('div') || [];
     for (let i = 0; i < Math.min(divs.length, 160); i++) {
@@ -332,12 +392,12 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     }
     return false;
   };
-  const counts = () => ({ tweets: X.backup.tweets.length, replies: X.backup.replies.length, unliked: 0, unreposted: X.backup.unreposted.length, follows: 0, unfollows: 0 });
+  const counts = () => ({ tweets: X.backup.tweets.length, replies: X.backup.replies.length, unliked: 0, unreposted: X.backup.unreposted.length, follows: 0, unfollows: X.backup.unfollows.length });
   const persist = async reason => {
     if (X.historySaved) return;
     X.historySaved = true;
     const completedAt = Date.now(), jobCounts = counts();
-    const total = jobCounts.tweets + jobCounts.replies + jobCounts.unreposted;
+    const total = jobCounts.tweets + jobCounts.replies + jobCounts.unreposted + jobCounts.unfollows;
     const status = /^Finished/i.test(reason || '') ? 'completed' : /Stopped by user/i.test(reason || '') ? 'stopped' : 'interrupted';
     const summary = { id: X.jobId, action, account, startedAt: X.startedAt, completedAt, durationMs: completedAt-X.startedAt, status, statusText: reason || 'Action finished', total, counts: jobCounts, selectedTotal: selected.size, skipped: Math.max(0, selected.size-total) };
     try {
@@ -350,16 +410,17 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
   const updateOverlay = () => {
     const shadow = X.overlayHost?.shadowRoot;
     if (!shadow) return;
-    const completed = type === 'replies' ? X.stats.repliesDeleted : type === 'reposts' ? X.stats.unreposts : X.stats.deleted;
-    shadow.getElementById('count').textContent = `${completed} of ${selected.size} ${type === 'reposts' ? 'removed' : 'deleted'}`;
+    const completed = type === 'replies' ? X.stats.repliesDeleted : type === 'reposts' ? X.stats.unreposts : type === 'unfollow' ? X.stats.unfollows : X.stats.deleted;
+    shadow.getElementById('count').textContent = `${completed} of ${selected.size} ${type === 'unfollow' ? 'unfollowed' : type === 'reposts' ? 'removed' : 'deleted'}`;
   };
   const createOverlay = () => {
     document.getElementById('__xbcJobOverlay')?.remove();
     const host = document.createElement('div'); host.id='__xbcJobOverlay'; host.style.cssText='position:fixed;top:16px;right:16px;z-index:2147483647';
     const shadow=host.attachShadow({mode:'open'});
-    const verb = type === 'reposts' ? 'Removing' : 'Deleting';
-    const progressVerb = type === 'reposts' ? 'removed' : 'deleted';
-    shadow.innerHTML=`<style>*{box-sizing:border-box}.c{width:290px;padding:14px;border-radius:14px;background:rgba(20,20,20,.96);color:#fff;box-shadow:0 18px 48px rgba(0,0,0,.35);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.k{color:#8fd5ae;font-size:10px;font-weight:750;letter-spacing:.09em;text-transform:uppercase}h2{margin:6px 0 4px;font-size:16px}.a,.m{color:#aaa;font-size:11px}.m{margin-top:10px;font-variant-numeric:tabular-nums}button{width:100%;height:38px;margin-top:11px;border:1px solid rgba(255,90,85,.28);border-radius:8px;background:rgba(255,90,85,.12);color:#ff8580;font-weight:750;cursor:pointer}</style><section class="c"><div class="k">X Bulk Clean running</div><h2>${verb} selected ${type}</h2><div class="a"></div><div id="count" class="m">0 of ${selected.size} ${progressVerb}</div><button id="stop">Stop current action</button></section>`;
+    const verb = type === 'unfollow' ? 'Unfollowing' : type === 'reposts' ? 'Removing' : 'Deleting';
+    const progressVerb = type === 'unfollow' ? 'unfollowed' : type === 'reposts' ? 'removed' : 'deleted';
+    const object = type === 'unfollow' ? 'accounts' : type;
+    shadow.innerHTML=`<style>*{box-sizing:border-box}.c{width:290px;padding:14px;border-radius:14px;background:rgba(20,20,20,.96);color:#fff;box-shadow:0 18px 48px rgba(0,0,0,.35);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.k{color:#8fd5ae;font-size:10px;font-weight:750;letter-spacing:.09em;text-transform:uppercase}h2{margin:6px 0 4px;font-size:16px}.a,.m{color:#aaa;font-size:11px}.m{margin-top:10px;font-variant-numeric:tabular-nums}button{width:100%;height:38px;margin-top:11px;border:1px solid rgba(255,90,85,.28);border-radius:8px;background:rgba(255,90,85,.12);color:#ff8580;font-weight:750;cursor:pointer}</style><section class="c"><div class="k">X Bulk Clean running</div><h2>${verb} selected ${object}</h2><div class="a"></div><div id="count" class="m">0 of ${selected.size} ${progressVerb}</div><button id="stop">Stop current action</button></section>`;
     shadow.querySelector('.a').textContent=account?.username?`@${account.username}`:'Active account';
     shadow.getElementById('stop').addEventListener('click',()=>stop('Stopped by user'));
     (document.body||document.documentElement).appendChild(host); X.overlayHost=host; updateOverlay(); X.overlayTimer=setInterval(updateOverlay,500);
@@ -377,20 +438,37 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     if(X.busy||!X.interval)return;X.busy=true;
     try{
       const candidates=[];
-      for(const article of document.querySelectorAll('article[data-testid="tweet"]')){
+      if(type==='unfollow'){
+        for(const cell of document.querySelectorAll('[data-testid="UserCell"]')){
+          const id=userHandle(cell);if(!id||!selected.has(id)||X.processed.has(id))continue;
+          const control=Array.from(cell.querySelectorAll('button')).find(button=>{
+            const testId=button.getAttribute('data-testid')||'';
+            return testId.endsWith('-unfollow')||/^following$/i.test((button.textContent||'').trim());
+          });
+          if(control&&control.offsetParent!==null)candidates.push({cell,id,control});
+        }
+      }else for(const article of document.querySelectorAll('article[data-testid="tweet"]')){
         const id=tweetId(article);if(!id||!selected.has(id)||X.processed.has(id))continue;
         if(type==='reposts'){
           const control=article.querySelector('[data-testid="unretweet"]');
           if(control)candidates.push({article,id,control});
         }else{
-          if(me&&authorHandle(article)!==me)continue;if((type==='replies')!==isReply(article))continue;
+          if(me&&authorHandle(article)!==me)continue;
+          const selectedItem=selected.get(id);
+          if(type==='replies' && !['orphan','standalone'].includes(selectedItem?.classification) && !isReply(article))continue;
+          if(type==='tweets' && isReply(article))continue;
           const control=article.querySelector('[data-testid="caret"]');if(control)candidates.push({article,id,control});
         }
       }
       let handled=0;
       for(const {id,control} of candidates){
         if(!X.interval)break;X.processed.add(id);const snap=selected.get(id);control.click();await sleep(600);
-        if(type==='reposts'){
+        if(type==='unfollow'){
+          if(await clickConfirm('confirmationSheetConfirm')){
+            X.stats.unfollows++;X.backup.unfollows.push({username:snap.username||id,displayName:snap.displayName||snap.text||id,profileUrl:snap.url?.startsWith('/')?`https://x.com${snap.url}`:snap.url||`https://x.com/${id}`,action:'unfollowed',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
+          }
+          await sleep(850);
+        }else if(type==='reposts'){
           if(await clickConfirm('unretweetConfirm')){
             X.stats.unreposts++;X.backup.unreposted.push({id,date:snap.date||'',text:snap.text||'',author:snap.author||'',url:snap.url||'',action:'unreposted',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
           }
@@ -398,14 +476,15 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
         }else if(await clickDeleteMenu()){
           await sleep(550);
           if(await clickConfirm('confirmationSheetConfirm')){
-            const row={id,date:snap.date||'',text:snap.text||'',author:snap.author||me||'',url:snap.url||'',action:type==='replies'?'deleted_reply':'deleted',actionAt:new Date().toISOString()};
-            if(type==='replies'){X.stats.repliesDeleted++;X.backup.replies.push(row)}else{X.stats.deleted++;X.backup.tweets.push(row)}X.successCount++;updateOverlay();
+            const standalone=type==='replies'&&snap.classification==='standalone';
+            const row={id,date:snap.date||'',text:snap.text||'',author:snap.author||me||'',url:snap.url||'',classification:snap.classification||'',action:type==='replies'&&!standalone?'deleted_reply':'deleted',actionAt:new Date().toISOString()};
+            if(type==='replies'){X.stats.repliesDeleted++;if(standalone)X.backup.tweets.push(row);else X.backup.replies.push(row)}else{X.stats.deleted++;X.backup.tweets.push(row)}X.successCount++;updateOverlay();
           }
           await sleep(800);
         }
         handled++;if(handled>=3)break;
       }
-      const resultVerb=type==='reposts'?'removed':'deleted';
+      const resultVerb=type==='unfollow'?'unfollowed':type==='reposts'?'removed':'deleted';
       if(X.successCount>=selected.size){stop(`Finished — ${X.successCount} selected items ${resultVerb}`);return}
       if(!candidates.length&&atBottom())X.emptyCycles++;else X.emptyCycles=0;
       if(X.emptyCycles>=6){stop(`Finished — ${X.successCount} ${resultVerb}, ${Math.max(0,selected.size-X.successCount)} not found`);return}
@@ -437,9 +516,9 @@ async function startScan() {
   const type = selectedType();
   await ensurePreviewPage(type);
   activeTab = await findActiveXTab();
-  const result = await executeInTab(startPreviewScanner, [type, activeAccount, $('previewPerformance').checked]);
+  const result = await executeInTab(startPreviewScanner, [type, activeAccount, $('previewPerformance').checked, selectedReplyScope()]);
   if (!result?.ok) { showError(result?.error || 'Could not start the scan.'); return; }
-  await chrome.storage.local.set({ activePreviewSession: { tabId: activeTab.id, type, account: activeAccount, startedAt: Date.now() } });
+  await chrome.storage.local.set({ activePreviewSession: { tabId: activeTab.id, type, replyScope: selectedReplyScope(), account: activeAccount, startedAt: Date.now() } });
   previewItems = []; shownItems = PAGE_SIZE;
   $('setupSection').style.display = 'none'; $('scanCard').style.display = 'block'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
   $('pauseScan').style.display = 'block'; $('pauseScan').disabled = false; $('stopScan').textContent = 'Stop scan'; $('stopScan').disabled = false;
@@ -451,8 +530,8 @@ async function pollPreview() {
   if (cleanupRunning) {
     const state = await executeInTab(readCleanupState);
     if (!state) return;
-    const count = state.action === 'deleteReplies' ? state.stats?.repliesDeleted || 0 : state.action === 'unrepost' ? state.stats?.unreposts || 0 : state.stats?.deleted || 0;
-    $('scanCount').textContent = `${count}`; $('scanState').textContent = state.action === 'unrepost' ? 'Removing selected' : 'Deleting selected';
+    const count = state.action === 'deleteReplies' ? state.stats?.repliesDeleted || 0 : state.action === 'unrepost' ? state.stats?.unreposts || 0 : state.action === 'bulkUnfollow' ? state.stats?.unfollows || 0 : state.stats?.deleted || 0;
+    $('scanCount').textContent = `${count}`; $('scanState').textContent = state.action === 'bulkUnfollow' ? 'Unfollowing selected' : state.action === 'unrepost' ? 'Removing selected' : 'Deleting selected';
     $('scanCard').classList.toggle('done', !state.running);
     if (!state.running && (state.historyPersisted || state.historySaveError)) {
       cleanupRunning = false;
@@ -468,7 +547,7 @@ async function pollPreview() {
   $('scanCount').textContent = `${state.count || 0}`;
   $('scanCard').classList.toggle('paused', !!state.paused);
   $('scanCard').classList.toggle('done', !state.running);
-  $('scanState').textContent = state.done ? 'Scan complete' : state.paused ? 'Scan paused' : state.running ? 'Scanning timeline' : state.issue || 'Scan stopped';
+  $('scanState').textContent = state.done ? 'Scan complete' : state.paused ? 'Scan paused' : state.running ? `Scanning ${typeLabel(state.type)}` : state.issue || 'Scan stopped';
   $('pauseScan').textContent = state.done ? 'Scan complete' : state.paused ? 'Resume scan' : 'Pause & review';
   $('pauseScan').disabled = !!state.done || (!state.running && !state.paused);
   $('stopScan').textContent = state.running ? 'Stop scan' : 'New scan';
@@ -513,7 +592,8 @@ function filteredItems() {
   const to = $('dateTo').value ? new Date(`${$('dateTo').value}T23:59:59`).getTime() : null;
   return previewItems.filter(item => {
     const time = item.date ? new Date(item.date).getTime() : null;
-    return (!query || (item.text || '').toLowerCase().includes(query)) && (!from || !time || time >= from) && (!to || !time || time <= to);
+    const searchable = [item.text, item.displayName, item.username, item.bio].filter(Boolean).join(' ').toLowerCase();
+    return (!query || searchable.includes(query)) && (!from || !time || time >= from) && (!to || !time || time <= to);
   });
 }
 
@@ -523,19 +603,30 @@ function formatItemDate(value) {
 }
 
 function createResult(item) {
-  const label = document.createElement('label'); label.className = 'result';
-  const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = item.selected;
+  const label = document.createElement('label'); label.className = `result${item.type === 'account' ? ' account-result' : ''}`;
+  const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = item.selected; checkbox.disabled = item.classification === 'unresolved';
+  if (checkbox.disabled) { label.classList.add('unverified'); label.title = 'Could not safely compare this item with the main profile. It is excluded from deletion.'; }
   checkbox.addEventListener('change', async () => { item.selected = checkbox.checked; updateSelectionCounts(); await executeInTab(updatePreviewSelection, [[item.id], item.selected]); });
-  const text = document.createElement('span'); text.className = 'result-text'; text.textContent = item.text || '(No text content)';
+  const text = document.createElement('span'); text.className = 'result-text'; text.textContent = item.type === 'account' ? (item.displayName || item.username) : item.text || '(No text content)';
   const meta = document.createElement('span'); meta.className = 'result-meta';
-  meta.append(document.createTextNode(`${formatItemDate(item.date)} · ${item.type}`));
+  meta.append(document.createTextNode(item.type === 'account' ? `@${item.username || item.author} · Following` : `${formatItemDate(item.date)} · ${item.type}`));
+  let avatar = null;
+  if (item.type === 'account') {
+    avatar = document.createElement('span'); avatar.className = 'result-avatar';
+    const image = document.createElement('img'); image.alt = ''; image.src = item.avatarUrl || '';
+    image.addEventListener('error', () => { image.remove(); avatar.textContent = (item.displayName || item.username || '?').slice(0, 2); });
+    avatar.appendChild(image);
+  }
+  const bio = item.type === 'account' && item.bio ? document.createElement('span') : null;
+  if (bio) { bio.className = 'result-bio'; bio.textContent = item.bio; }
   if (item.hasMedia) { const media = document.createElement('span'); media.className = 'media-pill'; media.textContent = 'Media'; meta.appendChild(media); }
   if (item.url) { const link = document.createElement('a'); link.className='result-link'; link.href=item.url.startsWith('/')?`https://x.com${item.url}`:item.url; link.target='_blank'; link.rel='noopener noreferrer'; link.textContent='↗'; link.title='Open on X'; link.addEventListener('click', event => event.stopPropagation()); meta.appendChild(link); }
-  label.append(checkbox, text, meta); return label;
+  label.append(checkbox, ...(avatar ? [avatar] : []), text, meta, ...(bio ? [bio] : [])); return label;
 }
 
 function renderReview() {
   $('reviewSection').style.display = 'block'; $('stickyBar').style.display = 'block';
+  $('reviewTitle').textContent = `Review ${typeLabel()}`;
   const filtered = filteredItems(); const visible = filtered.slice(0, shownItems);
   $('resultsList').replaceChildren(...visible.map(createResult));
   $('loadMore').hidden = visible.length >= filtered.length;
@@ -545,15 +636,19 @@ function renderReview() {
 }
 
 function updateSelectionCounts() {
-  const selected = previewItems.filter(item => item.selected).length;
+  const selected = previewItems.filter(item => item.selected && item.classification !== 'unresolved').length;
   $('selectedCount').textContent = `${selected} selected`;
-  $('stickySelected').textContent = `${selected}`; $('stickyScanned').textContent = `${previewItems.length} scanned`;
+  $('stickySelected').textContent = `${selected}`; $('stickyScanned').textContent = `${previewItems.length} found`;
   $('deleteSelected').disabled = !selected || cleanupRunning;
-  $('deleteSelected').textContent = selectedType() === 'reposts' ? 'Remove selected reposts' : 'Delete selected items';
+  $('deleteSelected').textContent = selectedType() === 'reposts'
+    ? 'Remove selected reposts'
+    : selectedType() === 'unfollow' ? 'Unfollow selected accounts'
+    : selectedType() === 'replies' && selectedReplyScope() === 'all'
+      ? 'Delete selected posts & replies' : 'Delete selected items';
 }
 
 async function setFilteredSelection(mode) {
-  const items = filteredItems();
+  const items = filteredItems().filter(item => item.classification !== 'unresolved');
   items.forEach(item => { item.selected = mode === 'invert' ? !item.selected : mode === 'all'; });
   if (mode === 'invert') {
     const yes = items.filter(item => item.selected).map(item => item.id), no = items.filter(item => !item.selected).map(item => item.id);
@@ -563,22 +658,27 @@ async function setFilteredSelection(mode) {
 }
 
 function openDeleteDialog() {
-  const selected = previewItems.filter(item => item.selected);
+  const selected = previewItems.filter(item => item.selected && item.classification !== 'unresolved');
   if (!selected.length) return;
   const reposts = selectedType() === 'reposts';
+  const unfollow = selectedType() === 'unfollow';
   $('deleteAccount').textContent = `@${activeAccount.username}`;
   $('deleteCount').textContent = `${selected.length} ${selected.length === 1 ? 'item' : 'items'}`;
-  $('deleteTitle').textContent = `${reposts ? 'Remove' : 'Delete'} ${selected.length} selected ${selectedType()}?`;
-  $('deleteDescription').textContent = reposts
+  $('deleteTitle').textContent = unfollow ? `Unfollow ${selected.length} selected accounts?` : `${reposts ? 'Remove' : 'Delete'} ${selected.length} selected ${selectedType()}?`;
+  $('deleteDescription').textContent = unfollow
+    ? 'Only the selected accounts will be unfollowed. A detailed job record will be saved locally.'
+    : reposts
     ? 'Only the selected reposts will be undone. A detailed job backup will be saved locally.'
-    : 'The selected items will be permanently deleted. A detailed job backup will be saved locally.';
-  $('confirmDelete').textContent = reposts ? 'Remove selected' : 'Delete selected';
+    : selectedType() === 'replies' && selectedReplyScope() === 'all'
+      ? 'Selected entries may include normal posts and orphan replies. They will be permanently deleted and backed up locally.'
+      : 'The selected items will be permanently deleted. A detailed job backup will be saved locally.';
+  $('confirmDelete').textContent = unfollow ? 'Unfollow selected' : reposts ? 'Remove selected' : 'Delete selected';
   $('deleteDialog').showModal();
 }
 
 async function beginSelectedDelete() {
   $('deleteDialog').close(); showError('');
-  const selected = previewItems.filter(item => item.selected);
+  const selected = previewItems.filter(item => item.selected && item.classification !== 'unresolved');
   const currentAccount = await detectAccount(activeTab);
   if (!currentAccount || currentAccount.username.toLowerCase() !== activeAccount.username.toLowerCase()) {
     showError('The active X account changed after scanning. Start a new scan for the current account.'); return;
@@ -586,20 +686,26 @@ async function beginSelectedDelete() {
   await executeInTab(controlPreviewScanner, ['stop']);
   await chrome.storage.local.remove(['activePreviewSession']);
   await ensurePreviewPage(selectedType()); activeTab = await findActiveXTab();
-  const action = selectedType() === 'replies' ? 'deleteReplies' : selectedType() === 'reposts' ? 'unrepost' : 'delete';
+  const action = selectedType() === 'replies' ? 'deleteReplies' : selectedType() === 'reposts' ? 'unrepost' : selectedType() === 'unfollow' ? 'bulkUnfollow' : 'delete';
   const startedAt = Date.now();
   await chrome.storage.local.set({ activeAction: action, activeTabId: activeTab.id, startTime: startedAt, actionStats: {} });
   const result = await executeInTab(runSelectedDelete, [selectedType(), selected, activeAccount, $('previewPerformance').checked]);
   if (!result?.ok) { await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']); showError(result?.error || 'Could not start selected deletion.'); return; }
-  cleanupRunning = true; $('reviewSection').style.display='none'; $('stickyBar').style.display='none'; $('scanCard').style.display='block'; $('scanCard').classList.remove('paused','done'); $('scanState').textContent=action==='unrepost'?'Removing selected':'Deleting selected'; $('scanCount').textContent='0'; $('pauseScan').style.display='none'; $('stopScan').textContent=action==='unrepost'?'Stop removal':'Stop deletion'; $('stopScan').disabled=false; startPolling();
+  cleanupRunning = true; $('reviewSection').style.display='none'; $('stickyBar').style.display='none'; $('scanCard').style.display='block'; $('scanCard').classList.remove('paused','done'); $('scanState').textContent=action==='bulkUnfollow'?'Unfollowing selected':action==='unrepost'?'Removing selected':'Deleting selected'; $('scanCount').textContent='0'; $('pauseScan').style.display='none'; $('stopScan').textContent=action==='bulkUnfollow'?'Stop unfollowing':action==='unrepost'?'Stop removal':'Stop deletion'; $('stopScan').disabled=false; startPolling();
 }
 
 async function initialize() {
   activeTab = await findActiveXTab();
   activeAccount = await detectAccount(activeTab);
   renderAccount(activeAccount);
-  const settings = await chrome.storage.local.get(['performanceMode','activeAction']);
+  const settings = await chrome.storage.local.get(['performanceMode','activeAction','previewRequestedType']);
   $('previewPerformance').checked = settings.performanceMode ?? true;
+  if (settings.previewRequestedType) {
+    const requested = document.querySelector(`input[name="previewType"][value="${settings.previewRequestedType}"]`);
+    if (requested) requested.checked = true;
+    await chrome.storage.local.remove(['previewRequestedType']);
+  }
+  updateSetupOptions();
   if (settings.activeAction && activeTab) {
     const cleanup = await executeInTab(readCleanupState);
     if (cleanup?.running || (!cleanup?.historyPersisted && cleanup?.issue)) {
@@ -611,6 +717,8 @@ async function initialize() {
     const state = await executeInTab(readPreviewState, [true]);
     if (state) {
       previewItems = state.items || []; document.querySelector(`input[name="previewType"][value="${state.type}"]`).checked=true;
+      if (state.replyScope) document.querySelector(`input[name="replyScope"][value="${state.replyScope}"]`).checked=true;
+      updateSetupOptions();
       $('setupSection').style.display='none'; $('scanCard').style.display='block'; startPolling(); if(state.paused||state.done||!state.running)renderReview();
     }
   }
@@ -622,5 +730,7 @@ document.addEventListener('DOMContentLoaded', () => {
   ['resultSearch','dateFrom','dateTo'].forEach(id=>$(id).addEventListener('input',()=>{shownItems=PAGE_SIZE;renderReview()}));
   $('loadMore').addEventListener('click',()=>{shownItems+=PAGE_SIZE;renderReview()}); $('deleteSelected').addEventListener('click',openDeleteDialog); $('cancelDelete').addEventListener('click',()=>$('deleteDialog').close()); $('confirmDelete').addEventListener('click',beginSelectedDelete);
   $('openHistory').addEventListener('click',()=>chrome.runtime.openOptionsPage());
+  document.querySelectorAll('input[name="previewType"],input[name="replyScope"]').forEach(input => input.addEventListener('change', updateSetupOptions));
+  updateSetupOptions();
   initialize();
 });

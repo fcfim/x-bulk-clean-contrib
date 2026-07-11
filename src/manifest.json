@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "name": "X Bulk Clean",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Free bulk cleanup tools for X. Delete posts/replies, remove likes/reposts, manage follows, and export CSV backups locally.",
   "author": "X Bulk Clean contributors",
   "icons": {

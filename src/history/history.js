@@ -85,6 +85,27 @@ function downloadJob(job) {
   URL.revokeObjectURL(url);
 }
 
+async function downloadAllHistory() {
+  if (!history.length) return;
+  const stored = await chrome.storage.local.get(history.map(job => `job_${job.id}`));
+  const headers = ['Job ID', 'Job action', 'Job status', 'Account', 'Job started', 'Job completed', 'Record type', 'Record date', 'Content', 'Author/Username', 'Display name', 'URL', 'Record action', 'Record action date'];
+  const lines = [headers.join(',')];
+  for (const summary of history) {
+    const job = stored[`job_${summary.id}`] || summary;
+    const rows = flattenBackup(job.backup);
+    const jobValues = [job.id || '', ACTION_LABELS[job.action] || job.action || '', job.status || '', job.account?.username ? `@${job.account.username}` : '', job.startedAt ? formatDate(job.startedAt) : '', job.completedAt ? formatDate(job.completedAt) : ''];
+    if (!rows.length) lines.push([...jobValues, 'No affected records', '', '', '', '', '', '', ''].map(csvEscape).join(','));
+    rows.forEach(row => lines.push([...jobValues, row.type, row.date, row.content, row.person, row.displayName, row.url, row.action, row.actionAt].map(csvEscape).join(',')));
+  }
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `x_bulk_clean_history_${new Date().toISOString().slice(0, 10)}.csv`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 function makeButton(label, iconId, className, handler) {
   const button = document.createElement('button');
   button.type = 'button';
@@ -197,6 +218,7 @@ async function renderJobDetail(summary, container) {
 function createJobCard(job) {
   const details = document.createElement('details');
   details.className = 'job';
+  details.dataset.action = job.action || 'other';
   const summary = document.createElement('summary');
   const icon = document.createElement('span');
   icon.className = 'job-icon';
@@ -245,6 +267,7 @@ function renderHistory() {
   $('emptyState').hidden = history.length !== 0;
   $('historyList').hidden = history.length === 0;
   $('clearAll').disabled = history.length === 0;
+  $('downloadAll').disabled = history.length === 0;
   $('totalJobs').textContent = `${history.length}`;
   $('totalRecords').textContent = `${history.reduce((sum, job) => sum + (job.total || 0), 0)}`;
 }
@@ -284,6 +307,7 @@ async function confirmDelete() {
 
 document.addEventListener('DOMContentLoaded', async () => {
   $('historySearch').addEventListener('input', renderHistory);
+  $('downloadAll').addEventListener('click', downloadAllHistory);
   $('clearAll').addEventListener('click', () => openDeleteDialog('all'));
   $('dialogCancel').addEventListener('click', () => $('deleteDialog').close());
   $('dialogConfirm').addEventListener('click', confirmDelete);
