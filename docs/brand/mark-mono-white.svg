@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <title>Postscrub</title>
+  <!-- Single-colour mark (bars knocked out). For one-colour print, embossing, or monochrome UI. -->
+  <path d="M40 16H88A24 24 0 0 1 112 40V48A64 64 0 0 1 48 112H40A24 24 0 0 1 16 88V40A24 24 0 0 1 40 16ZM36 32H92A4 4 0 0 1 96 36V44A4 4 0 0 1 92 48H36A4 4 0 0 1 32 44V36A4 4 0 0 1 36 32ZM36 64H52A4 4 0 0 1 56 68V76A4 4 0 0 1 52 80H36A4 4 0 0 1 32 76V68A4 4 0 0 1 36 64ZM68 64H99.58A54 54 0 0 1 91.50 80H68A4 4 0 0 1 64 76V68A4 4 0 0 1 68 64Z" fill="#f7f7f6" fill-rule="evenodd"/>
+</svg>

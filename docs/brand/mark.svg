@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <title>Postscrub</title>
+  <!-- Postscrub mark. A post card whose lower-right corner has been swept away (r64 vs r24).
+       Top bar: content kept. Second line: a kept fragment (white) and a fragment selected for removal (amber),
+       its end swept along the same arc. Every straight edge sits on the 8-unit grid (whole pixels at 16/32/48). -->
+  <path d="M40 16H88A24 24 0 0 1 112 40V48A64 64 0 0 1 48 112H40A24 24 0 0 1 16 88V40A24 24 0 0 1 40 16Z" fill="#179c72"/><rect x="32" y="32" width="64" height="16" rx="4" fill="#ffffff"/><rect x="32" y="64" width="24" height="16" rx="4" fill="#ffffff"/><path d="M68 64H99.58A54 54 0 0 1 91.50 80H68A4 4 0 0 1 64 76V68A4 4 0 0 1 68 64Z" fill="#ffc23d"/>
+</svg>

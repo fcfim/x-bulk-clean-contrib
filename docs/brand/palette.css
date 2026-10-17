@@ -1,0 +1,79 @@
+/* Postscrub palette. Contrast ratios are WCAG 2.x, measured against the surface they sit on. */
+:root {
+  /* Brand: the mark's own colours. Use for the icon and large graphics only, never body text. */
+  --ps-brand: #179c72;            /* mark tile; >= 3:1 on #fff, #f1f3f4, #3c3c3c and #202124 toolbars */
+  --ps-brand-select: #ffc23d;     /* the mark's "selected for removal" fragment */
+
+  /* Light theme */
+  --ps-surface: #f7f7f6;          /* page background */
+  --ps-surface-raised: #ffffff;   /* cards, popup panels */
+  --ps-border: #e3e6e4;           /* dividers (decorative) */
+  --ps-border-strong: #7d8682;    /* input and checkbox outlines, 3.75:1 on white */
+  --ps-ink: #1d1d1b;              /* body text, 15.8:1 */
+  --ps-ink-muted: #5c625f;        /* secondary text, 5.8:1 */
+
+  --ps-primary: #0f7a5e;          /* buttons, links, focus ring; 4.9:1 on surface */
+  --ps-primary-hover: #0c6650;
+  --ps-on-primary: #ffffff;       /* 5.3:1 on primary */
+  --ps-primary-soft: #e3f3ec;     /* success/kept tint; primary text 4.6:1 on it */
+
+  --ps-select: #ffc23d;           /* "selected for removal": chip/check fill. Fill only. Ink on it 10.5:1 */
+  --ps-on-select: #1d1d1b;
+  --ps-select-soft: #fff3d1;      /* selected row background; ink 15.3:1 */
+  --ps-select-strong: #8a5a00;    /* selected-row edge marker or "12 selected" text, 5.9:1 on white */
+
+  --ps-danger: #c73d37;           /* final destructive confirm only; white on it 5.1:1 */
+  --ps-danger-hover: #a8302b;
+  --ps-on-danger: #ffffff;
+  --ps-info: #1f6fbf;             /* neutral notices, 4.8:1 on surface */
+  --ps-focus: var(--ps-primary);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ps-surface: #121614;
+    --ps-surface-raised: #1a1f1d;
+    --ps-border: #2c3531;
+    --ps-border-strong: #6b7570;  /* 3.5:1 on raised */
+    --ps-ink: #eef2f0;            /* 14.8:1 on raised */
+    --ps-ink-muted: #a2aca7;      /* 7.2:1 */
+
+    --ps-primary: #4cc79a;        /* text, links, button fill; 7.9:1 on raised */
+    --ps-primary-hover: #6ad6ad;
+    --ps-on-primary: #0b1f18;     /* 8.1:1 on primary */
+    --ps-primary-soft: #16302a;
+
+    --ps-select: #ffc23d;         /* 10.4:1 on raised */
+    --ps-on-select: #1d1d1b;
+    --ps-select-soft: #3a2f12;    /* ink 11.7:1 on it */
+    --ps-select-strong: #ffd36e;
+
+    --ps-danger: #ff8a80;         /* 7.3:1 on raised */
+    --ps-danger-hover: #ffa49c;
+    --ps-on-danger: #1d0907;
+    --ps-info: #6aaef0;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --ps-surface: #121614;
+  --ps-surface-raised: #1a1f1d;
+  --ps-border: #2c3531;
+  --ps-border-strong: #6b7570;
+  --ps-ink: #eef2f0;
+  --ps-ink-muted: #a2aca7;
+  --ps-primary: #4cc79a;
+  --ps-primary-hover: #6ad6ad;
+  --ps-on-primary: #0b1f18;
+  --ps-primary-soft: #16302a;
+  --ps-select: #ffc23d;
+  --ps-on-select: #1d1d1b;
+  --ps-select-soft: #3a2f12;
+  --ps-select-strong: #ffd36e;
+  --ps-danger: #ff8a80;
+  --ps-danger-hover: #ffa49c;
+  --ps-on-danger: #1d0907;
+  --ps-info: #6aaef0;
+  color-scheme: dark;
+}
