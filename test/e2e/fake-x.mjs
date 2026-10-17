@@ -98,8 +98,11 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
     { name: 'auth_token', value: 'secret', domain: '.x.com', path: '/', secure: true, httpOnly: true }
   ]);
 
-  // The page's own script tag for X's bundle: serve nothing so the fake page stays fake.
-  await context.route('https://abs.twimg.com/**', route => route.fulfill({ status: 200, contentType: 'application/javascript', body: '' }));
+  // X's real bundle is only read by the extension's service worker (the page's tag is inert);
+  // anything else from the CDN is served empty so the fake page stays fake.
+  await context.route('https://abs.twimg.com/**', route => /\/client-web\/main\./.test(route.request().url())
+    ? route.continue()
+    : route.fulfill({ status: 200, contentType: 'application/javascript', body: '' }));
 
   await context.route('https://x.com/i/api/**', async route => {
     const request = route.request();
@@ -117,6 +120,7 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
         const variables = JSON.parse(url.searchParams.get('variables') || '{}');
         call.variables = variables;
         call.features = url.searchParams.get('features') ? JSON.parse(url.searchParams.get('features')) : null;
+        call.fieldToggles = url.searchParams.get('fieldToggles') ? JSON.parse(url.searchParams.get('fieldToggles')) : null;
         if (state.misbehave.refuse[op]) return json(route, state.misbehave.refuse[op], { errors: [{ message: 'refused' }] });
         if (variables.userId !== ME.id) return json(route, 400, { errors: [{ message: 'wrong user' }] });
         return json(route, 200, page(state, op, variables));
@@ -196,7 +200,12 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
 
 function pageHtml(op) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<script src="https://abs.twimg.com/responsive-web/client-web/main.b09082b07a640734a.js"></script>
+<script type="text/plain" src="https://abs.twimg.com/responsive-web/client-web/main.b09082b07a640734a.js"></script>
+<script>
+// Like x.com: the page seeds its state, feature switches included; main.js deletes it later.
+window.__INITIAL_STATE__ = { session: { user_id: '${ME.id}' }, featureSwitch: { defaultConfig: { rweb_video_screen_enabled: { value: false } }, user: { config: { rweb_video_screen_enabled: { value: true } } }, customOverrides: {} } };
+delete window.__INITIAL_STATE__;
+</script>
 <style>body{margin:0;font:14px system-ui}article{height:180px;border-bottom:1px solid #ddd;padding:8px}#layers{position:fixed;top:40px;right:40px;background:#fff}</style></head>
 <body>
 <nav><a data-testid="AppTabBar_Profile_Link" href="/${ME.screen}">Profile</a>

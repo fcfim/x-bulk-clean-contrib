@@ -82,7 +82,9 @@ const SCENARIOS = [
         ['4 reposts untouched', state.tweets.filter(t => t.retweetOf).length === 4],
         ['15 DeleteTweet calls', deletes.length === 15, deletes.length],
         ['body is {variables:{tweet_id}, queryId}', deletes.every(c => c.body?.queryId === fakeQueryIds.DeleteTweet && Object.keys(c.body.variables).join() === 'tweet_id'), deletes[0]?.body],
-        ['listing used the account id from twid', state.calls.filter(c => c.op === 'UserTweets' && c.method === 'GET' && c.variables).slice(1).every(c => c.variables.userId === ME.id)],
+        ['listing used the signed-in account id', state.calls.filter(c => c.op === 'UserTweets' && c.method === 'GET' && c.variables).slice(1).every(c => c.variables.userId === ME.id)],
+        ['features: all 40 of the build, values from the page state', (() => { const c = state.calls.filter(c => c.op === 'UserTweets' && c.features).at(-1); return c && Object.keys(c.features).length === 40 && c.features.rweb_video_screen_enabled === true; })(), state.calls.filter(c => c.op === 'UserTweets').at(-1)?.features],
+        ['fieldToggles as X sends them', JSON.stringify(state.calls.filter(c => c.op === 'UserTweets').at(-1)?.fieldToggles) === '{"withPayments":false,"withArticlePlainText":false}', state.calls.filter(c => c.op === 'UserTweets').at(-1)?.fieldToggles],
         ['history: completed with 15 records', r.job.status === 'completed' && r.job.total === 15, r.job],
         ['backup rows have text and url', r.record.backup.tweets.every(t => t.text && t.url?.includes('/status/'))]
       ];
@@ -126,6 +128,7 @@ const SCENARIOS = [
         ['mode is api', r.worker?.mode === 'api', r.worker],
         ['all 9 unfollowed', state.following.length === 0, state.following.length],
         ['form has user_id and the include_* params', calls.every(c => c.form.user_id && c.form.include_profile_interstitial_type === '1' && c.form.skip_status === '1'), calls[0]?.form],
+        ['user lists send no fieldToggles', state.calls.filter(c => c.op === 'Following' && c.features).every(c => c.fieldToggles === null), state.calls.filter(c => c.op === 'Following').map(c => c.fieldToggles)],
         ['history: 9 unfollows', r.job.counts.unfollows === 9, r.job.counts]
       ];
     }

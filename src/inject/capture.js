@@ -31,6 +31,31 @@
     } catch (_) {}
   };
 
+  // X sends each feature's value from its feature-switch config, which the page seeds from
+  // window.__INITIAL_STATE__ and main.js deletes right after reading. Record the values when the
+  // page assigns it (this script runs first), so API requests send exactly what X would.
+  let initialState;
+  try {
+    Object.defineProperty(window, '__INITIAL_STATE__', {
+      configurable: true,
+      enumerable: true,
+      get() { return initialState; },
+      set(value) {
+        initialState = value;
+        try {
+          const fs = value?.featureSwitch || {};
+          const plain = (v) => (v && typeof v === 'object' && 'value' in v ? v.value : v);
+          const features = {};
+          for (const [key, v] of Object.entries({ ...(fs.defaultConfig || {}), ...(fs.user?.config || {}) })) features[key] = plain(v) === true;
+          for (const [key, v] of Object.entries(fs.customOverrides || {})) features[key] = plain(v) === true;
+          state.features = features;
+          state.viewerId = value?.session?.user_id ? String(value.session.user_id) : null;
+          save();
+        } catch (_) {}
+      }
+    });
+  } catch (_) {}
+
   const plainHeaders = (source) => {
     const out = {};
     try { if (source) new Headers(source).forEach((value, key) => { out[key] = value; }); } catch (_) {}

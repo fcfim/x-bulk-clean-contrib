@@ -25,14 +25,24 @@
     Followers: 'stpzFPAIZ2qv8s2lRzPOnQ',
     BlueVerifiedFollowers: '1fjk4lmK45a-giaZTubqbg'
   };
+  // Variables and field toggles as X's web app builds them for each list (promoted entries are
+  // skipped when parsing). User lists send no fieldToggles at all.
   const LIST_DEFAULT_VARIABLES = {
-    UserTweets: { count: 20, includePromotedContent: false, withQuickPromoteEligibilityTweetFields: false, withVoice: true },
-    UserTweetsAndReplies: { count: 20, includePromotedContent: false, withCommunity: true, withVoice: true },
+    UserTweets: { count: 20, includePromotedContent: true, withQuickPromoteEligibilityTweetFields: true, withVoice: true },
+    UserTweetsAndReplies: { count: 20, includePromotedContent: true, withCommunity: true, withQuickPromoteEligibilityTweetFields: true, withVoice: true },
     Likes: { count: 20, includePromotedContent: false, withClientEventToken: false, withBirdwatchNotes: false, withVoice: true },
-    Following: { count: 20, includePromotedContent: false },
-    Followers: { count: 20, includePromotedContent: false },
-    BlueVerifiedFollowers: { count: 20, includePromotedContent: false }
+    Following: { count: 20, includePromotedContent: false, withGrokTranslatedBio: false },
+    Followers: { count: 20, includePromotedContent: false, withGrokTranslatedBio: false },
+    BlueVerifiedFollowers: { count: 20, includePromotedContent: false, withGrokTranslatedBio: false }
   };
+  const LIST_FIELD_TOGGLES = {
+    UserTweets: { withPayments: false, withArticlePlainText: false },
+    UserTweetsAndReplies: { withPayments: false, withArticlePlainText: false },
+    Likes: { withPayments: false, withArticlePlainText: false }
+  };
+  // Feature values of the build this was written against (its logged-out config), used only for
+  // names the page did not report. X itself treats a name missing from its config as false.
+  const FEATURE_DEFAULTS = {"articles_preview_enabled":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"communities_web_enable_tweet_community_results_fetch":true,"content_disclosure_ai_generated_indicator_enabled":true,"content_disclosure_indicator_enabled":true,"creator_subscriptions_tweet_preview_api_enabled":true,"freedom_of_speech_not_reach_fetch_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"longform_notetweets_consumption_enabled":true,"longform_notetweets_inline_media_enabled":false,"longform_notetweets_rich_text_read_enabled":true,"post_ctas_fetch_enabled":false,"premium_content_api_read_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"responsive_web_enhance_cards_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_grok_analysis_button_from_backend":true,"responsive_web_grok_analyze_button_fetch_trends_enabled":false,"responsive_web_grok_analyze_post_followups_enabled":false,"responsive_web_grok_annotations_enabled":true,"responsive_web_grok_community_note_auto_translation_is_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_grok_imagine_annotation_enabled":true,"responsive_web_grok_share_attachment_enabled":true,"responsive_web_grok_show_grok_translated_post":true,"responsive_web_jetfuel_frame":true,"responsive_web_nested_quote_preview_enabled":true,"responsive_web_profile_redirect_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"rweb_cashtags_composer_attachment_enabled":true,"rweb_cashtags_enabled":true,"rweb_conversational_replies_downvote_enabled":false,"rweb_sports_post_context_enabled":true,"rweb_tipjar_consumption_enabled":false,"rweb_video_screen_enabled":false,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"verified_phone_label_enabled":false,"view_counts_everywhere_api_enabled":true};
   // Parameters X's web app sends with friendships/create and friendships/destroy, in its order.
   const FRIENDSHIP_PARAMS = {
     include_profile_interstitial_type: '1', include_blocking: '1', include_blocked_by: '1',
@@ -101,15 +111,18 @@
       const fromStore = stored.ops?.[name] || {};
       const queryId = fromLive.queryId || fromBundle.queryId || fromStore.queryId || FALLBACK_QUERY_IDS[name];
       if (!queryId) continue;
-      const known = { ...(fromStore.features || {}), ...(fromLive.features || {}) };
-      const knownToggles = { ...(fromStore.fieldToggles || {}), ...(fromLive.fieldToggles || {}) };
-      // Feature names come from the current build when we have it; values from what X sent.
-      const features = fromBundle.featureSwitches
-        ? Object.fromEntries(fromBundle.featureSwitches.map(f => [f, f in known ? known[f] : true]))
-        : (Object.keys(known).length ? known : null);
-      const fieldToggles = fromBundle.fieldToggles
-        ? Object.fromEntries(fromBundle.fieldToggles.map(f => [f, f in knownToggles ? knownToggles[f] : false]))
-        : (Object.keys(knownToggles).length ? knownToggles : null);
+      // Feature names come from the current build; each value from the page's own feature config,
+      // then from what X sent for this operation, then from storage, then the defaults above.
+      const known = { ...FEATURE_DEFAULTS, ...(fromStore.features || {}), ...(fromLive.features || {}), ...(live.features || {}) };
+      let names = fromBundle.featureSwitches || Object.keys({ ...(fromStore.features || {}), ...(fromLive.features || {}) });
+      if (!fromBundle.featureSwitches && !names.length && LIST_DEFAULT_VARIABLES[name]) names = Object.keys(FEATURE_DEFAULTS);
+      const features = names.length ? Object.fromEntries(names.map(f => [f, known[f] === true])) : null;
+      // Field toggles: what X sent for this operation, else what X's web app sends for it, kept
+      // to the names the current build defines, in its order.
+      const toggles = fromLive.fieldToggles || fromStore.fieldToggles || LIST_FIELD_TOGGLES[name] || null;
+      const fieldToggles = toggles && fromBundle.fieldToggles
+        ? Object.fromEntries(fromBundle.fieldToggles.filter(f => f in toggles).map(f => [f, toggles[f]]))
+        : toggles;
       ops[name] = {
         queryId,
         operationType: fromBundle.operationType || fromStore.operationType || (fromLive.method && fromLive.method !== 'GET' ? 'mutation' : null),
@@ -120,7 +133,7 @@
       state.sources[name] = fromLive.queryId ? 'page' : fromBundle.queryId ? 'bundle' : fromStore.queryId ? 'stored' : 'fallback';
     }
     state.ops = ops;
-    state.me = { id: viewerId(), username: (account?.username || '').toLowerCase() };
+    state.me = { id: live.viewerId || viewerId(), username: (account?.username || '').toLowerCase() };
     state.ready = !!cookie('ct0') && !!state.me.id;
     try {
       await chrome.storage.local.set({ xbcApiCache: { bearer: state.bearer, ops, savedAt: Date.now() } });
@@ -253,10 +266,10 @@
       displayName: core.name || legacy.name || username,
       bio: result.profile_bio?.description ?? legacy.description ?? '',
       avatarUrl: result.avatar?.image_url || legacy.profile_image_url_https || '',
-      verified: !!(result.is_blue_verified || legacy.verified),
+      verified: !!(result.is_blue_verified || result.verification?.verified || legacy.verified),
       protected: !!(result.privacy?.protected ?? legacy.protected),
       following: !!(rel.following ?? legacy.following),
-      followRequestSent: !!(rel.follow_request_sent ?? legacy.follow_request_sent),
+      followRequestSent: !!(result.follow_request_sent ?? rel.follow_request_sent ?? legacy.follow_request_sent),
       followedBy: !!(rel.followed_by ?? legacy.followed_by)
     };
   }
@@ -267,7 +280,11 @@
     const legacy = tweet.legacy;
     const author = userFrom(tweet.core?.user_results?.result);
     const screen = author?.username || '';
-    const original = legacy.retweeted_status_result?.result ? tweetFrom(legacy.retweeted_status_result.result) : null;
+    // A repost carries the original post, or sometimes only a reference to its id.
+    const refId = legacy.retweetRefResult?.result?.rest_id;
+    const original = legacy.retweeted_status_result?.result
+      ? tweetFrom(legacy.retweeted_status_result.result)
+      : refId ? { id: refId, authorId: '', author: '', text: '', date: '', url: `/i/status/${refId}`, replyTo: null, hasMedia: false, retweetOf: null } : null;
     const created = legacy.created_at ? new Date(legacy.created_at) : null;
     return {
       id: tweet.rest_id,
@@ -284,10 +301,11 @@
 
   function parsePage(json) {
     const tweets = [], users = [];
-    let bottom = null;
+    let bottom = null, terminated = false;
     const visit = (node, depth) => {
       if (!node || typeof node !== 'object' || depth > 60) return;
       if (Array.isArray(node)) { for (const item of node) visit(item, depth + 1); return; }
+      if (node.type === 'TimelineTerminateTimeline' && /Bottom/.test(node.direction || '')) { terminated = true; return; }
       if (node.cursorType === 'Bottom' && typeof node.value === 'string') { bottom = node.value; return; }
       if (node.promotedMetadata) return;
       if (node.tweet_results) { const t = tweetFrom(node.tweet_results.result); if (t) tweets.push(t); return; }
@@ -297,7 +315,7 @@
       for (const key in node) visit(node[key], depth + 1);
     };
     visit(json?.data, 0);
-    return { tweets, users, bottom };
+    return { tweets, users, bottom: terminated ? null : bottom };
   }
 
   // Pages through a list operation. Yields { tweets, users } until the list ends.
