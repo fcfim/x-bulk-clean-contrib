@@ -11,8 +11,8 @@ Prioridades: **P0** = bloqueia o uso ou exige validação antes de seguir · **P
 
 | # | O que testar | Observação |
 |---|---|---|
-| V1 | Excluir posts e respostas com o X em português, numa conta de teste | É o sintoma original. |
-| V2 | Job com a aba em segundo plano por mais de 5 min, com mais de 100 posts | **Risco:** com a aba oculta o Chrome não roda a etapa de renderização, então eventos de `scroll` e `IntersectionObserver` não disparam. O worker processa o que já está carregado, mas o X pode não buscar a próxima página até a aba voltar a ficar visível. Se isso acontecer: disparar `window.dispatchEvent(new Event('scroll'))` depois de cada `scrollBy`. Se não bastar, abrir o job numa janela própria (`chrome.windows.create`) e avisar para não minimizá-la. |
+| V1 | Excluir posts e respostas com o X em português, numa conta de teste | ✅ **Validado:** 28 posts excluídos no X real. Os `400` em `live_pipeline/update_subscriptions` que aparecem no console são ruído do X (ele cancela os contadores ao vivo de um post que já não existe), não bloqueio. |
+| V2 | Job com a aba em segundo plano por mais de 5 min, com mais de 100 posts | ⚠️ **Parcial:** os timers funcionam (o job excluiu posts com a aba oculta), mas a aba oculta não é renderizada e o X não desenha mais posts. O job rolava até o fim da página vazia e **encerrava como "Finished"** com posts restantes. Corrigido em `cfcbe2a`: com a aba oculta, ciclos vazios não encerram o job, o worker não rola às cegas e dispara um `scroll` sintético. **Falta confirmar no X real** se o `scroll` sintético faz o X desenhar mais posts com a aba oculta, ou se o job só espera a aba voltar a ficar visível. Se só esperar, a saída é rodar o job numa janela própria (`chrome.windows.create`). |
 | V3 | Cor do item "Excluir" (fallback vermelho) nos temas claro, dim e escuro | Hoje é `rgb(244, 33, 46)`. |
 | V4 | Texto real do toast de rate limit em pt-BR | O regex usa "muitas solicitações" e "aguarde alguns instantes", que não foram confirmados. |
 
