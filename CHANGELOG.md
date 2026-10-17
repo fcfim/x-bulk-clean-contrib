@@ -2,6 +2,15 @@
 
 All notable changes are documented here. Releases before `1.4.0` are not reconstructed in detail.
 
+## [Unreleased]
+
+### Fixed 🐛
+
+- 🌐 Deleting posts and replies now works when X is not in English. The Delete menu item was matched only by its English label, so with X in Portuguese ("Excluir") or other languages every post was counted as found but none was deleted. Known labels in common languages are matched, with a language-independent fallback (the red first item of the menu on your own posts).
+- 🔁 Posts are no longer skipped after a single missed click. X re-renders the timeline after each deletion, so the worker now looks the post up again before acting and retries it up to three times before giving up.
+- 🕒 Jobs keep running while the X tab is in the background. Chrome throttles timers in hidden tabs (to about one wake-up per minute after five minutes), which stalled jobs; sleeps are now timed by the extension's service worker, the job tab is kept from being discarded by Memory Saver, and a Web Lock keeps the tab from being frozen.
+- 💬 Reply detection and X error toasts also recognize Portuguese, Spanish, French and German wording.
+
 ## [1.4.0] - 2026-07-11 🚀
 
 ### Added ✨

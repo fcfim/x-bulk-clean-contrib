@@ -130,7 +130,7 @@ async function ensurePreviewPage(type) {
 function startPreviewScanner(type, account, performanceMode, replyScope = 'fast') {
   if (window.__xCleaner?.interval) return { ok: false, error: 'A cleanup job is already running.' };
   const previous = window.__xbcPreview;
-  if (previous?.interval) clearInterval(previous.interval);
+  if (previous) previous.interval = null;
   if (previous?.style) previous.style.remove();
 
   const P = window.__xbcPreview = {
@@ -149,6 +149,13 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     startedAt: Date.now()
   };
 
+  // Chrome throttles timers in hidden tabs; the service worker times sleeps instead.
+  const sleep = ms => new Promise(resolve => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    setTimeout(done, ms);
+    try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); }); } catch (_) {}
+  });
   const ownHandle = () => {
     const link = document.querySelector('[data-testid="AppTabBar_Profile_Link"]') || document.querySelector('a[aria-label="Profile"]');
     return link?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
@@ -177,7 +184,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     return false;
   };
   const isReply = article => {
-    if (/Replying to/i.test((article.textContent || '').slice(0, 300))) return true;
+    if (/Replying to|Em resposta a|En respuesta a|En réponse à|Antwort an/i.test((article.textContent || '').slice(0, 300))) return true;
     const cell = article.closest('[data-testid="cellInnerDiv"]');
     let previousCell = cell?.previousElementSibling;
     for (let hops = 0; previousCell && hops < 4; hops++, previousCell = previousCell.previousElementSibling) {
@@ -187,7 +194,6 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   };
   const atBottom = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 240;
   const finish = (reason, done = false) => {
-    if (P.interval) clearInterval(P.interval);
     P.interval = null;
     P.running = false;
     P.paused = false;
@@ -208,7 +214,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   }
 
   window.scrollTo({ top: 0, behavior: 'auto' });
-  P.interval = setInterval(() => {
+  const scanTick = () => {
     if (P.busy || P.paused || !P.interval) return;
     P.busy = true;
     try {
@@ -267,7 +273,14 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     } finally {
       P.busy = false;
     }
-  }, 1500);
+  };
+  const token = P.interval = { loop: true };
+  (async () => {
+    while (P.interval === token) {
+      try { scanTick(); } catch (_) {}
+      await sleep(1500);
+    }
+  })();
   return { ok: true };
 }
 
@@ -295,7 +308,7 @@ function controlPreviewScanner(command) {
   if (command === 'resume' && P.interval) P.paused = false;
   if (command === 'stop') window.__xbcPreviewStop?.();
   if (command === 'reset') {
-    if (P.interval) clearInterval(P.interval);
+    P.interval = null;
     P.style?.remove();
     delete window.__xbcPreview;
     return null;
@@ -326,7 +339,7 @@ function readCleanupState() {
 
 function runSelectedDelete(type, selectedItems, account, performanceMode) {
   if (window.__xCleaner?.interval) return { ok: false, error: 'Another cleanup is already running.' };
-  if (window.__xbcPreview?.interval) clearInterval(window.__xbcPreview.interval);
+  if (window.__xbcPreview) window.__xbcPreview.interval = null;
   window.__xbcPreview?.style?.remove();
   const action = type === 'replies' ? 'deleteReplies' : type === 'reposts' ? 'unrepost' : type === 'unfollow' ? 'bulkUnfollow' : 'delete';
   const selected = new Map((selectedItems || []).map(item => [item.id, item]));
@@ -342,7 +355,13 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     jobId: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     overlayHost: null, overlayTimer: null, performanceStyle: null
   };
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  // Chrome throttles timers in hidden tabs; the service worker times sleeps instead.
+  const sleep = ms => new Promise(resolve => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    setTimeout(done, ms);
+    try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); }); } catch (_) {}
+  });
   const ownHandle = () => document.querySelector('[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
   const me = ownHandle();
   const tweetId = article => article.querySelector('a[href*="/status/"]')?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1] || null;
@@ -366,7 +385,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     return false;
   };
   const isReply = article => {
-    if (/Replying to/i.test((article.textContent || '').slice(0, 300))) return true;
+    if (/Replying to|Em resposta a|En respuesta a|En réponse à|Antwort an/i.test((article.textContent || '').slice(0, 300))) return true;
     const cell = article.closest('[data-testid="cellInnerDiv"]');
     let prev = cell?.previousElementSibling;
     for (let i = 0; prev && i < 4; i++, prev = prev.previousElementSibling) {
@@ -383,20 +402,54 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     }
     return false;
   };
+  // Matching only the English "Delete" label meant nothing was deleted when X used another
+  // language. Known labels first, then the red first item X uses for Delete on own posts.
+  const DELETE_LABELS = new Set([
+    'delete', 'delete post', 'delete tweet', 'delete reply',
+    'excluir', 'excluir post', 'excluir tweet', 'excluir resposta',
+    'eliminar', 'eliminar post', 'eliminar tweet', 'eliminar respuesta',
+    'supprimer', 'supprimer le post', 'löschen', 'post löschen', 'elimina', 'elimina post',
+    'verwijderen', 'usuń', 'sil', 'удалить', 'видалити', '削除', '삭제', '删除', '刪除',
+    'hapus', 'xóa', 'ลบ', 'حذف', 'מחק'
+  ]);
+  const isRedText = el => {
+    const m = getComputedStyle(el).color.match(/\d+/g);
+    return !!m && +m[0] >= 180 && +m[1] <= 90 && +m[2] <= 90;
+  };
   const clickDeleteMenu = async () => {
     for (let i = 0; i < 9; i++) {
-      const items = document.querySelectorAll('[role="menuitem"]');
-      const button = Array.from(items).find(item => /^delete( post| tweet| reply)?$/i.test((item.textContent || '').trim()));
-      if (button && button.offsetParent !== null) { button.click(); return true; }
+      const items = Array.from(document.querySelectorAll('[role="menuitem"]')).filter(item => item.offsetParent !== null);
+      let button = items.find(item => DELETE_LABELS.has((item.textContent || '').trim().toLowerCase()));
+      if (!button && items[0] && isRedText(items[0].querySelector('span') || items[0])) button = items[0];
+      if (button) { button.click(); return true; }
+      if (items.length) break; // menu is open but has no Delete
       await sleep(160);
     }
+    closeMenus();
+    await sleep(250);
     return false;
   };
+  // X dismisses popup menus on an outside click against the real hit-target.
+  const closeMenus = () => {
+    try {
+      const el = document.elementFromPoint(8, Math.round(window.innerHeight / 2));
+      if (el && !el.closest('a') && !el.closest('[role="menuitem"]') && !el.closest('[data-testid="caret"]')) el.click();
+    } catch (_) {}
+  };
+  // Element references go stale once X re-renders after a deletion; re-find by id.
+  const liveArticle = (article, id) => {
+    if (article?.isConnected) return article;
+    for (const a of document.querySelectorAll('article[data-testid="tweet"]')) if (tweetId(a) === id) return a;
+    return null;
+  };
+  // Mark an id processed only after it succeeds or fails three times.
+  const attempts = new Map();
+  const noteFailure = id => { const n = (attempts.get(id) || 0) + 1; attempts.set(id, n); if (n >= 3) X.processed.add(id); };
   const detectIssue = () => {
     const toast = document.querySelector('[data-testid="toast"]') || document.querySelector('[role="alert"]');
     const text = (toast?.textContent || '').trim();
-    if (/rate.?limit|too many requests|please wait a few moments/i.test(text)) return 'Rate limited by X — wait a few moments before starting another job';
-    if (/try again|something went wrong|unable|locked|restrict|exceeded/i.test(text)) return text.slice(0, 200);
+    if (/rate.?limit|too many requests|please wait a few moments|muitas solicitações|aguarde alguns instantes/i.test(text)) return 'Rate limited by X — wait a few moments before starting another job';
+    if (/try again|something went wrong|unable|locked|restrict|exceeded|tente novamente|algo deu errado/i.test(text)) return text.slice(0, 200);
     return null;
   };
   const stopIfIssue = async (waitMs = 0) => {
@@ -442,8 +495,15 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     shadow.getElementById('stop').addEventListener('click',()=>/rate.?limit/i.test(X.issue||'')?X.overlayHost?.remove():stop('Stopped by user'));
     (document.body||document.documentElement).appendChild(host); X.overlayHost=host; updateOverlay(); X.overlayTimer=setInterval(updateOverlay,500);
   };
+  const setJobRunning = running => {
+    try { chrome.runtime.sendMessage({ type: 'xbc:job', running }, () => void chrome.runtime.lastError); } catch (_) {}
+    // Holding a Web Lock keeps Chrome from freezing the tab while it is in the background.
+    if (running && navigator.locks) navigator.locks.request(`xbc-job-${X.jobId}`, () => new Promise(release => { X.releaseLock = release; })).catch(() => {});
+    else { X.releaseLock?.(); X.releaseLock = null; }
+  };
   const stop = async reason => {
-    if (X.interval) clearInterval(X.interval); if (X.keepAlive) clearInterval(X.keepAlive); if (X.overlayTimer) clearInterval(X.overlayTimer);
+    setJobRunning(false);
+    if (X.keepAlive) clearInterval(X.keepAlive); if (X.overlayTimer) clearInterval(X.overlayTimer);
     X.interval=null;X.keepAlive=null;X.issue=reason;X.performanceStyle?.remove();updateOverlay();
     const shadow=X.overlayHost?.shadowRoot;if(shadow){shadow.querySelector('.k').textContent=reason;const button=shadow.getElementById('stop');if(/rate.?limit/i.test(reason||'')){button.textContent='Dismiss';button.disabled=false}else{button.disabled=true;setTimeout(()=>X.overlayHost?.remove(),2200)}}
     await persist(reason);
@@ -451,7 +511,8 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
   window.__xCleanerStop=()=>stop('Stopped by user');
   if(performanceMode){const style=document.createElement('style');style.textContent='article[data-testid="tweet"] [data-testid="tweetPhoto"],article[data-testid="tweet"] [data-testid="videoPlayer"],article[data-testid="tweet"] video{display:none!important}';(document.head||document.documentElement).appendChild(style);X.performanceStyle=style}
   createOverlay(); window.scrollTo({top:0,behavior:'auto'}); X.keepAlive=setInterval(()=>document.body?.setAttribute('data-xbc-keepalive',String(Date.now())),25000);
-  X.interval=setInterval(async()=>{
+  setJobRunning(true);
+  const tick=async()=>{
     if(X.busy||!X.interval)return;X.busy=true;
     try{
       const issue=detectIssue();if(issue){await stop(issue);return}
@@ -479,23 +540,34 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
         }
       }
       let handled=0;
-      for(const {id,control} of candidates){
-        if(!X.interval)break;X.processed.add(id);const snap=selected.get(id);control.click();await sleep(600);
+      for(const {article:initial,cell,id,control:initialControl} of candidates){
+        if(!X.interval)break;const snap=selected.get(id);
+        let control=initialControl;
+        if(type!=='unfollow'){const article=liveArticle(initial,id);control=article?.querySelector(type==='reposts'?'[data-testid="unretweet"]':'[data-testid="caret"]');}
+        else if(!cell.isConnected)control=null;
+        if(!control)continue; // virtualized away; picked up again next cycle
+        control.click();await sleep(600);
         if(type==='unfollow'){
           const confirmed=await clickConfirm('confirmationSheetConfirm');
           if(await stopIfIssue(confirmed?900:0))break;
+          if(!confirmed)noteFailure(id);
           if(confirmed){
-            X.stats.unfollows++;X.backup.unfollows.push({username:snap.username||id,displayName:snap.displayName||snap.text||id,profileUrl:snap.url?.startsWith('/')?`https://x.com${snap.url}`:snap.url||`https://x.com/${id}`,action:'unfollowed',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
+            X.processed.add(id);X.stats.unfollows++;X.backup.unfollows.push({username:snap.username||id,displayName:snap.displayName||snap.text||id,profileUrl:snap.url?.startsWith('/')?`https://x.com${snap.url}`:snap.url||`https://x.com/${id}`,action:'unfollowed',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
           }
           await sleep(850);
         }else if(type==='reposts'){
-          if(await clickConfirm('unretweetConfirm')){
-            X.stats.unreposts++;X.backup.unreposted.push({id,date:snap.date||'',text:snap.text||'',author:snap.author||'',url:snap.url||'',action:'unreposted',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
+          if(!await clickConfirm('unretweetConfirm'))noteFailure(id);
+          else{
+            X.processed.add(id);X.stats.unreposts++;X.backup.unreposted.push({id,date:snap.date||'',text:snap.text||'',author:snap.author||'',url:snap.url||'',action:'unreposted',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
           }
           await sleep(700);
-        }else if(await clickDeleteMenu()){
+        }else if(!await clickDeleteMenu()){
+          noteFailure(id);
+        }else{
           await sleep(550);
-          if(await clickConfirm('confirmationSheetConfirm')){
+          if(!await clickConfirm('confirmationSheetConfirm'))noteFailure(id);
+          else{
+            X.processed.add(id);
             const standalone=type==='replies'&&snap.classification==='standalone';
             const row={id,date:snap.date||'',text:snap.text||'',author:snap.author||me||'',url:snap.url||'',classification:snap.classification||'',action:type==='replies'&&!standalone?'deleted_reply':'deleted',actionAt:new Date().toISOString()};
             if(type==='replies'){X.stats.repliesDeleted++;if(standalone)X.backup.tweets.push(row);else X.backup.replies.push(row)}else{X.stats.deleted++;X.backup.tweets.push(row)}X.successCount++;updateOverlay();
@@ -510,7 +582,17 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
       if(X.emptyCycles>=6){stop(`Finished — ${X.successCount} ${resultVerb}, ${Math.max(0,selected.size-X.successCount)} not found`);return}
       if(candidates.length<=handled)window.scrollBy(0,Math.max(520,window.innerHeight*.75));
     }finally{X.busy=false}
-  },2600);
+  };
+  // Sequential loop paced by sleep() instead of setInterval, so it keeps running in a background tab.
+  const token=X.interval={loop:true};
+  (async()=>{
+    while(X.interval===token){
+      const started=Date.now();
+      try{await tick()}catch(_){}
+      if(X.interval!==token)break;
+      await sleep(Math.max(250,2600-(Date.now()-started)));
+    }
+  })();
   return {ok:true};
 }
 

@@ -265,7 +265,6 @@ function runWorker(action, performanceMode, account) {
   const prior = window.__xCleaner;
   if (prior?.interval) return;
   if (prior) {
-    if (prior.interval) clearInterval(prior.interval);
     if (prior.keepAlive) clearInterval(prior.keepAlive);
     if (prior.mediaObserver) prior.mediaObserver.disconnect();
     if (prior.overlayTimer) clearInterval(prior.overlayTimer);
@@ -293,8 +292,43 @@ function runWorker(action, performanceMode, account) {
     historyPersisted: false
   };
 
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  // Chrome throttles timers in hidden tabs (after ~5 min, to one wake-up per minute), which
+  // stalled jobs while the user worked in other tabs. The service worker times each sleep
+  // instead; the local timer is only a fallback if the extension context goes away.
+  const sleep = (ms) => new Promise(resolve => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    setTimeout(done, ms);
+    try {
+      chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); });
+    } catch (_) {}
+  });
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
+
+  // Sequential replacement for setInterval, paced by sleep() so it keeps running in a
+  // background tab. X.interval stays truthy while the job runs; stopAll() clears it.
+  function runLoop(tick, periodMs) {
+    const token = X.interval = { loop: true };
+    (async () => {
+      while (X.interval === token) {
+        const started = Date.now();
+        try { await tick(); } catch (_) {}
+        if (X.interval !== token) break;
+        await sleep(Math.max(250, periodMs - (Date.now() - started)));
+      }
+    })();
+  }
+
+  function setJobRunning(running) {
+    try { chrome.runtime.sendMessage({ type: 'xbc:job', running }, () => void chrome.runtime.lastError); } catch (_) {}
+    if (running && navigator.locks) {
+      // Holding a Web Lock keeps Chrome from freezing the tab while it is in the background.
+      navigator.locks.request(`xbc-job-${X.jobId}`, () => new Promise(release => { X.releaseLock = release; })).catch(() => {});
+    } else {
+      X.releaseLock?.();
+      X.releaseLock = null;
+    }
+  }
 
   function overlayProgressText() {
     const s = X.stats || {};
@@ -492,7 +526,7 @@ function runWorker(action, performanceMode, account) {
   //     preceding article-cell has a connector is a reply. Original posts stand alone with
   //     no connected parent above, so they're correctly excluded (never deleted by mistake).
   function isReply(article) {
-    if (/Replying to/i.test((article.textContent || '').slice(0, 300))) return true;
+    if (/Replying to|Em resposta a|En respuesta a|En réponse à|Antwort an/i.test((article.textContent || '').slice(0, 300))) return true;
     const cell = article.closest('[data-testid="cellInnerDiv"]');
     if (!cell) return false;
     let prev = cell.previousElementSibling;
@@ -530,10 +564,10 @@ function runWorker(action, performanceMode, account) {
     const toast = document.querySelector('[data-testid="toast"]') || document.querySelector('[role="alert"]');
     if (toast) {
       const text = (toast.textContent || '').trim();
-      if (/rate.?limit|too many requests|please wait a few moments/i.test(text)) {
+      if (/rate.?limit|too many requests|please wait a few moments|muitas solicitações|aguarde alguns instantes/i.test(text)) {
         return 'Rate limited by X — wait a few moments before starting another job';
       }
-      if (/try again|something went wrong|rate.?limit|unable|locked|restrict|exceeded|too many/i.test(text)) {
+      if (/try again|something went wrong|rate.?limit|unable|locked|restrict|exceeded|too many|tente novamente|algo deu errado/i.test(text)) {
         return text.slice(0, 200);
       }
     }
@@ -608,11 +642,11 @@ function runWorker(action, performanceMode, account) {
   }
 
   async function stopAll(reason) {
-    if (X.interval) clearInterval(X.interval);
     if (X.keepAlive) clearInterval(X.keepAlive);
     X.interval = null;
     X.keepAlive = null;
     cleanUpPerformanceMode();
+    setJobRunning(false);
     if (reason) X.issue = reason;
     const historySave = persistJob(reason);
     finishJobOverlay(reason);
@@ -626,6 +660,7 @@ function runWorker(action, performanceMode, account) {
 
   applyPerformanceMode();
   createJobOverlay();
+  setJobRunning(true);
 
   async function bumpAndCheckCap() {
     X.successCount++;
@@ -655,16 +690,40 @@ function runWorker(action, performanceMode, account) {
     } catch (_) {}
   }
 
+  // Labels of the Delete menu item in the languages X ships most. Matching on the English
+  // text alone meant nothing was ever deleted when X was set to another language.
+  const DELETE_LABELS = new Set([
+    'delete', 'delete post', 'delete tweet', 'delete reply',
+    'excluir', 'excluir post', 'excluir tweet', 'excluir resposta',
+    'eliminar', 'eliminar post', 'eliminar tweet', 'eliminar respuesta',
+    'supprimer', 'supprimer le post', 'löschen', 'post löschen', 'elimina', 'elimina post',
+    'verwijderen', 'usuń', 'sil', 'удалить', 'видалити', '削除', '삭제', '删除', '刪除',
+    'hapus', 'xóa', 'ลบ', 'حذف', 'מחק'
+  ]);
+
+  // X paints the destructive Delete item red; used when the label is not in the list above.
+  function isRedText(el) {
+    const m = getComputedStyle(el).color.match(/\d+/g);
+    return !!m && +m[0] >= 180 && +m[1] <= 90 && +m[2] <= 90;
+  }
+
+  function findDeleteMenuItem(menuItems) {
+    const items = Array.from(menuItems).filter(m => m.offsetParent !== null);
+    const byLabel = items.find(m => DELETE_LABELS.has((m.textContent || '').trim().toLowerCase()));
+    if (byLabel) return byLabel;
+    // Delete is the first item of the menu on your own posts; never pick a red item elsewhere.
+    const first = items[0];
+    const label = first?.querySelector('span') || first;
+    return first && isRedText(label) ? first : null;
+  }
+
   async function clickDeleteInMenu() {
     // Poll for the menu to render (it can take 300-700ms), then find Delete.
     for (let i = 0; i < 8; i++) {
       const menuItems = document.querySelectorAll('[role="menuitem"]');
       if (menuItems.length) {
-        const del = Array.from(menuItems).find(m => {
-          const t = (m.textContent || '').trim().toLowerCase();
-          return t === 'delete' || t === 'delete post' || t === 'delete tweet' || t === 'delete reply';
-        });
-        if (del && del.offsetParent !== null) {
+        const del = findDeleteMenuItem(menuItems);
+        if (del) {
           del.click();
           return true;
         }
@@ -675,6 +734,25 @@ function runWorker(action, performanceMode, account) {
     closeMenus();
     await sleep(250);
     return false;
+  }
+
+  // X re-renders the timeline after each deletion, so element references collected at the
+  // start of a cycle go stale. Look the article up again by id right before acting on it.
+  function liveArticle(article, id) {
+    if (article?.isConnected) return article;
+    for (const a of document.querySelectorAll('article[data-testid="tweet"]')) {
+      if (tweetId(a) === id) return a;
+    }
+    return null;
+  }
+
+  // An id is only marked processed once it succeeds or has failed a few times, so a single
+  // missed click no longer skips the post for the rest of the job.
+  const attempts = new Map();
+  function noteFailure(id) {
+    const n = (attempts.get(id) || 0) + 1;
+    attempts.set(id, n);
+    if (n >= 3) X.processed.add(id);
   }
 
   function atBottom() {
@@ -700,7 +778,7 @@ function runWorker(action, performanceMode, account) {
       ? { deleted: 0, found: 0 }
       : { unreposts: 0, foundReposts: 0 };
 
-    X.interval = setInterval(async () => {
+    runLoop(async () => {
       if (X.busy || !X.interval) return;
       const issue = detectIssue();
       if (issue) { stopAll(issue); return; }
@@ -731,18 +809,22 @@ function runWorker(action, performanceMode, account) {
         else X.stats.foundReposts = X.processed.size + candidates.length;
 
         const maxPerCycle = hidden() ? 2 : 4;
-        for (const { article, control, id, kind } of candidates) {
+        for (const { article: initial, id, kind } of candidates) {
           if (!X.interval) break;
-          X.processed.add(id);
+          const article = liveArticle(initial, id);
+          const control = article?.querySelector(kind === 'caret' ? '[data-testid="caret"]' : '[data-testid="unretweet"]');
+          if (!control) continue; // virtualized away; picked up again next cycle
           const snap = tweetSnap(article);
           control.click();
           await sleep(hidden() ? 800 : 550);
 
           if (kind === 'caret') {
-            const opened = await clickDeleteInMenu();
-            if (opened) {
+            let done = false;
+            if (await clickDeleteInMenu()) {
               await sleep(hidden() ? 800 : 550);
               if (await clickConfirm('confirmationSheetConfirm')) {
+                done = true;
+                X.processed.add(id);
                 X.stats.deleted++;
                 X.backup.tweets.push({ ...snap, action: 'deleted', actionAt: new Date().toISOString() });
                 await bumpAndCheckCap();
@@ -750,12 +832,16 @@ function runWorker(action, performanceMode, account) {
               }
               await sleep(hidden() ? 1000 : 700);
             }
+            if (!done) noteFailure(id);
           } else {
             if (await clickConfirm('unretweetConfirm')) {
+              X.processed.add(id);
               X.stats.unreposts++;
               X.backup.unreposted.push({ ...snap, action: 'unreposted', actionAt: new Date().toISOString() });
               await bumpAndCheckCap();
               if (!X.interval) break;
+            } else {
+              noteFailure(id);
             }
             await sleep(hidden() ? 900 : 600);
           }
@@ -777,7 +863,7 @@ function runWorker(action, performanceMode, account) {
 
   else if (action === 'unlike') {
     X.stats = { unlikes: 0, foundLikes: 0 };
-    X.interval = setInterval(async () => {
+    runLoop(async () => {
       if (X.busy || !X.interval) return;
       const issue = detectIssue();
       if (issue) { stopAll(issue); return; }
@@ -824,7 +910,7 @@ function runWorker(action, performanceMode, account) {
 
   else if (action === 'deleteReplies') {
     X.stats = { repliesDeleted: 0, repliesFound: 0 };
-    X.interval = setInterval(async () => {
+    runLoop(async () => {
       if (X.busy || !X.interval) return;
       const issue = detectIssue();
       if (issue) { stopAll(issue); return; }
@@ -844,17 +930,22 @@ function runWorker(action, performanceMode, account) {
 
         let processedThisCycle = 0;
         const maxPerCycle = hidden() ? 1 : 3;
-        for (const { article, caret, id } of candidates) {
+        for (const { article: initial, id } of candidates) {
           if (!X.interval) break;
-          X.processed.add(id);
+          const article = liveArticle(initial, id);
+          const caret = article?.querySelector('[data-testid="caret"]');
+          if (!caret) continue; // virtualized away; picked up again next cycle
           const snap = tweetSnap(article);
           caret.click();
           await sleep(hidden() ? 900 : 600);
 
           const opened = await clickDeleteInMenu();
+          if (!opened) noteFailure(id);
           if (opened) {
             await sleep(hidden() ? 900 : 600);
-            if (await clickConfirm('confirmationSheetConfirm')) {
+            if (!await clickConfirm('confirmationSheetConfirm')) noteFailure(id);
+            else {
+              X.processed.add(id);
               X.stats.repliesDeleted++;
               X.backup.replies.push({ ...snap, action: 'deleted_reply', actionAt: new Date().toISOString() });
               await bumpAndCheckCap();
@@ -880,7 +971,7 @@ function runWorker(action, performanceMode, account) {
 
   else if (action === 'followVerified' || action === 'followAll') {
     X.stats = { follows: 0, foundFollowers: 0 };
-    X.interval = setInterval(async () => {
+    runLoop(async () => {
       if (X.busy || !X.interval) return;
       const issue = detectIssue();
       if (issue) { stopAll(issue); return; }
@@ -941,7 +1032,7 @@ function runWorker(action, performanceMode, account) {
 
   else if (action === 'bulkUnfollow') {
     X.stats = { unfollows: 0, foundFollowing: 0 };
-    X.interval = setInterval(async () => {
+    runLoop(async () => {
       if (X.busy || !X.interval) return;
       const issue = detectIssue();
       if (issue) { stopAll(issue); return; }
@@ -1006,7 +1097,6 @@ function stopWorker() {
   }
   const X = window.__xCleaner;
   if (!X) return;
-  if (X.interval) clearInterval(X.interval);
   if (X.keepAlive) clearInterval(X.keepAlive);
   if (X.mediaObserver) X.mediaObserver.disconnect();
   document.getElementById('__openxPerformanceStyle')?.remove();
@@ -1136,7 +1226,7 @@ async function endPreviewSession(session) {
         target: { tabId: session.tabId },
         func: () => {
           const preview = window.__xbcPreview;
-          if (preview?.interval) clearInterval(preview.interval);
+          if (preview) preview.interval = null;
           preview?.style?.remove();
           document.getElementById('__xbcPreviewPerformance')?.remove();
           delete window.__xbcPreview;
