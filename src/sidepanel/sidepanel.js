@@ -127,7 +127,7 @@ async function ensurePreviewPage(type) {
   return chrome.tabs.get(activeTab.id);
 }
 
-function startPreviewScanner(type, account, performanceMode, replyScope = 'fast') {
+function startPreviewScanner(type, account, performanceMode, replyScope = 'fast', useApi = false) {
   if (window.__xCleaner?.interval) return { ok: false, error: 'A cleanup job is already running.' };
   const previous = window.__xbcPreview;
   if (previous) previous.interval = null;
@@ -214,7 +214,6 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     document.querySelectorAll('article[data-testid="tweet"] video').forEach(video => { video.pause(); video.autoplay = false; video.preload = 'none'; });
   }
 
-  window.scrollTo({ top: 0, behavior: 'auto' });
   const scanTick = () => {
     if (P.busy || P.paused || !P.interval) return;
     P.busy = true;
@@ -280,13 +279,78 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
       P.busy = false;
     }
   };
-  const token = P.interval = { loop: true };
-  (async () => {
-    while (P.interval === token) {
-      try { scanTick(); } catch (_) {}
-      await sleep(1500);
+  const startDomScan = () => {
+    P.mode = 'dom';
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    const token = P.interval = { loop: true };
+    (async () => {
+      while (P.interval === token) {
+        try { scanTick(); } catch (_) {}
+        await sleep(1500);
+      }
+    })();
+  };
+
+  // API scan: lists the account's items through X's web API (worker/xapi.js), which also tells
+  // replies apart exactly instead of guessing from the thread line. Falls back to scrolling the
+  // page when X refuses the API before the first page.
+  const LIST_OP = { tweets: 'UserTweets', reposts: 'UserTweets', replies: 'UserTweetsAndReplies', unfollow: 'Following' };
+  const tweetItem = (t, itemType, classification) => ({ id: t.id, type: itemType, classification, text: t.text, date: t.date, author: t.author, url: t.url, hasMedia: t.hasMedia, selected: true });
+  const toItems = (page, myId) => {
+    if (type === 'unfollow') {
+      return (page.users || []).filter(u => u.id !== myId).map(u => ({
+        id: u.username.toLowerCase(), userId: u.id, type: 'account', classification: 'unfollow',
+        text: `${u.displayName} @${u.username}`, displayName: u.displayName, username: u.username, bio: u.bio,
+        avatarUrl: u.avatarUrl, date: '', author: u.username, url: `/${u.username}`, hasMedia: false, selected: true
+      }));
     }
-  })();
+    const out = [];
+    for (const t of page.tweets || []) {
+      if (t.authorId !== myId) continue;
+      if (type === 'reposts') { if (t.retweetOf) out.push(tweetItem(t.retweetOf, 'repost', 'reposts')); continue; }
+      if (t.retweetOf) continue;
+      if (type === 'tweets') { if (!t.replyTo) out.push(tweetItem(t, 'tweet', 'tweets')); continue; }
+      if (t.replyTo) out.push(tweetItem(t, 'reply', 'definite'));
+      else if (replyScope === 'all') out.push(tweetItem(t, 'post or orphan reply', 'standalone'));
+    }
+    return out;
+  };
+  const startApiScan = async (api) => {
+    const token = P.interval = { api: true };
+    const active = () => P.interval === token;
+    const fallback = (reason) => {
+      if (!active()) return;
+      P.apiFallback = reason;
+      console.warn('[X Bulk Clean] API scan unavailable, scrolling instead:', reason);
+      P.interval = null;
+      startDomScan();
+    };
+    const ready = await api.init(account);
+    if (!active()) return;
+    if (!ready.ok || !api.canList(LIST_OP[type])) return fallback(ready.reason || `no ${LIST_OP[type]} operation`);
+    P.mode = 'api';
+    let pages = 0;
+    try {
+      for await (const page of api.pages(LIST_OP[type], { isActive: active, onWait: until => { P.waitUntil = until; } })) {
+        pages++;
+        for (const item of toItems(page, ready.me.id)) {
+          if (!P.seen.has(item.id)) { P.seen.add(item.id); P.items.push(item); }
+        }
+        while (P.paused && active()) await sleep(400);
+        if (!active()) return;
+      }
+    } catch (error) {
+      if (!active()) return;
+      if (!pages && error.result?.kind === 'refused') return fallback(error.message);
+      finish(`Scan stopped: ${error.message || error}`, false);
+      return;
+    }
+    if (active()) finish('Scan complete', true);
+  };
+
+  const api = useApi ? globalThis.__xbcApi : null;
+  if (api) startApiScan(api).catch(error => { if (P.interval) finish(`Scan stopped: ${error?.message || error}`, false); });
+  else startDomScan();
   return { ok: true };
 }
 
@@ -298,6 +362,8 @@ function readPreviewState(includeItems = false) {
     replyScope: P.replyScope,
     account: P.account,
     running: !!P.interval,
+    mode: P.mode || null,
+    apiFallback: P.apiFallback || null,
     paused: !!P.paused,
     done: !!P.done,
     issue: P.issue,
@@ -337,13 +403,15 @@ function readCleanupState() {
     action: X.action,
     stats: X.stats,
     running: !!X.interval,
+    mode: X.mode || null,
+    apiFallback: X.apiFallback || null,
     issue: X.issue,
     historyPersisted: !!X.historyPersisted,
     historySaveError: X.historySaveError || null
   };
 }
 
-function runSelectedDelete(type, selectedItems, account, performanceMode) {
+function runSelectedDelete(type, selectedItems, account, performanceMode, useApi = false) {
   if (window.__xCleaner?.interval) return { ok: false, error: 'Another cleanup is already running.' };
   if (window.__xbcPreview) window.__xbcPreview.interval = null;
   window.__xbcPreview?.style?.remove();
@@ -489,6 +557,12 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     if (!shadow) return;
     const completed = type === 'replies' ? X.stats.repliesDeleted : type === 'reposts' ? X.stats.unreposts : type === 'unfollow' ? X.stats.unfollows : X.stats.deleted;
     shadow.getElementById('count').textContent = `${completed} of ${selected.size} ${type === 'unfollow' ? 'unfollowed' : type === 'reposts' ? 'removed' : 'deleted'}`;
+    const kicker = shadow.querySelector('.k');
+    if (X.interval && kicker) {
+      kicker.textContent = X.waitUntil
+        ? `X rate limit · resuming at ${new Date(X.waitUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+        : X.mode === 'api' ? 'X Bulk Clean running · API mode' : 'X Bulk Clean running';
+    }
   };
   const createOverlay = () => {
     document.getElementById('__xbcJobOverlay')?.remove();
@@ -517,8 +591,24 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
   };
   window.__xCleanerStop=()=>stop('Stopped by user');
   if(performanceMode){const style=document.createElement('style');style.textContent='article[data-testid="tweet"] [data-testid="tweetPhoto"],article[data-testid="tweet"] [data-testid="videoPlayer"],article[data-testid="tweet"] video{display:none!important}';(document.head||document.documentElement).appendChild(style);X.performanceStyle=style}
-  createOverlay(); window.scrollTo({top:0,behavior:'auto'}); X.keepAlive=setInterval(()=>document.body?.setAttribute('data-xbc-keepalive',String(Date.now())),25000);
+  createOverlay(); X.keepAlive=setInterval(()=>document.body?.setAttribute('data-xbc-keepalive',String(Date.now())),25000);
   setJobRunning(true);
+  const recordSuccess=(id,snap)=>{
+    X.processed.add(id);
+    const actionAt=new Date().toISOString();
+    if(type==='unfollow'){
+      X.stats.unfollows++;
+      X.backup.unfollows.push({username:snap.username||id,displayName:snap.displayName||snap.text||id,profileUrl:snap.url?.startsWith('/')?`https://x.com${snap.url}`:snap.url||`https://x.com/${id}`,action:'unfollowed',actionAt});
+    }else if(type==='reposts'){
+      X.stats.unreposts++;
+      X.backup.unreposted.push({id,date:snap.date||'',text:snap.text||'',author:snap.author||'',url:snap.url||'',action:'unreposted',actionAt});
+    }else{
+      const standalone=type==='replies'&&snap.classification==='standalone';
+      const row={id,date:snap.date||'',text:snap.text||'',author:snap.author||me||'',url:snap.url||'',classification:snap.classification||'',action:type==='replies'&&!standalone?'deleted_reply':'deleted',actionAt};
+      if(type==='replies'){X.stats.repliesDeleted++;if(standalone)X.backup.tweets.push(row);else X.backup.replies.push(row)}else{X.stats.deleted++;X.backup.tweets.push(row)}
+    }
+    X.successCount++;updateOverlay();
+  };
   const tick=async()=>{
     if(X.busy||!X.interval)return;X.busy=true;
     try{
@@ -558,27 +648,18 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
           const confirmed=await clickConfirm('confirmationSheetConfirm');
           if(await stopIfIssue(confirmed?900:0))break;
           if(!confirmed)noteFailure(id);
-          if(confirmed){
-            X.processed.add(id);X.stats.unfollows++;X.backup.unfollows.push({username:snap.username||id,displayName:snap.displayName||snap.text||id,profileUrl:snap.url?.startsWith('/')?`https://x.com${snap.url}`:snap.url||`https://x.com/${id}`,action:'unfollowed',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
-          }
+          if(confirmed)recordSuccess(id,snap);
           await sleep(850);
         }else if(type==='reposts'){
           if(!await clickConfirm('unretweetConfirm'))noteFailure(id);
-          else{
-            X.processed.add(id);X.stats.unreposts++;X.backup.unreposted.push({id,date:snap.date||'',text:snap.text||'',author:snap.author||'',url:snap.url||'',action:'unreposted',actionAt:new Date().toISOString()});X.successCount++;updateOverlay();
-          }
+          else recordSuccess(id,snap);
           await sleep(700);
         }else if(!await clickDeleteMenu()){
           noteFailure(id);
         }else{
           await sleep(550);
           if(!await clickConfirm('confirmationSheetConfirm'))noteFailure(id);
-          else{
-            X.processed.add(id);
-            const standalone=type==='replies'&&snap.classification==='standalone';
-            const row={id,date:snap.date||'',text:snap.text||'',author:snap.author||me||'',url:snap.url||'',classification:snap.classification||'',action:type==='replies'&&!standalone?'deleted_reply':'deleted',actionAt:new Date().toISOString()};
-            if(type==='replies'){X.stats.repliesDeleted++;if(standalone)X.backup.tweets.push(row);else X.backup.replies.push(row)}else{X.stats.deleted++;X.backup.tweets.push(row)}X.successCount++;updateOverlay();
-          }
+          else recordSuccess(id,snap);
           await sleep(800);
         }
         handled++;if(handled>=3)break;
@@ -594,15 +675,55 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     }finally{X.busy=false}
   };
   // Sequential loop paced by sleep() instead of setInterval, so it keeps running in a background tab.
-  const token=X.interval={loop:true};
-  (async()=>{
-    while(X.interval===token){
-      const started=Date.now();
-      try{await tick()}catch(_){}
-      if(X.interval!==token)break;
-      await sleep(Math.max(250,2600-(Date.now()-started)));
+  const startDomLoop=()=>{
+    X.mode='dom';window.scrollTo({top:0,behavior:'auto'});
+    const token=X.interval={loop:true};
+    (async()=>{
+      while(X.interval===token){
+        const started=Date.now();
+        try{await tick()}catch(_){}
+        if(X.interval!==token)break;
+        await sleep(Math.max(250,2600-(Date.now()-started)));
+      }
+    })();
+  };
+  // API mode: acts on the selected ids directly through X's web API (worker/xapi.js), so nothing
+  // has to be found on the page again. Falls back to clicking when X refuses the API before the
+  // first success.
+  const runApi=async api=>{
+    const token=X.interval={api:true};
+    const active=()=>X.interval===token;
+    const options={isActive:active,onWait:until=>{X.waitUntil=until;updateOverlay()}};
+    const fallback=reason=>{
+      if(!active())return;
+      X.apiFallback=reason;console.warn('[X Bulk Clean] API mode unavailable, clicking instead:',reason);
+      X.interval=null;startDomLoop();
+    };
+    const ready=await api.init(account);
+    if(!active())return;
+    if(!ready.ok)return fallback(ready.reason);
+    X.mode='api';
+    const pace=type==='unfollow'?'unfollow':type==='reposts'?'unrepost':'delete';
+    let failures=0,gone=0;
+    for(const [id,snap] of selected){
+      if(!active())return;
+      if(X.processed.has(id))continue;
+      const result=type==='unfollow'?await api.unfollow({id:snap.userId,username:snap.username||id},options)
+        :type==='reposts'?await api.deleteRetweet(id,options):await api.deleteTweet(id,options);
+      if(!active()||result.kind==='stopped')return;
+      if(result.kind==='ok'){failures=0;recordSuccess(id,snap)}
+      else if(result.kind==='gone'){X.processed.add(id);gone++}
+      else if(result.kind==='stop'){await stop(result.message);return}
+      else if(result.kind==='refused'&&!X.successCount)return fallback(result.message);
+      else if(++failures>=5){await stop(`X API errors: ${result.message||result.kind}`);return}
+      await api.sleep(api.pace(pace));
     }
-  })();
+    const verb=type==='unfollow'?'unfollowed':type==='reposts'?'removed':'deleted';
+    if(active())await stop(`Finished — ${X.successCount} selected items ${verb}${gone?`, ${gone} already gone`:''}`);
+  };
+  const api=useApi?globalThis.__xbcApi:null;
+  if(api)runApi(api).catch(error=>{if(X.interval)stop(`Error: ${error?.message||error}`)});
+  else startDomLoop();
   return {ok:true};
 }
 
@@ -628,7 +749,9 @@ async function startScan() {
   const type = selectedType();
   await ensurePreviewPage(type);
   activeTab = await findActiveXTab();
-  const result = await executeInTab(startPreviewScanner, [type, activeAccount, $('previewPerformance').checked, selectedReplyScope()]);
+  const useApi = $('previewApi').checked;
+  if (useApi) await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['worker/xapi.js'] });
+  const result = await executeInTab(startPreviewScanner, [type, activeAccount, $('previewPerformance').checked, selectedReplyScope(), useApi]);
   if (!result?.ok) { showError(result?.error || 'Could not start the scan.'); return; }
   await chrome.storage.local.set({ activePreviewSession: { tabId: activeTab.id, type, replyScope: selectedReplyScope(), account: activeAccount, startedAt: Date.now() } });
   previewItems = []; shownItems = PAGE_SIZE;
@@ -801,7 +924,9 @@ async function beginSelectedDelete() {
   const action = selectedType() === 'replies' ? 'deleteReplies' : selectedType() === 'reposts' ? 'unrepost' : selectedType() === 'unfollow' ? 'bulkUnfollow' : 'delete';
   const startedAt = Date.now();
   await chrome.storage.local.set({ activeAction: action, activeTabId: activeTab.id, startTime: startedAt, actionStats: {} });
-  const result = await executeInTab(runSelectedDelete, [selectedType(), selected, activeAccount, $('previewPerformance').checked]);
+  const useApi = $('previewApi').checked;
+  if (useApi) await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['worker/xapi.js'] });
+  const result = await executeInTab(runSelectedDelete, [selectedType(), selected, activeAccount, $('previewPerformance').checked, useApi]);
   if (!result?.ok) { await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']); showError(result?.error || 'Could not start selected deletion.'); return; }
   cleanupRunning = true; $('reviewSection').style.display='none'; $('stickyBar').style.display='none'; $('scanCard').style.display='block'; $('scanCard').classList.remove('paused','done'); $('scanState').textContent=action==='bulkUnfollow'?'Unfollowing selected':action==='unrepost'?'Removing selected':'Deleting selected'; $('scanCount').textContent='0'; $('pauseScan').style.display='none'; $('stopScan').textContent=action==='bulkUnfollow'?'Stop unfollowing':action==='unrepost'?'Stop removal':'Stop deletion'; $('stopScan').disabled=false; startPolling();
 }

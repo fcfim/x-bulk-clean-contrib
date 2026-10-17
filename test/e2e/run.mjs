@@ -34,6 +34,41 @@ async function quickClean(env, action, { apiMode = true } = {}) {
   return { job, record, worker, seconds: (Date.now() - started) / 1000 };
 }
 
+// Preview & Select in the side panel: scan, keep everything selected, act on the selection.
+async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true } = {}) {
+  const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
+  const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+  await panel.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
+  await panel.evaluate(({ type, replyScope, apiMode }) => {
+    document.querySelector(`input[name="previewType"][value="${type}"]`).click();
+    if (type === 'replies') document.querySelector(`input[name="replyScope"][value="${replyScope}"]`).click();
+    const box = document.getElementById('previewApi');
+    if (box.checked !== apiMode) box.click();
+    document.getElementById('startScan').click();
+  }, { type, replyScope, apiMode });
+  await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState')?.textContent || '') && !document.getElementById('deleteSelected').disabled, null, { timeout: 90000 });
+  const scanned = await panel.evaluate(() => ({ found: document.getElementById('stickyScanned').textContent, selected: document.getElementById('selectedCount').textContent }));
+  const scan = await env.worker.evaluate(async () => {
+    const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+    const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { const P = window.__xbcPreview; return P && { mode: P.mode, apiFallback: P.apiFallback || null, items: P.items.map(i => ({ id: i.id, type: i.type, classification: i.classification, userId: i.userId })) }; } });
+    return r?.result;
+  });
+  await panel.evaluate(() => document.getElementById('deleteSelected').click());
+  await panel.waitForFunction(() => document.getElementById('deleteDialog')?.open, null, { timeout: 10000 });
+  await panel.evaluate(() => document.getElementById('confirmDelete').click());
+  const job = await waitFor(async () => {
+    const history = (await storage(env.worker, ['jobHistory'])).jobHistory || [];
+    return history.length > before ? history[0] : null;
+  }, { timeout: 120000, label: `selected ${type} job to finish` });
+  const worker = await env.worker.evaluate(async () => {
+    const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+    const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { const X = window.__xCleaner; return X && { mode: X.mode, apiFallback: X.apiFallback || null, issue: X.issue }; } });
+    return r?.result;
+  });
+  await panel.close();
+  return { scanned, scan, job, worker };
+}
+
 const SCENARIOS = [
   {
     name: 'delete posts via API, leaving reposts alone',
@@ -159,6 +194,58 @@ const SCENARIOS = [
         ['mode is dom', r.worker?.mode === 'dom', r.worker],
         ['no API mutation sent', !state.calls.some(c => c.op === 'DeleteTweet')],
         ['all 4 deleted by clicking', state.tweets.length === 0, state.tweets.length]
+      ];
+    }
+  },
+  {
+    name: 'preview: scan posts via API and delete the selection',
+    state: { own: 9, replies: 3, retweets: 2, pageSize: 4 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets');
+      return [
+        ['scan ran via API', r.scan?.mode === 'api', r.scan],
+        ['scan found exactly the 9 posts (no replies, no reposts)', r.scan?.items.length === 9 && r.scan.items.every(i => i.classification === 'tweets'), r.scan?.items.length],
+        ['delete ran via API', r.worker?.mode === 'api', r.worker],
+        ['the 9 posts are gone, replies and reposts kept', state.tweets.filter(t => !t.retweetOf && !t.replyTo).length === 0 && state.tweets.length === 5, state.tweets.length],
+        ['history: 9 records', r.job.total === 9, r.job]
+      ];
+    }
+  },
+  {
+    name: 'preview: replies only, exact from the API',
+    state: { own: 4, replies: 5, pageSize: 3 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'replies', { replyScope: 'fast' });
+      return [
+        ['scan ran via API', r.scan?.mode === 'api', r.scan],
+        ['5 replies found, none of the other person\'s posts', r.scan?.items.length === 5 && r.scan.items.every(i => i.classification === 'definite' && /^8/.test(i.id)), r.scan?.items],
+        ['replies deleted, posts kept', state.tweets.filter(t => t.replyTo).length === 0 && state.tweets.length === 4, state.tweets.length],
+        ['history: 5 replies', r.job.counts.replies === 5, r.job.counts]
+      ];
+    }
+  },
+  {
+    name: 'preview: unfollow selected accounts by user id',
+    state: { following: 7, pageSize: 3 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'unfollow');
+      const calls = state.calls.filter(c => c.op === 'friendships/destroy');
+      return [
+        ['scan ran via API with user ids', r.scan?.mode === 'api' && r.scan.items.length === 7 && r.scan.items.every(i => i.userId), r.scan],
+        ['all 7 unfollowed by user_id', state.following.length === 0 && calls.every(c => c.form.user_id), calls.length],
+        ['history: 7 unfollows', r.job.counts.unfollows === 7, r.job.counts]
+      ];
+    }
+  },
+  {
+    name: 'preview: reposts via API',
+    state: { own: 2, retweets: 5, pageSize: 3 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'reposts');
+      return [
+        ['scan found the 5 reposts by original id', r.scan?.mode === 'api' && r.scan.items.length === 5 && r.scan.items.every(i => /^5/.test(i.id)), r.scan],
+        ['reposts removed, posts kept', state.tweets.filter(t => t.retweetOf).length === 0 && state.tweets.length === 2],
+        ['history: 5 unreposted', r.job.counts.unreposted === 5, r.job.counts]
       ];
     }
   }
