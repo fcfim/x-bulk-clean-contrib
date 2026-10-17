@@ -1,0 +1,12 @@
+{
+  "name": "x-bulk-clean",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test:e2e": "node test/e2e/run.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}

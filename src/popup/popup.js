@@ -1154,6 +1154,7 @@ function disableActionButtons(disabled) {
   $('stopAction').disabled = !disabled;
   $('openPreview').disabled = disabled;
   $('performanceMode').disabled = disabled;
+  $('apiMode').disabled = disabled;
   document.body.dataset.running = disabled ? 'true' : 'false';
   const moreActions = document.querySelector('.more-actions');
   if (moreActions) moreActions.inert = disabled;
@@ -1606,10 +1607,14 @@ async function renderRecentJobs() {
 // === Bootstrap ===
 
 document.addEventListener('DOMContentLoaded', async () => {
-  const settings = await chrome.storage.local.get(['performanceMode']);
+  const settings = await chrome.storage.local.get(['performanceMode', 'apiMode']);
   $('performanceMode').checked = settings.performanceMode ?? true;
   $('performanceMode').addEventListener('change', () => {
     chrome.storage.local.set({ performanceMode: $('performanceMode').checked });
+  });
+  $('apiMode').checked = settings.apiMode ?? true;
+  $('apiMode').addEventListener('change', () => {
+    chrome.storage.local.set({ apiMode: $('apiMode').checked });
   });
 
   $('startDelete').addEventListener('click', () => requestAction('delete'));

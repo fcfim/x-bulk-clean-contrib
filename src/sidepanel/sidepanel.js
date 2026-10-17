@@ -810,8 +810,9 @@ async function initialize() {
   activeTab = await findActiveXTab();
   activeAccount = await detectAccount(activeTab);
   renderAccount(activeAccount);
-  const settings = await chrome.storage.local.get(['performanceMode','activeAction','previewRequestedType']);
+  const settings = await chrome.storage.local.get(['performanceMode','apiMode','activeAction','previewRequestedType']);
   $('previewPerformance').checked = settings.performanceMode ?? true;
+  $('previewApi').checked = settings.apiMode ?? true;
   if (settings.previewRequestedType) {
     const requested = document.querySelector(`input[name="previewType"][value="${settings.previewRequestedType}"]`);
     if (requested) requested.checked = true;
@@ -842,6 +843,7 @@ document.addEventListener('DOMContentLoaded', () => {
   ['resultSearch','dateFrom','dateTo'].forEach(id=>$(id).addEventListener('input',()=>{shownItems=PAGE_SIZE;renderReview()}));
   $('loadMore').addEventListener('click',()=>{shownItems+=PAGE_SIZE;renderReview()}); $('deleteSelected').addEventListener('click',openDeleteDialog); $('cancelDelete').addEventListener('click',()=>$('deleteDialog').close()); $('confirmDelete').addEventListener('click',beginSelectedDelete);
   $('openHistory').addEventListener('click',()=>chrome.runtime.openOptionsPage());
+  $('previewApi').addEventListener('change',()=>chrome.storage.local.set({ apiMode: $('previewApi').checked }));
   document.querySelectorAll('input[name="previewType"],input[name="replyScope"]').forEach(input => input.addEventListener('change', updateSetupOptions));
   updateSetupOptions();
   initialize();
