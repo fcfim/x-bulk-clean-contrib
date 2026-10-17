@@ -763,12 +763,25 @@ function runWorker(action, performanceMode, account) {
   // timeline. Otherwise X just hasn't virtualized the next batch into view yet, and
   // stopping here would abandon most of the user's content (the old 0/12 bug).
   function noteEmpty(found) {
+    // A hidden tab is not rendered, so X neither draws nor loads more items until it is visible
+    // again. An empty cycle then says nothing about the end of the timeline.
+    if (hidden()) return;
     if (found === 0 && atBottom()) {
       X.emptyCycles++;
       if (X.emptyCycles >= 5) stopAll('Finished — no more items found');
     } else {
       X.emptyCycles = 0;
     }
+  }
+
+  // Scroll on to the next batch. While the tab is hidden and X has drawn nothing, scrolling blind
+  // would only run past the posts it has yet to draw. The synthetic scroll event lets X's own
+  // listener see the new position, since real scroll events wait for the tab to render.
+  function advance(found, handled) {
+    if (found > handled) return;
+    if (hidden() && !document.querySelector('article[data-testid="tweet"], [data-testid="UserCell"]')) return;
+    window.scrollBy(0, window.innerHeight * 0.7);
+    window.dispatchEvent(new Event('scroll'));
   }
 
   // === Action dispatch ===
@@ -853,7 +866,7 @@ function runWorker(action, performanceMode, account) {
         noteEmpty(candidates.length);
         // Only advance once every visible candidate this cycle was handled — otherwise a
         // fast scroll would virtualize away unprocessed items before we reach them.
-        if (candidates.length <= processedThisCycle) window.scrollBy(0, window.innerHeight * 0.7);
+        advance(candidates.length, processedThisCycle);
         await sleep(hidden() ? 1500 : 1000);
       } finally {
         X.busy = false;
@@ -900,7 +913,7 @@ function runWorker(action, performanceMode, account) {
         noteEmpty(candidates.length);
         // Only advance once every visible candidate this cycle was handled — otherwise a
         // fast scroll would virtualize away unprocessed items before we reach them.
-        if (candidates.length <= processedThisCycle) window.scrollBy(0, window.innerHeight * 0.7);
+        advance(candidates.length, processedThisCycle);
         await sleep(hidden() ? 1500 : 1000);
       } finally {
         X.busy = false;
@@ -961,7 +974,7 @@ function runWorker(action, performanceMode, account) {
         noteEmpty(candidates.length);
         // Only advance once every visible candidate this cycle was handled — otherwise a
         // fast scroll would virtualize away unprocessed items before we reach them.
-        if (candidates.length <= processedThisCycle) window.scrollBy(0, window.innerHeight * 0.7);
+        advance(candidates.length, processedThisCycle);
         await sleep(hidden() ? 1800 : 1200);
       } finally {
         X.busy = false;
@@ -1022,7 +1035,7 @@ function runWorker(action, performanceMode, account) {
         noteEmpty(candidates.length);
         // Only advance once every visible candidate this cycle was handled — otherwise a
         // fast scroll would virtualize away unprocessed items before we reach them.
-        if (candidates.length <= processedThisCycle) window.scrollBy(0, window.innerHeight * 0.7);
+        advance(candidates.length, processedThisCycle);
         await sleep(hidden() ? 2000 : 1500);
       } finally {
         X.busy = false;
@@ -1081,7 +1094,7 @@ function runWorker(action, performanceMode, account) {
         noteEmpty(candidates.length);
         // Only advance once every visible candidate this cycle was handled — otherwise a
         // fast scroll would virtualize away unprocessed items before we reach them.
-        if (candidates.length <= processedThisCycle) window.scrollBy(0, window.innerHeight * 0.7);
+        advance(candidates.length, processedThisCycle);
         await sleep(hidden() ? 2000 : 1500);
       } finally {
         X.busy = false;

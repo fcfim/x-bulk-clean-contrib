@@ -156,6 +156,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     setTimeout(done, ms);
     try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); }); } catch (_) {}
   });
+  const hidden = () => document.hidden || document.visibilityState === 'hidden';
   const ownHandle = () => {
     const link = document.querySelector('[data-testid="AppTabBar_Profile_Link"]') || document.querySelector('a[aria-label="Profile"]');
     return link?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
@@ -263,13 +264,18 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
         });
         added++;
       }
-      if (!added && atBottom()) P.emptyCycles++;
+      // A hidden tab is not rendered: X draws no more items until it is visible, so neither count
+      // an empty cycle as the end of the list nor scroll blind past items it has yet to draw.
+      if (hidden()) {
+        if (!document.querySelector('article[data-testid="tweet"], [data-testid="UserCell"]')) return;
+      } else if (!added && atBottom()) P.emptyCycles++;
       else P.emptyCycles = 0;
       if (P.emptyCycles >= 6) {
         finish('Scan complete', true);
         return;
       }
       window.scrollBy(0, Math.max(520, window.innerHeight * .78));
+      window.dispatchEvent(new Event('scroll'));
     } finally {
       P.busy = false;
     }
@@ -362,6 +368,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
     setTimeout(done, ms);
     try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); }); } catch (_) {}
   });
+  const hidden = () => document.hidden || document.visibilityState === 'hidden';
   const ownHandle = () => document.querySelector('[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
   const me = ownHandle();
   const tweetId = article => article.querySelector('a[href*="/status/"]')?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1] || null;
@@ -578,9 +585,12 @@ function runSelectedDelete(type, selectedItems, account, performanceMode) {
       }
       const resultVerb=type==='unfollow'?'unfollowed':type==='reposts'?'removed':'deleted';
       if(X.successCount>=selected.size){stop(`Finished — ${X.successCount} selected items ${resultVerb}`);return}
-      if(!candidates.length&&atBottom())X.emptyCycles++;else X.emptyCycles=0;
+      // A hidden tab is not rendered: X draws no more items until it is visible, so neither count
+      // an empty cycle as the end nor scroll blind past items it has yet to draw.
+      const blind=hidden()&&!document.querySelector('article[data-testid="tweet"],[data-testid="UserCell"]');
+      if(!hidden()){if(!candidates.length&&atBottom())X.emptyCycles++;else X.emptyCycles=0}
       if(X.emptyCycles>=6){stop(`Finished — ${X.successCount} ${resultVerb}, ${Math.max(0,selected.size-X.successCount)} not found`);return}
-      if(candidates.length<=handled)window.scrollBy(0,Math.max(520,window.innerHeight*.75));
+      if(candidates.length<=handled&&!blind){window.scrollBy(0,Math.max(520,window.innerHeight*.75));window.dispatchEvent(new Event('scroll'))}
     }finally{X.busy=false}
   };
   // Sequential loop paced by sleep() instead of setInterval, so it keeps running in a background tab.
