@@ -1,5 +1,5 @@
 {
-  "name": "x-bulk-clean",
+  "name": "postscrub",
   "private": true,
   "type": "module",
   "scripts": {

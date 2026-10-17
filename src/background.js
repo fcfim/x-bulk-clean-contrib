@@ -1,4 +1,4 @@
-// Reserved for extension lifecycle tasks. X Bulk Clean does not send analytics,
+// Reserved for extension lifecycle tasks. Postscrub does not send analytics,
 // perform license checks, or open an uninstall survey.
 
 const X_URL = /^https:\/\/(x\.com|twitter\.com)\//;

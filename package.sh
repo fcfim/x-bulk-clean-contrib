@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 
 # Read version from manifest
 VERSION=$(grep -o '"version": "[^"]*' src/manifest.json | head -n 1 | cut -d'"' -f4)
-ZIP_NAME="x-bulk-clean-v${VERSION}.zip"
+ZIP_NAME="postscrub-v${VERSION}.zip"
 
 # Remove any existing zip
 rm -f "$ZIP_NAME"

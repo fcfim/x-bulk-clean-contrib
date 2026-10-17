@@ -1,5 +1,5 @@
 const ACTION_LABELS = {
-  delete: 'Deleted tweets',
+  delete: 'Deleted posts',
   unlike: 'Cleared likes',
   unrepost: 'Removed reposts',
   deleteReplies: 'Deleted replies',
@@ -80,7 +80,7 @@ function downloadJob(job) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
-  anchor.download = `x_bulk_clean_${job.action || 'job'}_${new Date(job.completedAt || Date.now()).toISOString().slice(0, 10)}.csv`;
+  anchor.download = `postscrub_${job.action || 'job'}_${new Date(job.completedAt || Date.now()).toISOString().slice(0, 10)}.csv`;
   anchor.click();
   URL.revokeObjectURL(url);
 }
@@ -101,7 +101,7 @@ async function downloadAllHistory() {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
-  anchor.download = `x_bulk_clean_history_${new Date().toISOString().slice(0, 10)}.csv`;
+  anchor.download = `postscrub_history_${new Date().toISOString().slice(0, 10)}.csv`;
   anchor.click();
   URL.revokeObjectURL(url);
 }

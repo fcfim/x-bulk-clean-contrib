@@ -96,7 +96,7 @@ function updateSetupOptions() {
   $('replyScopeNote').classList.toggle('visible', all);
   document.querySelectorAll('.date-filter').forEach(filter => { filter.hidden = type === 'unfollow'; });
   const copy = type === 'tweets'
-    ? { title: 'Tweet cleanup', body: 'Review posts from your profile before you delete them.', tone: 'danger', start: 'Scan tweets' }
+    ? { title: 'Post cleanup', body: 'Review posts from your profile before you delete them.', tone: 'danger', start: 'Scan posts' }
     : type === 'replies'
       ? { title: all ? 'Posts + replies' : 'Replies only', body: all ? 'One pass through your Replies page. Review every selected item carefully.' : 'Scan clearly identified replies from your Replies page.', tone: all ? 'danger' : 'blue', start: 'Scan replies' }
       : type === 'reposts'
@@ -109,7 +109,7 @@ function updateSetupOptions() {
 }
 
 function typeLabel(type = selectedType()) {
-  return type === 'unfollow' ? 'following accounts' : type === 'reposts' ? 'reposts' : type === 'replies' ? 'replies' : 'tweets';
+  return type === 'unfollow' ? 'following accounts' : type === 'reposts' ? 'reposts' : type === 'replies' ? 'replies' : 'posts';
 }
 
 async function ensurePreviewPage(type) {
@@ -321,7 +321,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     const fallback = (reason) => {
       if (!active()) return;
       P.apiFallback = reason;
-      console.warn('[X Bulk Clean] API scan unavailable, scrolling instead:', reason);
+      console.warn('[Postscrub] API scan unavailable, scrolling instead:', reason);
       P.interval = null;
       startDomScan();
     };
@@ -561,7 +561,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     if (X.interval && kicker) {
       kicker.textContent = X.waitUntil
         ? `X rate limit · resuming at ${new Date(X.waitUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-        : X.mode === 'api' ? 'X Bulk Clean running · API mode' : 'X Bulk Clean running';
+        : X.mode === 'api' ? 'Postscrub running · API mode' : 'Postscrub running';
     }
   };
   const createOverlay = () => {
@@ -571,7 +571,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     const verb = type === 'unfollow' ? 'Unfollowing' : type === 'reposts' ? 'Removing' : 'Deleting';
     const progressVerb = type === 'unfollow' ? 'unfollowed' : type === 'reposts' ? 'removed' : 'deleted';
     const object = type === 'unfollow' ? 'accounts' : type;
-    shadow.innerHTML=`<style>*{box-sizing:border-box}.c{width:290px;padding:14px;border-radius:14px;background:rgba(20,20,20,.96);color:#fff;box-shadow:0 18px 48px rgba(0,0,0,.35);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.k{color:#8fd5ae;font-size:10px;font-weight:750;letter-spacing:.09em;text-transform:uppercase}h2{margin:6px 0 4px;font-size:16px}.a,.m{color:#aaa;font-size:11px}.m{margin-top:10px;font-variant-numeric:tabular-nums}button{width:100%;height:38px;margin-top:11px;border:1px solid rgba(255,90,85,.28);border-radius:8px;background:rgba(255,90,85,.12);color:#ff8580;font-weight:750;cursor:pointer}</style><section class="c"><div class="k">X Bulk Clean running</div><h2>${verb} selected ${object}</h2><div class="a"></div><div id="count" class="m">0 of ${selected.size} ${progressVerb}</div><button id="stop">Stop current action</button></section>`;
+    shadow.innerHTML=`<style>*{box-sizing:border-box}.c{width:290px;padding:14px;border-radius:14px;background:rgba(20,20,20,.96);color:#fff;box-shadow:0 18px 48px rgba(0,0,0,.35);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.k{color:#8fd5ae;font-size:10px;font-weight:750;letter-spacing:.09em;text-transform:uppercase}h2{margin:6px 0 4px;font-size:16px}.a,.m{color:#aaa;font-size:11px}.m{margin-top:10px;font-variant-numeric:tabular-nums}button{width:100%;height:38px;margin-top:11px;border:1px solid rgba(255,90,85,.28);border-radius:8px;background:rgba(255,90,85,.12);color:#ff8580;font-weight:750;cursor:pointer}</style><section class="c"><div class="k">Postscrub running</div><h2>${verb} selected ${object}</h2><div class="a"></div><div id="count" class="m">0 of ${selected.size} ${progressVerb}</div><button id="stop">Stop current action</button></section>`;
     shadow.querySelector('.a').textContent=account?.username?`@${account.username}`:'Active account';
     shadow.getElementById('stop').addEventListener('click',()=>/rate.?limit/i.test(X.issue||'')?X.overlayHost?.remove():stop('Stopped by user'));
     (document.body||document.documentElement).appendChild(host); X.overlayHost=host; updateOverlay(); X.overlayTimer=setInterval(updateOverlay,500);
@@ -696,7 +696,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     const options={isActive:active,onWait:until=>{X.waitUntil=until;updateOverlay()}};
     const fallback=reason=>{
       if(!active())return;
-      X.apiFallback=reason;console.warn('[X Bulk Clean] API mode unavailable, clicking instead:',reason);
+      X.apiFallback=reason;console.warn('[Postscrub] API mode unavailable, clicking instead:',reason);
       X.interval=null;startDomLoop();
     };
     const ready=await api.init(account);
@@ -899,7 +899,7 @@ function openDeleteDialog() {
   const unfollow = selectedType() === 'unfollow';
   $('deleteAccount').textContent = `@${activeAccount.username}`;
   $('deleteCount').textContent = `${selected.length} ${selected.length === 1 ? 'item' : 'items'}`;
-  $('deleteTitle').textContent = unfollow ? `Unfollow ${selected.length} selected accounts?` : `${reposts ? 'Remove' : 'Delete'} ${selected.length} selected ${selectedType()}?`;
+  $('deleteTitle').textContent = unfollow ? `Unfollow ${selected.length} selected accounts?` : `${reposts ? 'Remove' : 'Delete'} ${selected.length} selected ${typeLabel()}?`;
   $('deleteDescription').textContent = unfollow
     ? 'Only the selected accounts will be unfollowed. A detailed job record will be saved locally.'
     : reposts

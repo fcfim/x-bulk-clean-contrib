@@ -1,37 +1,19 @@
-# Changelog 📋
+# Changelog
 
-All notable changes are documented here. Releases before `1.4.0` are not reconstructed in detail.
+## [0.1.0] - Unreleased
 
-## [Unreleased]
+First release of Postscrub.
 
-### Fixed 🐛
+### Added
 
-- 🌐 Deleting posts and replies now works when X is not in English. The Delete menu item was matched only by its English label, so with X in Portuguese ("Excluir") or other languages every post was counted as found but none was deleted. Known labels in common languages are matched, with a language-independent fallback (the red first item of the menu on your own posts).
-- 🔁 Posts are no longer skipped after a single missed click. X re-renders the timeline after each deletion, so the worker now looks the post up again before acting and retries it up to three times before giving up.
-- 🕒 Jobs keep running while the X tab is in the background. Chrome throttles timers in hidden tabs (to about one wake-up per minute after five minutes), which stalled jobs; sleeps are now timed by the extension's service worker, the job tab is kept from being discarded by Memory Saver, and a Web Lock keeps the tab from being frozen.
-- 🙈 Jobs and Preview scans no longer end early as "Finished" while the X tab is hidden. A hidden tab is not rendered, so X drew no posts and the worker scrolled to the bottom, saw nothing and stopped; empty cycles in a hidden tab no longer count as the end, and the worker waits instead of scrolling past posts X has yet to draw.
-- 💬 Reply detection and X error toasts also recognize Portuguese, Spanish, French and German wording.
+- API mode, on by default: lists and acts through the same requests X's own site sends, so jobs are faster and keep running in a background tab. Request formats are discovered at runtime from the page and X's current web bundle. Falls back to clicking through the page when X refuses the API.
+- Preview & Select scans through the API identify replies exactly, and selected items are acted on directly by id.
+- Automatic handling of X's limits: waits out rate limits until X's reset time and slows down afterwards; stops at once on account locks, restricted sessions, suspensions, expired sessions, daily limits, the follow limit and anything X flags as automated.
+- End-to-end tests that load the extension in Chromium against a simulated x.com.
 
-## [1.4.0] - 2026-07-11 🚀
+### Fixed
 
-### Added ✨
-
-- 🧭 Preview & Select in Chrome's Side Panel for tweets, replies, reposts, and Following accounts.
-- 💬 Reply scan choices: **Replies only** or **Posts + replies** for one-pass manual review of standalone posts and possible orphan replies.
-- 👥 Selected-only bulk unfollow, including profile photos, bios, search, confirmation, progress, local backup, and CSV export data.
-- 🛡️ Active-account display, destructive-action confirmations, job locking, and an in-page progress overlay with stop control.
-- 📦 Persistent job history with per-job details, individual CSV downloads, and a single **Download all CSV** export.
-- ⚡ Performance mode for reducing media rendering while scans and cleanup jobs run.
-- 🔗 Quick access to the GitHub repository from the popup header.
-
-### Changed 🎨
-
-- 🧩 Reworked popup, Side Panel, and History UI around safer review-first cleanup flows.
-- ✨ Improved interaction feedback, accessibility focus states, reduced-motion support, and restrained state-transition animations.
-- 🚪 The popup closes after a cleanup worker starts successfully.
-
-### Fixed 🐛
-
-- 🔓 Quick Clean actions now end an existing Preview session only after confirmation instead of becoming blocked by a stale preview lock.
-- 🧠 Reply cleanup no longer needs a second main-profile scan; the Posts + replies mode keeps standalone items available for manual selection.
-- ⏸️ Rate Limit Guard stops follow and unfollow jobs immediately when X reports a rate limit, avoids counting failed actions, and records the job as rate limited.
+- Deleting posts and replies works in every language X supports. Only the English "Delete" label was recognized, so on X in Portuguese and other languages posts were found but never deleted.
+- Posts are no longer skipped after one missed click: elements are looked up again after X re-renders, and a post is retried up to three times.
+- Jobs no longer stall or end early in a background tab: sleeps are timed by the service worker, the tab is kept from being discarded, and a hidden tab's empty cycles no longer count as the end of a list.
+- Reply detection and X's error toasts are recognized in Portuguese, Spanish, French and German.

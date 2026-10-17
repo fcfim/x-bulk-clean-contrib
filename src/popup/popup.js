@@ -11,7 +11,7 @@ let armedHistoryTimer = null;
 let previewSessionToEnd = null;
 
 const ACTION_LABELS = {
-  delete: 'Deleting tweets',
+  delete: 'Deleting posts',
   unlike: 'Unliking posts',
   unrepost: 'Removing reposts',
   deleteReplies: 'Deleting replies',
@@ -32,21 +32,21 @@ const ACTION_PATHS = {
 
 const ACTION_CONFIRMATIONS = {
   delete: {
-    title: 'Delete all tweets?',
-    description: 'Tweets will be permanently deleted as X Bulk Clean scrolls through your profile.',
-    button: 'Delete all tweets',
+    title: 'Delete all your posts?',
+    description: 'Every post on your profile will be permanently deleted. A record of each one is saved locally.',
+    button: 'Delete all posts',
     icon: 'icon-trash',
     danger: true
   },
   unlike: {
     title: 'Clear all likes?',
-    description: 'Likes will be removed automatically as X Bulk Clean scrolls through your Likes tab.',
+    description: 'Every post in your Likes will be unliked. A record of each one is saved locally.',
     button: 'Clear all likes',
     icon: 'icon-heart-off'
   },
   unrepost: {
     title: 'Remove all reposts?',
-    description: 'Every repost X Bulk Clean can find on your timeline will be undone.',
+    description: 'Every repost on your profile will be undone. A record of each one is saved locally.',
     button: 'Remove reposts',
     icon: 'icon-repeat'
   },
@@ -59,19 +59,19 @@ const ACTION_CONFIRMATIONS = {
   },
   followVerified: {
     title: 'Follow verified followers?',
-    description: 'X Bulk Clean will follow verified accounts found in your followers list.',
+    description: 'Postscrub will follow the verified accounts in your followers list.',
     button: 'Start following',
     icon: 'icon-badge-check'
   },
   followAll: {
     title: 'Follow all followers?',
-    description: 'X Bulk Clean will follow back accounts found in your followers list.',
+    description: 'Postscrub will follow back the accounts in your followers list.',
     button: 'Start following',
     icon: 'icon-users'
   },
   bulkUnfollow: {
     title: 'Start bulk unfollow?',
-    description: 'X Bulk Clean will unfollow accounts as it scrolls through your Following list.',
+    description: 'Postscrub will unfollow every account in your Following list.',
     button: 'Start unfollowing',
     icon: 'icon-user-minus',
     danger: true
@@ -349,7 +349,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
     if (X.interval && jobState) {
       jobState.textContent = X.waitUntil
         ? `X rate limit · resuming at ${new Date(X.waitUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-        : X.mode === 'api' ? 'X Bulk Clean running · API mode' : 'X Bulk Clean running';
+        : X.mode === 'api' ? 'Postscrub running · API mode' : 'Postscrub running';
     }
     const elapsed = Math.max(0, Math.floor((Date.now() - X.startedAt) / 1000));
     shadow.getElementById('jobTime').textContent = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}`;
@@ -357,7 +357,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   function createJobOverlay() {
     const labels = {
-      delete: 'Deleting all tweets',
+      delete: 'Deleting all posts',
       unlike: 'Clearing all likes',
       unrepost: 'Removing all reposts',
       deleteReplies: 'Deleting all replies',
@@ -391,7 +391,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
         @media(prefers-reduced-motion:reduce){.progress::after{animation:none;width:100%}button{transition:none}}
       </style>
       <section class="card" role="status" aria-live="polite">
-        <div class="kicker"><span class="dot"></span><span id="jobState">X Bulk Clean running</span></div>
+        <div class="kicker"><span class="dot"></span><span id="jobState">Postscrub running</span></div>
         <h2 id="jobTitle"></h2>
         <div class="account">
           <div id="jobFallback" class="fallback"></div>
@@ -853,7 +853,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
     const fallback = (reason) => {
       if (!active()) return;
       X.apiFallback = reason;
-      console.warn('[X Bulk Clean] API mode unavailable, clicking instead:', reason);
+      console.warn('[Postscrub] API mode unavailable, clicking instead:', reason);
       X.interval = null;
       startDomLoop();
     };
@@ -861,7 +861,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
     if (!active()) return;
     if (!ready.ok || !api.canList(LIST_OP[action])) return fallback(ready.reason || `no ${LIST_OP[action]} operation`);
     X.mode = 'api';
-    console.info('[X Bulk Clean] API mode, operation sources:', ready.sources);
+    console.info('[Postscrub] API mode, operation sources:', ready.sources);
     const myId = ready.me.id;
     const isMe = t => t.authorId === myId || (!!me && t.author === me);
     const options = { isActive: active, onWait };
@@ -1633,7 +1633,7 @@ function exportAllToCSV(backup, filename) {
 }
 
 const HISTORY_ACTION_LABELS = {
-  delete: 'Deleted tweets',
+  delete: 'Deleted posts',
   unlike: 'Cleared likes',
   unrepost: 'Removed reposts',
   deleteReplies: 'Deleted replies',
@@ -1653,7 +1653,7 @@ async function downloadHistoryJob(jobId) {
   const job = stored[`job_${jobId}`];
   if (!job?.backup) return;
   const date = new Date(job.completedAt || Date.now()).toISOString().slice(0, 10);
-  exportAllToCSV(job.backup, `x_bulk_clean_${job.action || 'job'}_${date}.csv`);
+  exportAllToCSV(job.backup, `postscrub_${job.action || 'job'}_${date}.csv`);
 }
 
 async function removeHistoryJob(jobId) {

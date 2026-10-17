@@ -1,11 +1,19 @@
 # Privacy
 
-X Bulk Clean does not collect, sell, or transmit personal data to the project's developers.
+Postscrub does not collect, sell, or transmit personal data to its developers. It has no backend, analytics, telemetry, advertising or accounts.
 
-The extension reads and interacts with pages on `x.com` and `twitter.com` only when needed to perform an action selected by the user. Preferences, job history, affected-record details, and CSV backup data are stored locally through Chrome's extension storage until the user removes individual jobs or clears their history. CSV exports are created locally and downloaded by the browser.
+## What it accesses
 
-Preview scan results remain locally in the active X tab and side panel. They are not transmitted to the project's developers or an external service.
+- **x.com and twitter.com**, only in your signed-in tab and only to perform the action you start. In API mode the extension sends the same requests X's own site sends when you click (listing your posts, likes or follows, deleting, unliking, unreposting, following or unfollowing), from your browser, with your existing X session.
+- **abs.twimg.com**, X's public content server, to read the version of X's web app your tab loaded. Postscrub reads it only to learn the current request formats; nothing is sent to it.
+- A script that runs in the X page records the request formats and public settings X's page uses (operation ids, feature flags, the web app's public token and your account id). It does not record the content of requests or responses, and it does not store your cookies or session.
 
-The extension has no analytics, advertising, payment processing, license validation, telemetry, or project-operated backend. X itself may process activity performed on its website under its own privacy policy.
+## What it stores
 
-If a future contribution introduces data collection or a new external service, this document and the extension permissions must be updated before release.
+Preferences, job history, the records of affected posts and accounts, and the CSV backup data are stored locally in Chrome's extension storage until you remove jobs or clear the history. CSV exports are created locally and downloaded by your browser.
+
+Preview scan results stay in the X tab and the side panel.
+
+## Changes
+
+If a future version introduces any data collection or external service, this document and the extension's permissions will be updated before release.

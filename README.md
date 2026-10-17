@@ -1,91 +1,57 @@
 <p align="center">
-  <img src="src/icons/logo.png" alt="X Bulk Clean logo" width="160" height="160">
+  <img src="src/icons/logo.png" alt="Postscrub" width="128" height="128">
 </p>
 
-<h1 align="center">X Bulk Clean</h1>
+<h1 align="center">Postscrub</h1>
 
-<p align="center">
-  <a href="https://chromewebstore.google.com/detail/bcpkijoolaciolfegopiaifmoedbolgg">
-    <img src="https://img.shields.io/chrome-web-store/v/bcpkijoolaciolfegopiaifmoedbolgg" alt="Chrome Web Store version">
-  </a>
-  <a href="https://chromewebstore.google.com/detail/bcpkijoolaciolfegopiaifmoedbolgg">
-    <img src="https://img.shields.io/chrome-web-store/users/bcpkijoolaciolfegopiaifmoedbolgg" alt="Chrome Web Store users">
-  </a>
-  <a href="https://github.com/agmmnn/x-bulk-clean/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/agmmnn/x-bulk-clean" alt="MIT License">
-  </a>
-</p>
+<p align="center"><strong>Scrub your social history.</strong> Review first, act in bulk, everything stays in your browser.</p>
 
-<p align="center">
-  <a href="https://github.com/agmmnn/x-bulk-clean">github.com/agmmnn/x-bulk-clean</a>
-</p>
-
-**X Bulk Clean** is a Chrome extension for quickly cleaning up your X account. Bulk delete tweets, replies, reposts, and likes, or mass unfollow accounts without managing items one by one. It runs directly in your browser for a simple, fast, and privacy-friendly cleanup experience.
+Postscrub is a Chrome extension that cleans up your X account in bulk: delete posts and replies, remove likes and reposts, unfollow or follow back. You see exactly what will be removed before anything happens, every job keeps a local record you can export as CSV, and nothing is ever sent to a server of ours. There is none.
 
 ## Features
 
-- Delete posts and replies
-- Preview tweets, replies, or reposts in Chrome's side panel and choose exactly what to delete or remove
-- Preview accounts from your Following page and unfollow only the selected accounts
-- Choose a one-pass reply scan: clearly identified replies only, or all posts and replies from `/with_replies` for manual review of possible orphan replies
-- Filter scanned results by text and date, then select all, none, or invert the selection
-- Remove likes and reposts
-- Follow followers or verified followers
-- Bulk unfollow accounts
-- Show the currently active X account before an action starts
-- Confirm the account and action before every automated run
-- Monitor or stop an active job from an on-page status panel
-- Prevent overlapping cleanup jobs
-- Keep persistent, account-aware job history with dates, times, counts, and affected records
-- Review, export, or remove individual jobs from the full history page
-- Export activity backups as CSV
-- Optional performance mode that reduces tweet-media rendering during automated runs
-- No analytics, payment service, or external backend
-
-## Install from Chrome Web Store
-
-The easiest way to install X Bulk Clean:
-
-1. Visit the [Chrome Web Store listing](https://chromewebstore.google.com/detail/bcpkijoolaciolfegopiaifmoedbolgg).
-2. Click **Add to Chrome**.
-3. Sign in to X, open the extension, and choose an action.
+- **Preview & Select** in Chrome's side panel: scan posts, replies, reposts or the accounts you follow, filter by text and date, select exactly what goes.
+- **Quick clean**: delete all posts, clear all likes, remove all reposts, bulk unfollow, follow back followers.
+- **API mode** (default): Postscrub sends the same requests X's own site sends when you click, so jobs are fast and keep running in a background tab. If X refuses them, the job falls back to clicking through the page automatically.
+- **Works in any language** X is set to.
+- **Safety first**: confirmation with the active account before every run, one job at a time, a stop button on the page, and an automatic stop when X reports a lock, a limit or suspected automation. Rate limits are waited out, not hammered.
+- **Local job history** with every affected post or account, exportable as CSV.
 
 ## Install from source
 
-1. Download or clone this repository.
-2. Open `chrome://extensions` in Google Chrome.
-3. Enable **Developer mode** (toggle in the top-right corner).
-4. Click **Load unpacked** (top-left corner).
-5. Select the `src` folder inside the cloned repository.
-6. Sign in to X, open the extension, and choose an action.
+1. Clone this repository.
+2. Open `chrome://extensions` and turn on **Developer mode**.
+3. Click **Load unpacked** and select the `src` folder.
+4. Open x.com signed in, then open Postscrub from the toolbar.
 
-Preview & Select mode requires Chrome 116 or newer.
+Chrome 116 or newer is required.
 
-## Development & Packaging
+## How it works
 
-To bundle the extension into a clean ZIP archive ready for the Chrome Web Store:
-1. Make the packaging script executable (if not already): `chmod +x package.sh`
-2. Run `./package.sh` in the project root.
-3. This creates a release-ready `x-bulk-clean-v<version>.zip` excluding git metadata, documentation, and editor files.
+Postscrub runs in the x.com tab you are signed in to:
 
-## Important safety notes
+- `src/inject/capture.js` records the request formats X's own page uses (operation ids, feature flags), because X changes them with every release.
+- `src/worker/xapi.js` uses them to list and act on your items through X's web API, waiting out rate limits and stopping on anything that signals risk to the account.
+- If the API is unavailable, the original click-through workers in `src/popup/popup.js` and `src/sidepanel/sidepanel.js` take over.
 
-Bulk actions are destructive and may be difficult or impossible to reverse. Export a CSV backup first, test with a small account or a small set of items, and keep the X tab visible while an action is running. X can change its interface or impose rate limits at any time, which may interrupt an action.
+See [AGENTS.md](AGENTS.md) for the architecture, the X API details and the development workflow.
 
-Use the extension only on accounts you own or are authorized to manage. You are responsible for complying with X's terms and applicable rules.
+## Development
+
+```bash
+npm run check        # syntax-check every JavaScript file
+npm run test:e2e     # load the extension in Chromium against a simulated x.com
+./package.sh         # build postscrub-v<version>.zip for the Chrome Web Store
+```
+
+End-to-end tests need Playwright and a Chromium build (`CHROMIUM_PATH` overrides the default location).
 
 ## Privacy
 
-X Bulk Clean operates on the active X page. It does not include analytics, licensing, payment processing, or an external service. See [PRIVACY.md](PRIVACY.md) for details.
+Postscrub has no backend, analytics, telemetry or accounts. It talks only to X, from your own browser, on your behalf. Job history and backups are stored locally in Chrome. See [PRIVACY.md](PRIVACY.md).
 
-## Contributing
+## Important
 
-Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Bulk actions are permanent. Start with a small selection, keep the CSV record, and use Postscrub only on accounts you own or manage. You are responsible for complying with X's terms.
 
-## License
-
-Released under the [MIT License](LICENSE).
-
-Interface icons are based on [Lucide](https://lucide.dev/) and covered by the notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-X Bulk Clean is not affiliated with, endorsed by, or sponsored by X Corp.
+Postscrub is not affiliated with, endorsed by, or sponsored by X Corp.
