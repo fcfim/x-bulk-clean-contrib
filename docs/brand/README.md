@@ -20,13 +20,13 @@ Constraints still met: there is no platform shape, bird, trash can or mascot. Th
 ## Usage
 
 Other files, besides the ones listed in files:
-- 24px hint master: /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/mark-24.svg, rendered to /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/out/icon24.png
-- One-colour marks: /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/mark-mono-ink.svg and /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/mark-mono-white.svg
-- Wordmarks: /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/wordmark-reverse.svg (dark backgrounds) and /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/wordmark-green.svg (unknown or photographic backgrounds)
-- Palette: /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/palette.css
-- Brand sheet HTML source: /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/out/brand-sheet.html
-- Generators (edit the geometry in build.py, never by hand): /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/tools/build.py, outline.py, brandsheet.mjs and compare.mjs. outline.py needs fontTools and uharfbuzz, which are installed in the scratchpad's pylib/ folder.
-- Iterations: /tmp/claude-0/-workspace-x-bulk-clean-contrib/b2f38aab-3aad-5b46-a72b-14aef32033d2/scratchpad/brand/final/iter/
+- 24px hint master: ./mark-24.svg, rendered to icons/icon24.png
+- One-colour marks: ./mark-mono-ink.svg and ./mark-mono-white.svg
+- Wordmarks: ./wordmark-reverse.svg (dark backgrounds) and ./wordmark-green.svg (unknown or photographic backgrounds)
+- Palette: ./palette.css
+- Brand sheet HTML source: icons/brand-sheet.html
+- Generators (edit the geometry in build.py, never by hand): ./tools/build.py, outline.py, brandsheet.mjs and compare.mjs. outline.py needs fontTools and uharfbuzz, which are installed in the scratchpad's pylib/ folder.
+- Iterations: ./iter/
 
 Manifest:
 - "icons": {"16": icon16.png, "32": icon32.png, "48": icon48.png, "128": icon128.png}
