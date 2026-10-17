@@ -162,6 +162,20 @@ const SCENARIOS = [
     }
   },
   {
+    name: 'stops at once when X flags the activity as automated',
+    state: { own: 8 },
+    setup: (state) => { state.misbehave.errorCode = { op: 'DeleteTweet', code: 226, after: 3 }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete');
+      const deletes = state.calls.filter(c => c.op === 'DeleteTweet');
+      return [
+        ['job stopped with the automation message', /looks automated/.test(r.job.statusText) && r.job.status === 'interrupted', r.job.statusText],
+        ['no request after the flag', deletes.length === 4, deletes.length],
+        ['the 3 deleted before are recorded', r.job.total === 3, r.job.total]
+      ];
+    }
+  },
+  {
     name: 'falls back to clicking when X refuses the API',
     state: { own: 5 },
     setup: (state) => { state.misbehave.refuse.DeleteTweet = 404; },
@@ -258,6 +272,7 @@ const filter = process.argv[2];
 let failed = 0;
 for (const scenario of SCENARIOS.filter(s => !filter || s.name.includes(filter))) {
   const env = await launch();
+  await env.worker.evaluate(() => chrome.storage.local.set({ apiPace: 0.05 }));
   const state = createState(scenario.state);
   scenario.setup?.(state);
   await installFakeX(env.context, state);

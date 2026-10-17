@@ -50,8 +50,10 @@
     include_can_media_tag: '1', include_ext_is_blue_verified: '1', include_ext_verified_type: '1',
     include_ext_profile_image_shape: '1', skip_status: '1'
   };
-  // Seconds between actions, before jitter. Slow on purpose: one person clicking fast, not a script.
-  const PACE_MS = { delete: 1500, unrepost: 1300, unlike: 1100, unfollow: 2200, follow: 3200 };
+  // Milliseconds between actions, before jitter. X publishes no limit for deleting, unliking or
+  // unreposting and reports of locks come from fast automated activity, so this stays near the
+  // speed of clicking (about 20 a minute). Following is slower: X limits it to ~400 a day.
+  const PACE_MS = { delete: 2500, unrepost: 2200, unlike: 2000, unfollow: 4000, follow: 6000 };
 
   const sleep = (ms) => new Promise(resolve => {
     // Timed by the service worker: page timers are throttled in background tabs.
@@ -95,11 +97,14 @@
     } catch (_) { return {}; }
   }
 
-  const state = { ready: false, bearer: FALLBACK_BEARER, ops: {}, me: null, sources: {} };
+  const state = { ready: false, bearer: FALLBACK_BEARER, ops: {}, me: null, sources: {}, backoffUntil: 0, paceFactor: 1 };
 
   async function init(account) {
     const live = captured();
-    const stored = (await chrome.storage.local.get(['xbcApiCache'])).xbcApiCache || {};
+    const settings = await chrome.storage.local.get(['xbcApiCache', 'apiPace']);
+    const stored = settings.xbcApiCache || {};
+    // Speed multiplier for the pauses between actions (1 = default; the end-to-end tests use less).
+    state.paceFactor = Number(settings.apiPace) > 0 ? Number(settings.apiPace) : 1;
     const bundle = await bundleOps();
     state.bearer = live.bearer || stored.bearer || bundle.bearer || FALLBACK_BEARER;
 
@@ -175,6 +180,9 @@
     } catch (error) {
       return { status: 0, json: null, codes: [], messages: [String(error?.message || error)], reset: null };
     }
+    // Server-driven backoff, honored the way X's own client does (capped at 10 s).
+    const backoff = Number((response.headers.get('backoff-policy') || '').match(/(?:^|;)\s*backoff=(\d+)/)?.[1]);
+    if (backoff > 0) state.backoffUntil = Date.now() + Math.min(backoff, 10000);
     let json = null;
     try { json = await response.json(); } catch (_) {}
     const errors = Array.isArray(json?.errors) ? json.errors : [];
@@ -188,21 +196,35 @@
     };
   }
 
-  // Maps a response to what a job should do next (codes from X's own error enum).
+  // Maps a response to what a job should do next. Codes and their meaning come from X's own
+  // error enum and handlers in its web bundle.
+  const STOP_CODES = {
+    326: 'X locked the account. Open x.com to unlock it before continuing.',
+    445: 'X restricted the session and wants a check on x.com before continuing.',
+    64: 'X reports the account as suspended.', 141: 'X reports the account as suspended or inactive.', 159: 'X reports the account as suspended.',
+    89: 'Your X session expired. Reload x.com and sign in again.', 220: 'Your X session expired. Reload x.com and sign in again.',
+    344: 'X daily limit for this action reached. Try again tomorrow.',
+    161: 'X follow limit reached for now.'
+  };
+  const AUTOMATION_CODES = [225, 226, 227, 228, 263, 283, 292, 315, 382];
+  const GONE_CODES = [144, 34, 50, 63, 108];
+
   function classify(r, { okWhen } = {}) {
     const has = (...codes) => codes.some(c => r.codes.includes(c));
     const message = r.messages[0] || (r.status ? `HTTP ${r.status}` : 'network error');
-    if (r.status === 429 || has(88)) return { kind: 'rate', resetAt: r.reset ? r.reset * 1000 : Date.now() + 5 * 60000, message };
+    if (r.status === 429 || has(88, 143)) {
+      return { kind: 'rate', resetAt: r.reset ? r.reset * 1000 + 10000 : Date.now() + 15 * 60000, message };
+    }
     if (has(353)) return { kind: 'csrf', message };
-    if (has(326)) return { kind: 'stop', message: 'X locked the account (verify it on x.com before continuing)' };
-    if (has(64)) return { kind: 'stop', message: 'X reports the account as suspended' };
-    if (has(161)) return { kind: 'stop', message: 'X follow limit reached for now' };
-    if (has(205, 225, 226, 283, 143)) return { kind: 'stop', message: `X flagged the activity as automated (code ${r.codes.join(',')}); wait before trying again` };
-    if (has(32, 89, 239) || r.binding || (r.status === 401)) return { kind: 'refused', message: r.binding ? 'X requires a signed session for this action' : 'X refused the credentials' };
-    if (has(144, 34, 50, 63, 108)) return { kind: 'gone', message };
-    if (r.status >= 200 && r.status < 300 && !r.codes.length && r.json && (!okWhen || okWhen(r.json))) return { kind: 'ok' };
-    if (r.status === 403 || r.status === 404 || r.status === 400) return { kind: 'refused', message };
-    if (r.status >= 500 || r.status === 0) return { kind: 'retry', message };
+    const stop = r.codes.find(c => STOP_CODES[c]);
+    if (stop) return { kind: 'stop', message: STOP_CODES[stop] };
+    if (has(...AUTOMATION_CODES)) return { kind: 'stop', message: `X says this looks automated (code ${r.codes.join(', ')}). Wait a few hours before trying again.` };
+    if (r.binding) return { kind: 'refused', message: 'X requires a signed session for this action' };
+    // Success is judged the way X's app judges each operation (some tolerate errors[] beside data).
+    if (r.status >= 200 && r.status < 300 && r.json && (okWhen ? okWhen(r.json) : !r.codes.length)) return { kind: 'ok' };
+    if (has(...GONE_CODES)) return { kind: 'gone', message };
+    if (has(32, 37, 200) || r.status === 401 || r.status === 403 || r.status === 404 || r.status === 400) return { kind: 'refused', message };
+    if (has(130, 131) || r.status >= 500 || r.status === 0) return { kind: 'retry', message };
     return { kind: 'error', message };
   }
 
@@ -211,9 +233,12 @@
     let transient = 0, csrf = 0;
     for (;;) {
       if (isActive && !isActive()) return { kind: 'stopped' };
+      if (state.backoffUntil > Date.now() && !(await waitUntil(state.backoffUntil, isActive))) return { kind: 'stopped' };
       const result = classify(await send(), { okWhen });
       if (result.kind === 'rate') {
-        const until = Math.min(result.resetAt, Date.now() + 20 * 60000) + 3000;
+        // Wait for the window to reset, then go slower for the rest of the job.
+        state.paceFactor = Math.min(state.paceFactor * 2, 8);
+        const until = Math.min(result.resetAt, Date.now() + 30 * 60000);
         onWait?.(until);
         const resumed = await waitUntil(until, isActive);
         onWait?.(null);
@@ -221,7 +246,7 @@
         continue;
       }
       if (result.kind === 'csrf' && csrf++ < 1) continue;
-      if (result.kind === 'retry' && transient++ < 2) { await sleep(3000 * transient); continue; }
+      if (result.kind === 'retry' && transient++ < 3) { await sleep(5000 * 3 ** (transient - 1)); continue; }
       return result;
     }
   }
@@ -361,9 +386,10 @@
     pages,
     parsePage,
     sleep,
-    pace: (action) => jitter(PACE_MS[action] || 1500),
-    deleteTweet: (id, options) => mutate('DeleteTweet', { tweet_id: String(id) }, { ...options, okWhen: json => !!json?.data }),
-    deleteRetweet: (sourceId, options) => mutate('DeleteRetweet', { source_tweet_id: String(sourceId) }, { ...options, okWhen: json => !!json?.data?.unretweet }),
+    pace: (action) => jitter((PACE_MS[action] || 2500) * state.paceFactor),
+    // DeleteTweet fails on any error, as in X's app; the others succeed on their data check.
+    deleteTweet: (id, options) => mutate('DeleteTweet', { tweet_id: String(id) }, { ...options, okWhen: json => !!json?.data && !json.errors?.length }),
+    deleteRetweet: (sourceId, options) => mutate('DeleteRetweet', { source_tweet_id: String(sourceId) }, { ...options, okWhen: json => !!json?.data?.unretweet?.source_tweet_results?.result }),
     unfavorite: (id, options) => mutate('UnfavoriteTweet', { tweet_id: String(id) }, { ...options, okWhen: json => json?.data?.unfavorite_tweet === 'Done' }),
     follow: (user, options) => friendship('create', user, options),
     unfollow: (user, options) => friendship('destroy', user, options)

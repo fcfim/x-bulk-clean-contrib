@@ -31,7 +31,7 @@ export function createState({ own = 12, replies = 0, retweets = 0, likes = 0, fo
     followers: stamp(users(followers, 'r', i => ({ following: i < followedBack, verified: i % 2 === 0 }))),
     pageSize,
     calls: [],
-    misbehave: { rateLimitAfter: null, rateLimitSeconds: 3, refuse: {}, binding: {} },
+    misbehave: { rateLimitAfter: null, rateLimitSeconds: 3, refuse: {}, binding: {}, errorCode: null },
     mutations: 0
   };
 }
@@ -135,6 +135,8 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
         return json(route, 429, { errors: [{ code: 88, message: 'Rate limit exceeded.' }] }, { 'x-rate-limit-reset': String(reset), 'x-rate-limit-remaining': '0' });
       }
       const v = body?.variables || {};
+      const forced = state.misbehave.errorCode;
+      if (forced && forced.op === op && state.mutations > forced.after) return json(route, 200, { errors: [{ message: 'forced', extensions: { code: forced.code } }], data: {} });
       if (body?.queryId !== queryId) return json(route, 400, { errors: [{ message: 'queryId mismatch' }] });
       if (op === 'DeleteTweet') {
         const i = state.tweets.findIndex(t => t.id === v.tweet_id && !t.retweetOf && t.authorId === ME.id);
