@@ -17,16 +17,21 @@ const opPattern = new RegExp(`\\b(${[...byName.keys()].sort((a, b) => b.length -
 
 lines.forEach((line, index) => {
   const ops = [...line.matchAll(opPattern)].map(m => m[1]);
-  const ids = [...line.matchAll(/(?<![\w-])([A-Za-z0-9_-]{22})(?![\w-])/g)].map(m => m[1]).filter(id => /[A-Z]/.test(id) && /[a-z]/.test(id));
+  // A 22-character token counts as a query id when it is a known one, or when it looks like one
+  // (digits, '-' or '_') — plain CamelCase words of that length are usually error names.
+  const ids = [...line.matchAll(/(?<![\w-])([A-Za-z0-9_-]{22})(?![\w-])/g)].map(m => m[1])
+    .filter(id => byQueryId.has(id) || (/[A-Z]/.test(id) && /[a-z]/.test(id) && /[0-9_-]/.test(id)));
   for (const id of ids) {
     const owner = byQueryId.get(id);
     if (!owner) findings.push({ line: index + 1, kind: 'unknown-queryId', id, text: line.trim().slice(0, 200) });
     else if (ops.length && !ops.includes(owner.operationName)) findings.push({ line: index + 1, kind: 'queryId-on-wrong-op', id, belongsTo: owner.operationName, opsOnLine: ops, text: line.trim().slice(0, 200) });
   }
-  for (const op of ops) {
+  // Only a type word right next to the operation name is a claim about its type.
+  for (const op of new Set(ops)) {
     const def = byName.get(op);
-    const typeWord = line.match(/\b(query|mutation)\b/i)?.[1]?.toLowerCase();
-    if (typeWord && ops.length === 1 && typeWord !== def.operationType) findings.push({ line: index + 1, kind: 'type-mismatch', op, spec: typeWord, bundle: def.operationType });
+    const near = line.match(new RegExp(`\\b${op}\\b[^.;]{0,30}?\\b(query|mutation)\\b|\\b(query|mutation)\\b[^.;]{0,12}?\\b${op}\\b`, 'i'));
+    const typeWord = (near?.[1] || near?.[2])?.toLowerCase();
+    if (typeWord && typeWord !== def.operationType) findings.push({ line: index + 1, kind: 'type-mismatch', op, spec: typeWord, bundle: def.operationType, text: line.trim().slice(0, 200) });
   }
 });
 
@@ -43,6 +48,8 @@ const result = {
   operationsMentioned: [...mentioned].sort(),
   neededButNotMentioned: needed.filter(n => !mentioned.has(n)),
   findings,
-  unknownFeatureNames: unknownFeatures
+  // Informational: snake_case names the spec uses that no operation lists in its metadata
+  // (global feature switches, response fields, REST params). Not errors by themselves.
+  namesNotInOperationMetadata: unknownFeatures
 };
 console.log(JSON.stringify(result, null, 2));
