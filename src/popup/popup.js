@@ -260,7 +260,7 @@ async function ensureProfilePage(action) {
 
 // === Worker (runs in the tab via chrome.scripting.executeScript) ===
 
-function runWorker(action, performanceMode, account) {
+function runWorker(action, performanceMode, account, useApi = false) {
 
   const prior = window.__xCleaner;
   if (prior?.interval) return;
@@ -345,6 +345,12 @@ function runWorker(action, performanceMode, account) {
     const shadow = X.overlayHost?.shadowRoot;
     if (!shadow) return;
     shadow.getElementById('jobProgress').textContent = overlayProgressText();
+    const jobState = shadow.getElementById('jobState');
+    if (X.interval && jobState) {
+      jobState.textContent = X.waitUntil
+        ? `X rate limit · resuming at ${new Date(X.waitUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+        : X.mode === 'api' ? 'X Bulk Clean running · API mode' : 'X Bulk Clean running';
+    }
     const elapsed = Math.max(0, Math.floor((Date.now() - X.startedAt) / 1000));
     shadow.getElementById('jobTime').textContent = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}`;
   }
@@ -784,322 +790,447 @@ function runWorker(action, performanceMode, account) {
     window.dispatchEvent(new Event('scroll'));
   }
 
-  // === Action dispatch ===
+  // === API mode ===
+  // Lists and acts through X's own web API (worker/xapi.js, injected before this worker) instead
+  // of clicking, so the job needs neither scrolling nor a rendered tab. If X refuses the API
+  // before anything succeeded, the job falls back to clicking.
+  const LIST_OP = {
+    delete: 'UserTweets', unrepost: 'UserTweets', deleteReplies: 'UserTweetsAndReplies', unlike: 'Likes',
+    followVerified: 'BlueVerifiedFollowers', followAll: 'Followers', bulkUnfollow: 'Following'
+  };
+  const PACE_KEY = {
+    delete: 'delete', deleteReplies: 'delete', unrepost: 'unrepost', unlike: 'unlike',
+    followVerified: 'follow', followAll: 'follow', bulkUnfollow: 'unfollow'
+  };
+  const FOUND_KEY = {
+    delete: 'found', unrepost: 'foundReposts', deleteReplies: 'repliesFound', unlike: 'foundLikes',
+    followVerified: 'foundFollowers', followAll: 'foundFollowers', bulkUnfollow: 'foundFollowing'
+  };
+  const DONE_VERB = {
+    delete: 'deleted', unrepost: 'removed', deleteReplies: 'deleted', unlike: 'unliked',
+    followVerified: 'followed', followAll: 'followed', bulkUnfollow: 'unfollowed'
+  };
 
-  if (action === 'delete' || action === 'unrepost') {
-    X.stats = action === 'delete'
-      ? { deleted: 0, found: 0 }
-      : { unreposts: 0, foundReposts: 0 };
+  function apiItems(page, isMe, myId) {
+    const tweets = page.tweets || [], users = page.users || [];
+    if (action === 'delete') return tweets.filter(t => isMe(t) && !t.retweetOf).map(t => ({ key: t.id, tweet: t }));
+    if (action === 'deleteReplies') return tweets.filter(t => isMe(t) && !t.retweetOf && t.replyTo).map(t => ({ key: t.id, tweet: t }));
+    if (action === 'unrepost') return tweets.filter(t => isMe(t) && t.retweetOf).map(t => ({ key: t.retweetOf.id, tweet: t.retweetOf }));
+    if (action === 'unlike') return tweets.map(t => ({ key: t.id, tweet: t }));
+    if (action === 'followVerified' || action === 'followAll') {
+      return users.filter(u => u.id !== myId && !u.following && !u.followRequestSent).map(u => ({ key: `u:${u.username.toLowerCase()}`, user: u }));
+    }
+    if (action === 'bulkUnfollow') return users.filter(u => u.id !== myId).map(u => ({ key: `u:${u.username.toLowerCase()}`, user: u }));
+    return [];
+  }
 
-    runLoop(async () => {
-      if (X.busy || !X.interval) return;
-      const issue = detectIssue();
-      if (issue) { stopAll(issue); return; }
-      X.busy = true;
-      try {
-        let processedThisCycle = 0;
-        const articles = document.querySelectorAll('article[data-testid="tweet"]');
-        const candidates = [];
+  function apiAct(api, item, options) {
+    if (action === 'delete' || action === 'deleteReplies') return api.deleteTweet(item.tweet.id, options);
+    if (action === 'unrepost') return api.deleteRetweet(item.tweet.id, options);
+    if (action === 'unlike') return api.unfavorite(item.tweet.id, options);
+    if (action === 'bulkUnfollow') return api.unfollow(item.user, options);
+    return api.follow(item.user, options);
+  }
 
-        if (action === 'delete') {
+  function recordApiSuccess(item) {
+    const at = new Date().toISOString();
+    const t = item.tweet, u = item.user;
+    const tweetRow = t && { id: t.id, date: t.date, text: t.text, author: t.author, url: t.url };
+    const userRow = u && { username: u.username, displayName: u.displayName, profileUrl: `/${u.username}` };
+    if (action === 'delete') { X.stats.deleted++; X.backup.tweets.push({ ...tweetRow, action: 'deleted', actionAt: at }); }
+    else if (action === 'deleteReplies') { X.stats.repliesDeleted++; X.backup.replies.push({ ...tweetRow, action: 'deleted_reply', actionAt: at }); }
+    else if (action === 'unrepost') { X.stats.unreposts++; X.backup.unreposted.push({ ...tweetRow, action: 'unreposted', actionAt: at }); }
+    else if (action === 'unlike') { X.stats.unlikes++; X.backup.unliked.push({ ...tweetRow, action: 'unliked', actionAt: at }); }
+    else if (action === 'bulkUnfollow') { X.stats.unfollows++; X.backup.unfollows.push({ ...userRow, action: 'unfollowed', actionAt: at }); }
+    else { X.stats.follows++; X.backup.follows.push({ ...userRow, action: action === 'followVerified' ? 'followed_verified' : 'followed_all', actionAt: at }); }
+    X.successCount++;
+  }
+
+  async function runApiJob(api) {
+    const token = X.interval = { api: true };
+    const active = () => X.interval === token;
+    const onWait = (until) => { X.waitUntil = until; updateJobOverlay(); };
+    const fallback = (reason) => {
+      if (!active()) return;
+      X.apiFallback = reason;
+      console.warn('[X Bulk Clean] API mode unavailable, clicking instead:', reason);
+      X.interval = null;
+      startDomLoop();
+    };
+    const ready = await api.init(account);
+    if (!active()) return;
+    if (!ready.ok || !api.canList(LIST_OP[action])) return fallback(ready.reason || `no ${LIST_OP[action]} operation`);
+    X.mode = 'api';
+    console.info('[X Bulk Clean] API mode, operation sources:', ready.sources);
+    const myId = ready.me.id;
+    const isMe = t => t.authorId === myId || (!!me && t.author === me);
+    const options = { isActive: active, onWait };
+    let succeeded = 0, failures = 0;
+    try {
+      // Acting on a list while paging through it can make X skip items, so after a pass that
+      // changed anything, page through again until a pass finds nothing left to do.
+      for (let pass = 0; pass < 3; pass++) {
+        let actedThisPass = 0;
+        for await (const page of api.pages(LIST_OP[action], options)) {
+          if (!active()) return;
+          for (const item of apiItems(page, isMe, myId)) {
+            if (!active()) return;
+            if (X.processed.has(item.key)) continue;
+            if (!X.seen?.has(item.key)) { (X.seen ||= new Set()).add(item.key); X.stats[FOUND_KEY[action]]++; }
+            const result = await apiAct(api, item, options);
+            if (!active() || result.kind === 'stopped') return;
+            if (result.kind === 'ok') { X.processed.add(item.key); succeeded++; actedThisPass++; failures = 0; recordApiSuccess(item); }
+            else if (result.kind === 'gone') X.processed.add(item.key);
+            else if (result.kind === 'stop') { await stopAll(result.message); return; }
+            else if (result.kind === 'refused' && !succeeded) return fallback(result.message);
+            else if (++failures >= 5) { await stopAll(`X API errors: ${result.message || result.kind}`); return; }
+            updateJobOverlay();
+            await api.sleep(api.pace(PACE_KEY[action]));
+          }
+        }
+        if (!actedThisPass) break;
+      }
+    } catch (error) {
+      if (!active()) return;
+      if (!succeeded && error.result?.kind === 'refused') return fallback(error.message);
+      await stopAll(`X API error: ${error.message || error}`);
+      return;
+    }
+    if (active()) await stopAll(`Finished — ${succeeded} ${DONE_VERB[action]} via API`);
+  }
+
+  // === Action dispatch (clicking) ===
+
+  function startDomLoop() {
+    X.mode = 'dom';
+    if (action === 'delete' || action === 'unrepost') {
+      X.stats = action === 'delete'
+        ? { deleted: 0, found: 0 }
+        : { unreposts: 0, foundReposts: 0 };
+
+      runLoop(async () => {
+        if (X.busy || !X.interval) return;
+        const issue = detectIssue();
+        if (issue) { stopAll(issue); return; }
+        X.busy = true;
+        try {
+          let processedThisCycle = 0;
+          const articles = document.querySelectorAll('article[data-testid="tweet"]');
+          const candidates = [];
+
+          if (action === 'delete') {
+            for (const a of articles) {
+              const id = tweetId(a);
+              if (!id || X.processed.has(id)) continue;
+              if (!isMine(a)) { X.processed.add(id); continue; }
+              const caret = a.querySelector('[data-testid="caret"]');
+              if (caret) candidates.push({ article: a, control: caret, id, kind: 'caret' });
+            }
+          } else {
+            for (const a of articles) {
+              const id = tweetId(a);
+              if (!id || X.processed.has(id)) continue;
+              const btn = a.querySelector('[data-testid="unretweet"]');
+              if (btn) candidates.push({ article: a, control: btn, id, kind: 'unretweet' });
+            }
+          }
+
+          if (action === 'delete') X.stats.found = X.processed.size + candidates.length;
+          else X.stats.foundReposts = X.processed.size + candidates.length;
+
+          const maxPerCycle = hidden() ? 2 : 4;
+          for (const { article: initial, id, kind } of candidates) {
+            if (!X.interval) break;
+            const article = liveArticle(initial, id);
+            const control = article?.querySelector(kind === 'caret' ? '[data-testid="caret"]' : '[data-testid="unretweet"]');
+            if (!control) continue; // virtualized away; picked up again next cycle
+            const snap = tweetSnap(article);
+            control.click();
+            await sleep(hidden() ? 800 : 550);
+
+            if (kind === 'caret') {
+              let done = false;
+              if (await clickDeleteInMenu()) {
+                await sleep(hidden() ? 800 : 550);
+                if (await clickConfirm('confirmationSheetConfirm')) {
+                  done = true;
+                  X.processed.add(id);
+                  X.stats.deleted++;
+                  X.backup.tweets.push({ ...snap, action: 'deleted', actionAt: new Date().toISOString() });
+                  await bumpAndCheckCap();
+                  if (!X.interval) break;
+                }
+                await sleep(hidden() ? 1000 : 700);
+              }
+              if (!done) noteFailure(id);
+            } else {
+              if (await clickConfirm('unretweetConfirm')) {
+                X.processed.add(id);
+                X.stats.unreposts++;
+                X.backup.unreposted.push({ ...snap, action: 'unreposted', actionAt: new Date().toISOString() });
+                await bumpAndCheckCap();
+                if (!X.interval) break;
+              } else {
+                noteFailure(id);
+              }
+              await sleep(hidden() ? 900 : 600);
+            }
+
+            processedThisCycle++;
+            if (processedThisCycle >= maxPerCycle) break;
+          }
+
+          noteEmpty(candidates.length);
+          // Only advance once every visible candidate this cycle was handled — otherwise a
+          // fast scroll would virtualize away unprocessed items before we reach them.
+          advance(candidates.length, processedThisCycle);
+          await sleep(hidden() ? 1500 : 1000);
+        } finally {
+          X.busy = false;
+        }
+      }, 2500);
+    }
+
+    else if (action === 'unlike') {
+      X.stats = { unlikes: 0, foundLikes: 0 };
+      runLoop(async () => {
+        if (X.busy || !X.interval) return;
+        const issue = detectIssue();
+        if (issue) { stopAll(issue); return; }
+        X.busy = true;
+        try {
+          const buttons = Array.from(document.querySelectorAll('[data-testid="unlike"]'));
+          const candidates = [];
+          for (const btn of buttons) {
+            const article = btn.closest('article');
+            if (!article) continue;
+            const id = tweetId(article);
+            if (id && X.processed.has(id)) continue;
+            candidates.push({ btn, article, id });
+          }
+          X.stats.foundLikes = X.processed.size + candidates.length;
+
+          let processedThisCycle = 0;
+          const maxPerCycle = hidden() ? 3 : 5;
+          for (const { btn, article, id } of candidates) {
+            if (!X.interval) break;
+            if (id) X.processed.add(id);
+            const snap = tweetSnap(article);
+            btn.click();
+            X.stats.unlikes++;
+            X.backup.unliked.push({ ...snap, action: 'unliked', actionAt: new Date().toISOString() });
+            await bumpAndCheckCap();
+            if (!X.interval) break;
+            await sleep(hidden() ? 800 : 500);
+
+            processedThisCycle++;
+            if (processedThisCycle >= maxPerCycle) break;
+          }
+
+          noteEmpty(candidates.length);
+          // Only advance once every visible candidate this cycle was handled — otherwise a
+          // fast scroll would virtualize away unprocessed items before we reach them.
+          advance(candidates.length, processedThisCycle);
+          await sleep(hidden() ? 1500 : 1000);
+        } finally {
+          X.busy = false;
+        }
+      }, 2000);
+    }
+
+    else if (action === 'deleteReplies') {
+      X.stats = { repliesDeleted: 0, repliesFound: 0 };
+      runLoop(async () => {
+        if (X.busy || !X.interval) return;
+        const issue = detectIssue();
+        if (issue) { stopAll(issue); return; }
+        X.busy = true;
+        try {
+          const articles = document.querySelectorAll('article[data-testid="tweet"]');
+          const candidates = [];
           for (const a of articles) {
             const id = tweetId(a);
             if (!id || X.processed.has(id)) continue;
             if (!isMine(a)) { X.processed.add(id); continue; }
+            if (!isReply(a)) continue;
             const caret = a.querySelector('[data-testid="caret"]');
-            if (caret) candidates.push({ article: a, control: caret, id, kind: 'caret' });
+            if (caret) candidates.push({ article: a, caret, id });
           }
-        } else {
-          for (const a of articles) {
-            const id = tweetId(a);
-            if (!id || X.processed.has(id)) continue;
-            const btn = a.querySelector('[data-testid="unretweet"]');
-            if (btn) candidates.push({ article: a, control: btn, id, kind: 'unretweet' });
-          }
-        }
+          X.stats.repliesFound = X.processed.size + candidates.length;
 
-        if (action === 'delete') X.stats.found = X.processed.size + candidates.length;
-        else X.stats.foundReposts = X.processed.size + candidates.length;
+          let processedThisCycle = 0;
+          const maxPerCycle = hidden() ? 1 : 3;
+          for (const { article: initial, id } of candidates) {
+            if (!X.interval) break;
+            const article = liveArticle(initial, id);
+            const caret = article?.querySelector('[data-testid="caret"]');
+            if (!caret) continue; // virtualized away; picked up again next cycle
+            const snap = tweetSnap(article);
+            caret.click();
+            await sleep(hidden() ? 900 : 600);
 
-        const maxPerCycle = hidden() ? 2 : 4;
-        for (const { article: initial, id, kind } of candidates) {
-          if (!X.interval) break;
-          const article = liveArticle(initial, id);
-          const control = article?.querySelector(kind === 'caret' ? '[data-testid="caret"]' : '[data-testid="unretweet"]');
-          if (!control) continue; // virtualized away; picked up again next cycle
-          const snap = tweetSnap(article);
-          control.click();
-          await sleep(hidden() ? 800 : 550);
-
-          if (kind === 'caret') {
-            let done = false;
-            if (await clickDeleteInMenu()) {
-              await sleep(hidden() ? 800 : 550);
-              if (await clickConfirm('confirmationSheetConfirm')) {
-                done = true;
+            const opened = await clickDeleteInMenu();
+            if (!opened) noteFailure(id);
+            if (opened) {
+              await sleep(hidden() ? 900 : 600);
+              if (!await clickConfirm('confirmationSheetConfirm')) noteFailure(id);
+              else {
                 X.processed.add(id);
-                X.stats.deleted++;
-                X.backup.tweets.push({ ...snap, action: 'deleted', actionAt: new Date().toISOString() });
+                X.stats.repliesDeleted++;
+                X.backup.replies.push({ ...snap, action: 'deleted_reply', actionAt: new Date().toISOString() });
                 await bumpAndCheckCap();
                 if (!X.interval) break;
               }
-              await sleep(hidden() ? 1000 : 700);
+              await sleep(hidden() ? 1200 : 800);
             }
-            if (!done) noteFailure(id);
-          } else {
-            if (await clickConfirm('unretweetConfirm')) {
-              X.processed.add(id);
-              X.stats.unreposts++;
-              X.backup.unreposted.push({ ...snap, action: 'unreposted', actionAt: new Date().toISOString() });
-              await bumpAndCheckCap();
-              if (!X.interval) break;
-            } else {
-              noteFailure(id);
-            }
-            await sleep(hidden() ? 900 : 600);
+
+            processedThisCycle++;
+            if (processedThisCycle >= maxPerCycle) break;
           }
 
-          processedThisCycle++;
-          if (processedThisCycle >= maxPerCycle) break;
+          noteEmpty(candidates.length);
+          // Only advance once every visible candidate this cycle was handled — otherwise a
+          // fast scroll would virtualize away unprocessed items before we reach them.
+          advance(candidates.length, processedThisCycle);
+          await sleep(hidden() ? 1800 : 1200);
+        } finally {
+          X.busy = false;
         }
+      }, 3000);
+    }
 
-        noteEmpty(candidates.length);
-        // Only advance once every visible candidate this cycle was handled — otherwise a
-        // fast scroll would virtualize away unprocessed items before we reach them.
-        advance(candidates.length, processedThisCycle);
-        await sleep(hidden() ? 1500 : 1000);
-      } finally {
-        X.busy = false;
-      }
-    }, 2500);
-  }
+    else if (action === 'followVerified' || action === 'followAll') {
+      X.stats = { follows: 0, foundFollowers: 0 };
+      runLoop(async () => {
+        if (X.busy || !X.interval) return;
+        const issue = detectIssue();
+        if (issue) { stopAll(issue); return; }
+        X.busy = true;
+        try {
+          const cells = document.querySelectorAll('[data-testid="UserCell"]');
+          const candidates = [];
+          for (const cell of cells) {
+            const link = cell.querySelector('a[role="link"][href^="/"]');
+            const username = link?.getAttribute('href')?.replace(/^\//, '').split('/')[0];
+            if (!username) continue;
+            const key = `u:${username.toLowerCase()}`;
+            if (X.processed.has(key)) continue;
+            const followBtn = Array.from(cell.querySelectorAll('button')).find(b => {
+              const testid = b.getAttribute('data-testid') || '';
+              return testid.endsWith('-follow');
+            });
+            if (followBtn && followBtn.offsetParent !== null) {
+              candidates.push({ cell, button: followBtn, key });
+            } else {
+              X.processed.add(key);
+            }
+          }
+          X.stats.foundFollowers = X.processed.size + candidates.length;
 
-  else if (action === 'unlike') {
-    X.stats = { unlikes: 0, foundLikes: 0 };
-    runLoop(async () => {
-      if (X.busy || !X.interval) return;
-      const issue = detectIssue();
-      if (issue) { stopAll(issue); return; }
-      X.busy = true;
-      try {
-        const buttons = Array.from(document.querySelectorAll('[data-testid="unlike"]'));
-        const candidates = [];
-        for (const btn of buttons) {
-          const article = btn.closest('article');
-          if (!article) continue;
-          const id = tweetId(article);
-          if (id && X.processed.has(id)) continue;
-          candidates.push({ btn, article, id });
+          let processedThisCycle = 0;
+          const maxPerCycle = hidden() ? 2 : 4;
+          for (const { cell, button, key } of candidates) {
+            if (!X.interval) break;
+            X.processed.add(key);
+            const user = userSnap(cell);
+            button.click();
+            if (await stopIfIssue(900)) break;
+            X.stats.follows++;
+            X.backup.follows.push({
+              ...user,
+              action: action === 'followVerified' ? 'followed_verified' : 'followed_all',
+              actionAt: new Date().toISOString()
+            });
+            await bumpAndCheckCap();
+            if (!X.interval) break;
+            await sleep(hidden() ? 1400 : 950);
+
+            processedThisCycle++;
+            if (processedThisCycle >= maxPerCycle) break;
+          }
+
+          noteEmpty(candidates.length);
+          // Only advance once every visible candidate this cycle was handled — otherwise a
+          // fast scroll would virtualize away unprocessed items before we reach them.
+          advance(candidates.length, processedThisCycle);
+          await sleep(hidden() ? 2000 : 1500);
+        } finally {
+          X.busy = false;
         }
-        X.stats.foundLikes = X.processed.size + candidates.length;
+      }, 3500);
+    }
 
-        let processedThisCycle = 0;
-        const maxPerCycle = hidden() ? 3 : 5;
-        for (const { btn, article, id } of candidates) {
-          if (!X.interval) break;
-          if (id) X.processed.add(id);
-          const snap = tweetSnap(article);
-          btn.click();
-          X.stats.unlikes++;
-          X.backup.unliked.push({ ...snap, action: 'unliked', actionAt: new Date().toISOString() });
-          await bumpAndCheckCap();
-          if (!X.interval) break;
-          await sleep(hidden() ? 800 : 500);
+    else if (action === 'bulkUnfollow') {
+      X.stats = { unfollows: 0, foundFollowing: 0 };
+      runLoop(async () => {
+        if (X.busy || !X.interval) return;
+        const issue = detectIssue();
+        if (issue) { stopAll(issue); return; }
+        X.busy = true;
+        try {
+          const cells = document.querySelectorAll('[data-testid="UserCell"]');
+          const candidates = [];
+          for (const cell of cells) {
+            const link = cell.querySelector('a[role="link"][href^="/"]');
+            const username = link?.getAttribute('href')?.replace(/^\//, '').split('/')[0];
+            if (!username) continue;
+            const key = `u:${username.toLowerCase()}`;
+            if (X.processed.has(key)) continue;
+            const unfollowBtn = Array.from(cell.querySelectorAll('button')).find(b => {
+              const testid = b.getAttribute('data-testid') || '';
+              return testid.endsWith('-unfollow');
+            });
+            if (unfollowBtn && unfollowBtn.offsetParent !== null) {
+              candidates.push({ cell, button: unfollowBtn, key });
+            }
+          }
+          X.stats.foundFollowing = X.processed.size + candidates.length;
 
-          processedThisCycle++;
-          if (processedThisCycle >= maxPerCycle) break;
-        }
-
-        noteEmpty(candidates.length);
-        // Only advance once every visible candidate this cycle was handled — otherwise a
-        // fast scroll would virtualize away unprocessed items before we reach them.
-        advance(candidates.length, processedThisCycle);
-        await sleep(hidden() ? 1500 : 1000);
-      } finally {
-        X.busy = false;
-      }
-    }, 2000);
-  }
-
-  else if (action === 'deleteReplies') {
-    X.stats = { repliesDeleted: 0, repliesFound: 0 };
-    runLoop(async () => {
-      if (X.busy || !X.interval) return;
-      const issue = detectIssue();
-      if (issue) { stopAll(issue); return; }
-      X.busy = true;
-      try {
-        const articles = document.querySelectorAll('article[data-testid="tweet"]');
-        const candidates = [];
-        for (const a of articles) {
-          const id = tweetId(a);
-          if (!id || X.processed.has(id)) continue;
-          if (!isMine(a)) { X.processed.add(id); continue; }
-          if (!isReply(a)) continue;
-          const caret = a.querySelector('[data-testid="caret"]');
-          if (caret) candidates.push({ article: a, caret, id });
-        }
-        X.stats.repliesFound = X.processed.size + candidates.length;
-
-        let processedThisCycle = 0;
-        const maxPerCycle = hidden() ? 1 : 3;
-        for (const { article: initial, id } of candidates) {
-          if (!X.interval) break;
-          const article = liveArticle(initial, id);
-          const caret = article?.querySelector('[data-testid="caret"]');
-          if (!caret) continue; // virtualized away; picked up again next cycle
-          const snap = tweetSnap(article);
-          caret.click();
-          await sleep(hidden() ? 900 : 600);
-
-          const opened = await clickDeleteInMenu();
-          if (!opened) noteFailure(id);
-          if (opened) {
-            await sleep(hidden() ? 900 : 600);
-            if (!await clickConfirm('confirmationSheetConfirm')) noteFailure(id);
-            else {
-              X.processed.add(id);
-              X.stats.repliesDeleted++;
-              X.backup.replies.push({ ...snap, action: 'deleted_reply', actionAt: new Date().toISOString() });
+          let processedThisCycle = 0;
+          const maxPerCycle = hidden() ? 2 : 3;
+          for (const { cell, button, key } of candidates) {
+            if (!X.interval) break;
+            X.processed.add(key);
+            const user = userSnap(cell);
+            button.click();
+            await sleep(hidden() ? 700 : 500);
+            const confirmed = await clickConfirm('confirmationSheetConfirm');
+            if (await stopIfIssue(confirmed ? 900 : 0)) break;
+            if (confirmed) {
+              X.stats.unfollows++;
+              X.backup.unfollows.push({ ...user, action: 'unfollowed', actionAt: new Date().toISOString() });
               await bumpAndCheckCap();
               if (!X.interval) break;
             }
             await sleep(hidden() ? 1200 : 800);
+
+            processedThisCycle++;
+            if (processedThisCycle >= maxPerCycle) break;
           }
 
-          processedThisCycle++;
-          if (processedThisCycle >= maxPerCycle) break;
+          noteEmpty(candidates.length);
+          // Only advance once every visible candidate this cycle was handled — otherwise a
+          // fast scroll would virtualize away unprocessed items before we reach them.
+          advance(candidates.length, processedThisCycle);
+          await sleep(hidden() ? 2000 : 1500);
+        } finally {
+          X.busy = false;
         }
-
-        noteEmpty(candidates.length);
-        // Only advance once every visible candidate this cycle was handled — otherwise a
-        // fast scroll would virtualize away unprocessed items before we reach them.
-        advance(candidates.length, processedThisCycle);
-        await sleep(hidden() ? 1800 : 1200);
-      } finally {
-        X.busy = false;
-      }
-    }, 3000);
+      }, 3500);
+    }
   }
 
-  else if (action === 'followVerified' || action === 'followAll') {
-    X.stats = { follows: 0, foundFollowers: 0 };
-    runLoop(async () => {
-      if (X.busy || !X.interval) return;
-      const issue = detectIssue();
-      if (issue) { stopAll(issue); return; }
-      X.busy = true;
-      try {
-        const cells = document.querySelectorAll('[data-testid="UserCell"]');
-        const candidates = [];
-        for (const cell of cells) {
-          const link = cell.querySelector('a[role="link"][href^="/"]');
-          const username = link?.getAttribute('href')?.replace(/^\//, '').split('/')[0];
-          if (!username) continue;
-          const key = `u:${username.toLowerCase()}`;
-          if (X.processed.has(key)) continue;
-          const followBtn = Array.from(cell.querySelectorAll('button')).find(b => {
-            const testid = b.getAttribute('data-testid') || '';
-            return testid.endsWith('-follow');
-          });
-          if (followBtn && followBtn.offsetParent !== null) {
-            candidates.push({ cell, button: followBtn, key });
-          } else {
-            X.processed.add(key);
-          }
-        }
-        X.stats.foundFollowers = X.processed.size + candidates.length;
-
-        let processedThisCycle = 0;
-        const maxPerCycle = hidden() ? 2 : 4;
-        for (const { cell, button, key } of candidates) {
-          if (!X.interval) break;
-          X.processed.add(key);
-          const user = userSnap(cell);
-          button.click();
-          if (await stopIfIssue(900)) break;
-          X.stats.follows++;
-          X.backup.follows.push({
-            ...user,
-            action: action === 'followVerified' ? 'followed_verified' : 'followed_all',
-            actionAt: new Date().toISOString()
-          });
-          await bumpAndCheckCap();
-          if (!X.interval) break;
-          await sleep(hidden() ? 1400 : 950);
-
-          processedThisCycle++;
-          if (processedThisCycle >= maxPerCycle) break;
-        }
-
-        noteEmpty(candidates.length);
-        // Only advance once every visible candidate this cycle was handled — otherwise a
-        // fast scroll would virtualize away unprocessed items before we reach them.
-        advance(candidates.length, processedThisCycle);
-        await sleep(hidden() ? 2000 : 1500);
-      } finally {
-        X.busy = false;
-      }
-    }, 3500);
-  }
-
-  else if (action === 'bulkUnfollow') {
-    X.stats = { unfollows: 0, foundFollowing: 0 };
-    runLoop(async () => {
-      if (X.busy || !X.interval) return;
-      const issue = detectIssue();
-      if (issue) { stopAll(issue); return; }
-      X.busy = true;
-      try {
-        const cells = document.querySelectorAll('[data-testid="UserCell"]');
-        const candidates = [];
-        for (const cell of cells) {
-          const link = cell.querySelector('a[role="link"][href^="/"]');
-          const username = link?.getAttribute('href')?.replace(/^\//, '').split('/')[0];
-          if (!username) continue;
-          const key = `u:${username.toLowerCase()}`;
-          if (X.processed.has(key)) continue;
-          const unfollowBtn = Array.from(cell.querySelectorAll('button')).find(b => {
-            const testid = b.getAttribute('data-testid') || '';
-            return testid.endsWith('-unfollow');
-          });
-          if (unfollowBtn && unfollowBtn.offsetParent !== null) {
-            candidates.push({ cell, button: unfollowBtn, key });
-          }
-        }
-        X.stats.foundFollowing = X.processed.size + candidates.length;
-
-        let processedThisCycle = 0;
-        const maxPerCycle = hidden() ? 2 : 3;
-        for (const { cell, button, key } of candidates) {
-          if (!X.interval) break;
-          X.processed.add(key);
-          const user = userSnap(cell);
-          button.click();
-          await sleep(hidden() ? 700 : 500);
-          const confirmed = await clickConfirm('confirmationSheetConfirm');
-          if (await stopIfIssue(confirmed ? 900 : 0)) break;
-          if (confirmed) {
-            X.stats.unfollows++;
-            X.backup.unfollows.push({ ...user, action: 'unfollowed', actionAt: new Date().toISOString() });
-            await bumpAndCheckCap();
-            if (!X.interval) break;
-          }
-          await sleep(hidden() ? 1200 : 800);
-
-          processedThisCycle++;
-          if (processedThisCycle >= maxPerCycle) break;
-        }
-
-        noteEmpty(candidates.length);
-        // Only advance once every visible candidate this cycle was handled — otherwise a
-        // fast scroll would virtualize away unprocessed items before we reach them.
-        advance(candidates.length, processedThisCycle);
-        await sleep(hidden() ? 2000 : 1500);
-      } finally {
-        X.busy = false;
-      }
-    }, 3500);
+  X.stats = {
+    delete: { deleted: 0, found: 0 }, unrepost: { unreposts: 0, foundReposts: 0 },
+    deleteReplies: { repliesDeleted: 0, repliesFound: 0 }, unlike: { unlikes: 0, foundLikes: 0 },
+    followVerified: { follows: 0, foundFollowers: 0 }, followAll: { follows: 0, foundFollowers: 0 },
+    bulkUnfollow: { unfollows: 0, foundFollowing: 0 }
+  }[action] || {};
+  const api = useApi ? globalThis.__xbcApi : null;
+  if (api) {
+    runApiJob(api).catch(error => { if (X.interval) stopAll(`Error: ${error?.message || error}`); });
+  } else {
+    startDomLoop();
   }
 }
 
@@ -1125,6 +1256,9 @@ function readWorkerState() {
     action: X.action,
     stats: X.stats,
     running: !!X.interval,
+    mode: X.mode || null,
+    apiFallback: X.apiFallback || null,
+    waitUntil: X.waitUntil || null,
     issue: X.issue,
     historyPersisted: !!X.historyPersisted,
     historySaveError: X.historySaveError || null,
@@ -1359,11 +1493,13 @@ async function startAction(action, previewSession = null) {
 
   try {
     const performanceMode = $('performanceMode').checked;
+    const useApi = $('apiMode').checked;
     const { currentAccount } = await chrome.storage.local.get(['currentAccount']);
+    if (useApi) await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['worker/xapi.js'] });
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: runWorker,
-      args: [action, performanceMode, currentAccount || null]
+      args: [action, performanceMode, currentAccount || null, useApi]
     });
     window.close();
   } catch (e) {
