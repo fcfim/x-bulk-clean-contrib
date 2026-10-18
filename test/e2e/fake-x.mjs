@@ -80,8 +80,17 @@ function page(state, op, variables) {
     } else entries.push(tweetEntry(item));
   }
   entries.push(cursorEntry(`c:${slice.length ? slice[slice.length - 1].seq : after}`));
-  const timeline = { timeline: { instructions: [{ type: 'TimelineClearCache' }, { type: 'TimelineAddEntries', entries }] } };
+  const hasMore = all.some(item => item.seq > (slice.at(-1)?.seq ?? after));
+  const timeline = { timeline: { instructions: [{ type: 'TimelineClearCache' }, { type: 'TimelineAddEntries', entries }, ...(!hasMore ? [{ type: 'TimelineTerminateTimeline', direction: 'Bottom' }] : [])] } };
   return { data: { user: { result: { __typename: 'User', timeline } } } };
+}
+
+// Scripted scan sequences for deterministic termination/cursor fixtures.
+export function scriptedTimeline(state, { indices = [], cursor = null, end = false, errors } = {}) {
+  const entries = indices.map(index => tweetEntry(state.tweets[index]));
+  if (cursor !== null) entries.push(cursorEntry(cursor));
+  const instructions = [{ type: 'TimelineAddEntries', entries }, ...(end ? [{ type: 'TimelineTerminateTimeline', direction: 'Bottom' }] : [])];
+  return { ...(errors ? { errors } : {}), data: { user: { result: { __typename: 'User', timeline: { timeline: { instructions } } } } } };
 }
 
 const json = (route, status, body, headers = {}) => route.fulfill({ status, contentType: 'application/json', headers, body: JSON.stringify(body) });
@@ -120,6 +129,7 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
       // after the page's discovery request, so they target the extension worker alone.
       const forcedResponse = state.misbehave.responses[op]?.shift();
       if (forcedResponse) {
+        await forcedResponse.waitFor; // optional test-only barrier for Stop while a page is in flight
         const headers = { ...(forcedResponse.headers || {}) };
         if (forcedResponse.resetSeconds != null) headers['x-rate-limit-reset'] = String(Math.ceil(Date.now() / 1000) + forcedResponse.resetSeconds);
         return json(route, forcedResponse.status ?? 429, forcedResponse.body || { errors: [{ code: forcedResponse.code ?? 88, message: 'synthetic restriction' }] }, headers);

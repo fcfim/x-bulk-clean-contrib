@@ -855,20 +855,17 @@ function runWorker(action, performanceMode, account, useApi = false) {
       const cooldown = await domCooldown();
       if (!active()) return;
       if (cooldown) return stopAll(cooldown);
-      X.apiFallback = reason;
-      console.warn('[Postscrub] API mode unavailable, clicking instead:', reason);
-      X.interval = null;
-      startDomLoop();
+      return stopAll(`API job interrupted after ${X.successCount} items: ${reason}. Try again with API, or turn off API mode and start a new job; review and confirm again.`);
     };
+    X.mode = 'api';
     const ready = await api.init(account);
     if (!active()) return;
     if (!ready.ok || !api.canList(LIST_OP[action])) return fallback(ready.reason || `no ${LIST_OP[action]} operation`);
-    X.mode = 'api';
     console.info('[Postscrub] API mode, operation sources:', ready.sources);
     const myId = ready.me.id;
     const isMe = t => t.authorId === myId || (!!me && t.author === me);
     const options = { isActive: active, onWait };
-    let succeeded = 0, failures = 0;
+    let succeeded = 0, failures = 0, settled = false;
     try {
       // Acting on a list while paging through it can make X skip items, so after a pass that
       // changed anything, page through again until a pass finds nothing left to do.
@@ -876,6 +873,11 @@ function runWorker(action, performanceMode, account, useApi = false) {
         let actedThisPass = 0;
         for await (const page of api.pages(LIST_OP[action], options)) {
           if (!active()) return;
+          if (page.partial) {
+            const error = new Error('Partial API page; no actions taken from this page');
+            error.result = { kind: 'incomplete', reason: 'partial_response' };
+            throw error;
+          }
           for (const item of apiItems(page, isMe, myId)) {
             if (!active()) return;
             if (X.processed.has(item.key)) continue;
@@ -885,21 +887,27 @@ function runWorker(action, performanceMode, account, useApi = false) {
             if (result.kind === 'ok') { X.processed.add(item.key); succeeded++; actedThisPass++; failures = 0; recordApiSuccess(item); }
             else if (result.kind === 'gone') X.processed.add(item.key);
             else if (result.kind === 'stop') { await stopAll(result.message); return; }
-            else if (result.kind === 'refused' && !succeeded) return fallback(result.message);
+            else if (result.kind === 'refused') return fallback(result.message);
             else if (++failures >= 5) { await stopAll(`X API errors: ${result.message || result.kind}`); return; }
             updateJobOverlay();
             await api.sleep(api.pace(PACE_KEY[action]));
           }
         }
-        if (!actedThisPass) break;
+        if (!actedThisPass) { settled = true; break; }
       }
     } catch (error) {
       if (!active()) return;
-      if (!succeeded && error.result?.kind === 'refused') return fallback(error.message);
-      await stopAll(`X API error: ${error.message || error}`);
-      return;
+      if (['stop', 'stopped', 'rate'].includes(error.result?.kind)) {
+        await stopAll(`X API stopped after ${succeeded} items: ${error.message || error}`);
+        return;
+      }
+      return fallback(error.message || 'API job could not finish');
     }
-    if (active()) await stopAll(`Finished — ${succeeded} ${DONE_VERB[action]} via API`);
+    if (active()) {
+      if (!settled) return fallback('API pass safety limit reached');
+      if (!succeeded) return fallback('No matching items returned by API');
+      await stopAll(`Finished — ${succeeded} ${DONE_VERB[action]} via API`);
+    }
   }
 
   // === Action dispatch (clicking) ===

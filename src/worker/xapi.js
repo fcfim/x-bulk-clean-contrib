@@ -429,53 +429,95 @@
 
   function parsePage(json) {
     const tweets = [], users = [];
-    let bottom = null, terminated = false;
-    const visit = (node, depth) => {
-      if (!node || typeof node !== 'object' || depth > 60) return;
-      if (Array.isArray(node)) { for (const item of node) visit(item, depth + 1); return; }
-      if (node.type === 'TimelineTerminateTimeline' && /Bottom/.test(node.direction || '')) { terminated = true; return; }
+    let bottom = null, terminated = false, groups = 0, invalid = false;
+    let partial = json?.errors != null && (!Array.isArray(json.errors) || json.errors.length > 0);
+    const content = (node, depth = 0) => {
+      if (!node || typeof node !== 'object') return;
+      if (depth > 60) { partial = true; return; }
+      if (Array.isArray(node)) { for (const item of node) content(item, depth + 1); return; }
       if (node.cursorType === 'Bottom' && typeof node.value === 'string') { bottom = node.value; return; }
       if (node.promotedMetadata) return;
       if (node.tweet_results) { const t = tweetFrom(node.tweet_results.result); if (t) tweets.push(t); return; }
       if (node.user_results && (node.itemType === 'TimelineUser' || node.__typename === 'TimelineUser')) {
         const u = userFrom(node.user_results.result); if (u) users.push(u); return;
       }
-      for (const key in node) visit(node[key], depth + 1);
+      for (const value of Object.values(node)) content(value, depth + 1);
     };
-    visit(json?.data, 0);
-    return { tweets, users, bottom: terminated ? null : bottom };
+    const visit = (node, depth = 0) => {
+      if (!node || typeof node !== 'object') return;
+      if (depth > 60) { partial = true; return; }
+      if (Array.isArray(node)) { for (const item of node) visit(item, depth + 1); return; }
+      if ('instructions' in node) {
+        if (!Array.isArray(node.instructions)) { invalid = true; return; }
+        groups++;
+        for (const instruction of node.instructions) {
+          if (!instruction || typeof instruction !== 'object') { invalid = true; continue; }
+          if (instruction.type === 'TimelineAddEntries') {
+            if (!Array.isArray(instruction.entries) || instruction.entries.some(entry => !entry || typeof entry !== 'object')) invalid = true;
+            else content(instruction.entries);
+          } else if (instruction.type === 'TimelineReplaceEntry' || instruction.type === 'TimelinePinEntry') {
+            if (!instruction.entry || typeof instruction.entry !== 'object') invalid = true;
+            else content(instruction.entry);
+          } else if (instruction.type === 'TimelineAddToModule') {
+            if (!Array.isArray(instruction.moduleItems)) invalid = true;
+            else content(instruction.moduleItems);
+          } else if (instruction.type === 'TimelineTerminateTimeline') {
+            if (instruction.direction === 'Bottom') terminated = true;
+            else if (instruction.direction !== 'Top') invalid = true;
+          } else if (instruction.type !== 'TimelineClearCache') partial = true;
+        }
+        return;
+      }
+      for (const value of Object.values(node)) visit(value, depth + 1);
+    };
+    visit(json?.data);
+    return { tweets, users, bottom, terminated, recognized: groups > 0 && !invalid, partial: partial || groups > 1 };
   }
 
-  // Pages through a list operation. Yields { tweets, users } until the list ends.
+  const paginationError = (reason, message, kind = 'incomplete') => {
+    const error = new Error(message);
+    error.result = { kind, reason, message };
+    return error;
+  };
+
+  // Normal return means an explicit bottom termination in a recognized timeline.
+  // Every incomplete/cancelled path throws, so callers cannot mistake it for completion.
   async function* pages(name, { isActive, onWait, pause = 900 } = {}) {
     const op = graphql(name);
     const job = state.job;
     const base = { ...(LIST_DEFAULT_VARIABLES[name] || {}), ...(op.variables || {}) };
-    base.userId = job.me.id; // always the signed-in account, whatever page the template came from
+    base.userId = job.me.id;
     delete base.cursor;
-    const seen = new Set();
-    let cursor = null, empty = 0;
+    const seen = new Set(), cursors = new Set();
+    let cursor = null;
     for (let page = 0; page < 2000; page++) {
       const variables = cursor ? { ...base, cursor } : base;
       let parsed = null;
       const result = await perform(name, async () => {
-        // X sends features and fieldToggles only when the operation defines some.
-        const nonEmpty = (o) => (o && Object.keys(o).length ? o : undefined);
+        const nonEmpty = o => o && Object.keys(o).length ? o : undefined;
         const r = await call('GET', `/i/api/graphql/${op.queryId}/${name}`, { params: { variables, features: nonEmpty(op.features), fieldToggles: nonEmpty(op.fieldToggles) } });
         parsed = r.json ? parsePage(r.json) : null;
         return r;
       }, { isActive, onWait, okWhen: json => !!json?.data }, job);
-      if (result.kind === 'stopped') return;
+      if (result.kind === 'stopped') throw paginationError('cancelled', 'API pagination cancelled', 'stopped');
       if (result.kind !== 'ok') { const error = new Error(result.message || result.kind); error.result = result; throw error; }
+      if (!parsed?.recognized) throw paginationError('invalid_timeline', 'X returned an unrecognized or malformed timeline');
       const fresh = {
         tweets: parsed.tweets.filter(t => !seen.has(`t${t.id}`) && seen.add(`t${t.id}`)),
-        users: parsed.users.filter(u => !seen.has(`u${u.id}`) && seen.add(`u${u.id}`))
+        users: parsed.users.filter(u => !seen.has(`u${u.id}`) && seen.add(`u${u.id}`)),
+        partial: parsed.partial
       };
-      empty = fresh.tweets.length + fresh.users.length ? 0 : empty + 1;
       yield fresh;
-      if (!parsed.bottom || parsed.bottom === cursor || empty >= 2) return;
+      if (isActive && !isActive()) throw paginationError('cancelled', 'API pagination cancelled', 'stopped');
+      if (parsed.partial) throw paginationError('partial_response', 'X returned a partial or unsupported timeline response');
+      if (parsed.terminated) return { kind: 'complete', reason: 'explicit_end', pages: page + 1 };
+      if (!parsed.bottom) throw paginationError('missing_cursor', 'Timeline has no bottom cursor or explicit end');
+      if (parsed.bottom === cursor) throw paginationError('cursor_stalled', 'Timeline cursor stopped advancing');
+      if (cursors.has(parsed.bottom)) throw paginationError('cursor_cycle', 'Timeline cursor entered a cycle');
+      if (page === 1999) throw paginationError('page_budget', 'API page safety limit reached');
+      cursors.add(parsed.bottom);
       cursor = parsed.bottom;
-      if (!(await waitUntil(Date.now() + Math.max(900, Number(pause) || 900) * job.paceFactor * job.slowdown, isActive))) return;
+      if (!(await waitUntil(Date.now() + Math.max(900, Number(pause) || 900) * job.paceFactor * job.slowdown, isActive))) throw paginationError('cancelled', 'API pagination cancelled', 'stopped');
     }
   }
 
