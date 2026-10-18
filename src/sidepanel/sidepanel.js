@@ -10,6 +10,7 @@ let cleanupRunning = false;
 let previewSnapshot = null;
 let pollGeneration = 0;
 let pollBusy = false;
+let pollPending = false;
 let selectionQueue = Promise.resolve();
 
 const $ = (id) => document.getElementById(id);
@@ -775,7 +776,8 @@ async function startScan() {
 }
 
 async function pollPreview() {
-  if (!activeTab || pollBusy) return;
+  if (!activeTab) return;
+  if (pollBusy) { pollPending = true; return; }
   const generation = pollGeneration;
   pollBusy = true;
   try {
@@ -823,12 +825,20 @@ async function pollPreview() {
     $('pauseScan').textContent = state.done ? 'Scan complete' : state.paused ? 'Resume scan' : 'Pause & review';
     $('pauseScan').disabled = !!state.done || (!state.running && !state.paused);
     $('stopScan').textContent = state.running ? 'Stop scan' : 'New scan';
-    if (refreshed && (state.paused || state.done || !state.running)) renderReview();
+    if (state.paused || state.done || !state.running) {
+      if (refreshed) renderReview();
+      else {
+        // Resuming hides these nodes without invalidating the cached items.
+        $('reviewSection').style.display = 'block';
+        $('stickyBar').style.display = 'block';
+      }
+    }
     if (!state.running) stopPolling();
   } catch (error) {
     if (generation === pollGeneration) showError(`Could not refresh preview: ${error?.message || error}`);
   } finally {
     pollBusy = false;
+    if (pollPending) { pollPending = false; pollPreview(); }
   }
 }
 
@@ -840,6 +850,7 @@ function stopPolling() {
   clearInterval(pollTimer);
   pollTimer = null;
   pollGeneration++;
+  pollPending = false;
 }
 
 function startPolling() {

@@ -53,6 +53,15 @@ async function testPreviewPolling() {
   for (let i = 0; i < 4; i++) await run('pollPreview()');
   check('2,000 paused items are fetched/rendered once; checkbox and focus stay attached', () => { assert.equal(fullReads, 1); assert.equal(list.rebuilds, 1); assert.equal(first(), original); assert.equal(document.activeElement, original); assert.equal(timers.size, 1); });
 
+  original.checked = false; await original.listeners.change();
+  await run('togglePause()'); await settle();
+  assert.equal(document.getElementById('reviewSection').style.display, 'none', 'resume hides the review');
+  await run('togglePause()'); await settle();
+  check('pause resume pause with no new items shows the cached review and selection bar', () => { assert.equal(document.getElementById('reviewSection').style.display, 'block'); assert.equal(document.getElementById('stickyBar').style.display, 'block'); assert.equal(first().checked, false); assert.equal(document.getElementById('selectedCount').textContent, '1999 selected'); });
+  for (let i = 0; i < 3; i++) await run('pollPreview()');
+  check('repeated pause preserves cached rows and focus without another fetch', () => { assert.equal(fullReads, 1); assert.equal(list.rebuilds, 1); assert.equal(first(), original); assert.equal(document.activeElement, original); });
+  original.checked = true; await original.listeners.change();
+
   let releaseWrite;
   holdWrite = new Promise(resolve => { releaseWrite = resolve; });
   original.checked = false; const change = original.listeners.change();
@@ -99,15 +108,15 @@ async function testPreviewPolling() {
   holdFull = new Promise(resolve => { releaseFull = resolve; });
   window.__xbcPreview = { startedAt: 3, type: 'tweets', items: makeItems(2), interval: {}, paused: true };
   const beforeRestart = fullReads;
+  const rebuildsBeforeRestart = list.rebuilds;
   run('startPolling()');
   for (let i = 0; i < 20 && fullReads === beforeRestart; i++) await Promise.resolve();
   assert.equal(fullReads, beforeRestart + 1);
   window.__xbcPreview = { startedAt: 4, type: 'tweets', items: makeItems(2).map(item => ({ ...item, selected: false })), interval: null, done: true };
-  run('stopPolling(); startPolling();');
+  run('stopPolling(); startPolling(); startPolling();');
   releaseFull(); holdFull = null; await settle();
-  check('a response from an earlier polling generation is discarded', () => assert.equal(run('previewItems.length'), 0));
-  await run('pollPreview()');
-  check('the next scan still loads after an interrupted refresh', () => { assert.equal(first().checked, false); assert.equal(run('previewSnapshot.startedAt'), 4); });
+  check('pending restarts coalesce into an immediate refresh after the in-flight poll', () => assert.equal(fullReads, beforeRestart + 2));
+  check('earlier polling responses are discarded and the next scan loads without a timer tick', () => { assert.equal(list.rebuilds, rebuildsBeforeRestart + 1); assert.equal(first().checked, false); assert.equal(run('previewSnapshot.startedAt'), 4); });
 
   run('startPolling()'); await settle();
   await run('setFilteredSelection("none")'); await toggle(true);
@@ -197,6 +206,46 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true } 
 }
 
 const SCENARIOS = [
+  {
+    name: 'preview: pause resume pause without new items restores cached review',
+    state: { own: 0 },
+    async run(env) {
+      await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+          window.__xbcPreview = {
+            startedAt: 1, type: 'tweets', account: { username: 'me' }, interval: {}, paused: true, done: false,
+            items: Array.from({ length: 2000 }, (_, i) => ({ id: `9${1000 + i}`, type: 'tweet', classification: 'tweets', text: `post ${i}`, date: '2024-01-01', selected: false }))
+          };
+        } });
+      });
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => document.getElementById('scanState').textContent === 'Scan paused' && document.getElementById('reviewSection').style.display === 'block');
+      await panel.locator('#resultsList input').first().check();
+      await panel.evaluate(() => {
+        window.__cachedCheckbox = document.querySelector('#resultsList input');
+        window.__fullReads = 0;
+        const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+        chrome.scripting.executeScript = details => {
+          if (details.func?.name === 'readPreviewState' && details.args?.[0]) window.__fullReads++;
+          return execute(details);
+        };
+      });
+      await panel.locator('#pauseScan').click();
+      await panel.waitForFunction(() => document.getElementById('reviewSection').style.display === 'none');
+      await panel.locator('#pauseScan').click();
+      await panel.waitForFunction(() => document.getElementById('scanState').textContent === 'Scan paused' && document.getElementById('reviewSection').style.display === 'block' && document.getElementById('stickyBar').style.display === 'block', null, { timeout: 5000 });
+      await panel.locator('#resultsList input').first().focus();
+      await panel.waitForTimeout(1800);
+      const result = await panel.evaluate(() => ({ sameNode: document.querySelector('#resultsList input') === window.__cachedCheckbox, focused: document.activeElement === window.__cachedCheckbox, checked: window.__cachedCheckbox.checked, count: document.getElementById('selectedCount').textContent, fullReads: window.__fullReads }));
+      await panel.close();
+      return [
+        ['second pause restores the same cached row without a full read', result.sameNode && result.fullReads === 0, result],
+        ['selected checkbox and count survive resume and re-pause', result.checked && result.count === '1 selected', result],
+        ['focus remains stable during subsequent paused ticks', result.focused, result]
+      ];
+    }
+  },
   {
     name: 'preview: 2000 paused items preserve checkbox focus and selection',
     state: { own: 3 },
