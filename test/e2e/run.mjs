@@ -151,6 +151,8 @@ async function quickClean(env, action, { apiMode = true } = {}) {
   const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
   const popup = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
   await popup.waitForFunction(() => document.getElementById('accountCard')?.dataset.state === 'ready', null, { timeout: 20000 });
+  // Restoring a finished job clears activeAction asynchronously in the new popup.
+  await waitFor(async () => !(await storage(env.worker, ['activeAction'])).activeAction, { label: 'previous action state to clear' });
   await popup.evaluate((on) => {
     const box = document.getElementById('apiMode');
     if (box.checked !== on) box.click();
