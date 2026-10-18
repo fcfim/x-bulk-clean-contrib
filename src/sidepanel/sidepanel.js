@@ -323,8 +323,11 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   const startApiScan = async (api) => {
     const token = P.interval = { api: true };
     const active = () => P.interval === token;
-    const fallback = (reason) => {
+    const fallback = async (reason) => {
       if (!active()) return;
+      const cooldown = await domCooldown([LIST_OP[type]]);
+      if (!active()) return;
+      if (cooldown) return finish(`Scan stopped: ${cooldown}`, false);
       P.apiFallback = reason;
       console.warn('[Postscrub] API scan unavailable, scrolling instead:', reason);
       P.interval = null;
@@ -353,9 +356,31 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     if (active()) finish('Scan complete', true);
   };
 
+  // Kept inside this serialized worker: DOM mode may run without xapi injected.
+  async function domCooldown(operations) {
+    const raw = (document.cookie || '').match(/(?:^|;\s*)twid=([^;]*)/)?.[1] || '';
+    const accountId = decodeURIComponent(raw).match(/u=(\d+)/)?.[1];
+    if (!accountId) throw new Error('Cannot identify the signed-in account for cooldown checks');
+    const prefixes = operations.filter(Boolean).map(op => `xbcApiCooldown:${accountId}:${op}`);
+    const records = await chrome.storage.local.get(null);
+    let until = 0;
+    for (const [key, value] of Object.entries(records)) {
+      if (prefixes.some(prefix => key === prefix || key.startsWith(prefix + ':claim:')) && Number.isFinite(value?.until) && value.until > Date.now()) {
+        until = Math.max(until, value.until);
+      }
+    }
+    return until ? `X API cooldown. Job suspended; try again after ${new Date(until).toISOString()}.` : null;
+  }
   const api = useApi ? globalThis.__xbcApi : null;
   if (api) startApiScan(api).catch(error => { if (P.interval) finish(`Scan stopped: ${error?.message || error}`, false); });
-  else startDomScan();
+  else {
+    const token = P.interval = { cooldown: true };
+    domCooldown([LIST_OP[type]]).then(reason => {
+      if (P.interval !== token) return;
+      if (reason) return finish(`Scan stopped: ${reason}`, false);
+      startDomScan();
+    }).catch(() => { if (P.interval === token) finish('Scan stopped: could not check X cooldown for the signed-in account. Reload X before trying again.', false); });
+  }
   return { ok: true };
 }
 
@@ -700,8 +725,11 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     const token=X.interval={api:true};
     const active=()=>X.interval===token;
     const options={isActive:active,onWait:until=>{X.waitUntil=until;updateOverlay()}};
-    const fallback=reason=>{
+    const fallback=async reason=>{
       if(!active())return;
+      const cooldown=await domCooldown();
+      if(!active())return;
+      if(cooldown)return stop(cooldown);
       X.apiFallback=reason;console.warn('[Postscrub] API mode unavailable, clicking instead:',reason);
       X.interval=null;startDomLoop();
     };
@@ -727,9 +755,34 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     const verb=type==='unfollow'?'unfollowed':type==='reposts'?'removed':'deleted';
     if(active())await stop(`Finished — ${X.successCount} selected items ${verb}${gone?`, ${gone} already gone`:''}`);
   };
+  // Kept inside this serialized worker: DOM mode may run without xapi injected.
+  async function domCooldown() {
+    const list = { tweets: 'UserTweets', replies: 'UserTweetsAndReplies', reposts: 'UserTweets', unfollow: 'Following' }[type];
+    const operation = type === 'unfollow' ? 'friendships/destroy' : type === 'reposts' ? 'DeleteRetweet' : 'DeleteTweet';
+    const operations = [list, operation];
+    const raw = (document.cookie || '').match(/(?:^|;\s*)twid=([^;]*)/)?.[1] || '';
+    const accountId = decodeURIComponent(raw).match(/u=(\d+)/)?.[1];
+    if (!accountId) throw new Error('Cannot identify the signed-in account for cooldown checks');
+    const prefixes = operations.filter(Boolean).map(op => `xbcApiCooldown:${accountId}:${op}`);
+    const records = await chrome.storage.local.get(null);
+    let until = 0;
+    for (const [key, value] of Object.entries(records)) {
+      if (prefixes.some(prefix => key === prefix || key.startsWith(prefix + ':claim:')) && Number.isFinite(value?.until) && value.until > Date.now()) {
+        until = Math.max(until, value.until);
+      }
+    }
+    return until ? `X API cooldown. Job suspended; try again after ${new Date(until).toISOString()}.` : null;
+  }
   const api=useApi?globalThis.__xbcApi:null;
   if(api)runApi(api).catch(error=>{if(X.interval)stop(`Error: ${error?.message||error}`)});
-  else startDomLoop();
+  else {
+    const token=X.interval={cooldown:true};
+    domCooldown().then(reason=>{
+      if(X.interval!==token)return;
+      if(reason)return stop(reason);
+      startDomLoop();
+    }).catch(()=>{if(X.interval===token)stop('Could not check X cooldown for the signed-in account. Reload X before trying again.')});
+  }
   return {ok:true};
 }
 

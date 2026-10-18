@@ -139,12 +139,20 @@ if (process.argv[2] === '--preview-polling') {
   process.exit(0);
 }
 
+if (process.argv[2] === '--api-limits') {
+  const { testApiLimits } = await import('./api-limits.mjs');
+  await testApiLimits();
+  process.exit(0);
+}
+
 const BUTTONS = { delete: 'startDelete', unrepost: 'startUnrepost', unlike: 'startUnlike', bulkUnfollow: 'bulkUnfollow', followAll: 'followAllFollowers', followVerified: 'followVerifiedFollowers' };
 
 async function quickClean(env, action, { apiMode = true } = {}) {
   const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
   const popup = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
   await popup.waitForFunction(() => document.getElementById('accountCard')?.dataset.state === 'ready', null, { timeout: 20000 });
+  // Restoring a finished job clears activeAction asynchronously in the new popup.
+  await waitFor(async () => !(await storage(env.worker, ['activeAction'])).activeAction, { label: 'previous action state to clear' });
   await popup.evaluate((on) => {
     const box = document.getElementById('apiMode');
     if (box.checked !== on) box.click();
@@ -171,7 +179,7 @@ async function quickClean(env, action, { apiMode = true } = {}) {
 }
 
 // Preview & Select in the side panel: scan, keep everything selected, act on the selection.
-async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true } = {}) {
+async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true, beforeAct } = {}) {
   const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
   const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
   await panel.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
@@ -189,6 +197,7 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true } 
     const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { const P = window.__xbcPreview; return P && { mode: P.mode, apiFallback: P.apiFallback || null, items: P.items.map(i => ({ id: i.id, type: i.type, classification: i.classification, userId: i.userId })) }; } });
     return r?.result;
   });
+  await beforeAct?.();
   await panel.evaluate(() => document.getElementById('deleteSelected').click());
   await panel.waitForFunction(() => document.getElementById('deleteDialog')?.open, null, { timeout: 10000 });
   await panel.evaluate(() => document.getElementById('confirmDelete').click());
@@ -206,6 +215,202 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true } 
 }
 
 const SCENARIOS = [
+  ...[
+    { name: 'active', account: ME.id, offset: 3600000, blocked: false, stops: true },
+    { name: 'blocked', account: ME.id, offset: 3600000, blocked: true, stops: true },
+    { name: 'expired', account: ME.id, offset: -60000, blocked: true, stops: false },
+    { name: 'another account', account: '99', offset: 3600000, blocked: true, stops: false }
+  ].map(({ name, account, offset, blocked, stops }) => ({
+    name: `limits: API off Quick Clean respects ${name} cooldown`,
+    state: { own: 2 },
+    async run(env, state) {
+      await env.worker.evaluate(({ account, offset, blocked }) => chrome.storage.local.set({ [`xbcApiCooldown:${account}:DeleteTweet:claim:manual-test`]: { until: Date.now() + offset, blocked } }), { account, offset, blocked });
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      const dom = state.calls.filter(c => c.op === 'dom-delete').length;
+      return [
+        ['API mode stays off', !state.calls.some(c => c.op === 'DeleteTweet'), state.calls],
+        ['only applicable active cooldown blocks DOM', stops ? dom === 0 && state.tweets.length === 2 : dom === 2 && state.tweets.length === 0, { dom, remaining: state.tweets.length }],
+        ['history reflects the gate or completed consented action', stops ? r.job.status === 'interrupted' && r.job.total === 0 && /suspended/.test(r.job.statusText) : r.job.status === 'completed' && r.job.total === 2, r.job]
+      ];
+    }
+  })),
+  {
+    name: 'limits: API off preview scan respects its list cooldown',
+    state: { own: 2 },
+    async run(env, state) {
+      await env.worker.evaluate(id => chrome.storage.local.set({ [`xbcApiCooldown:${id}:UserTweets:claim:manual-test`]: { until: Date.now() + 3600000 } }), ME.id);
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.evaluate(() => { document.getElementById('previewApi').checked = false; document.getElementById('startScan').click(); });
+      await panel.waitForFunction(() => /Scan stopped.*suspended/.test(document.getElementById('scanState').textContent));
+      const result = await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { const p = window.__xbcPreview; return { mode: p.mode, running: !!p.interval, done: p.done, items: p.items.length }; } });
+        return r.result;
+      });
+      await panel.close();
+      return [
+        ['scan did not start DOM or mark complete', result.mode !== 'dom' && !result.running && !result.done && result.items === 0, result],
+        ['no destructive request', !state.calls.some(c => c.method === 'POST'), state.calls]
+      ];
+    }
+  },
+  {
+    name: 'limits: API off selected deletion respects an action cooldown after confirmation',
+    state: { own: 2 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false, beforeAct: () => env.worker.evaluate(id => chrome.storage.local.set({ [`xbcApiCooldown:${id}:DeleteTweet:claim:manual-test`]: { until: Date.now() + 3600000, blocked: true } }), ME.id) });
+      return [
+        ['unrestricted DOM scan still found both items', r.scan.mode === 'dom' && r.scan.items.length === 2, r.scan],
+        ['confirmed job records suspension with zero success', r.job.status === 'interrupted' && r.job.total === 0 && /suspended/.test(r.job.statusText), r.job],
+        ['no DOM or API deletion', !state.calls.some(c => c.op === 'dom-delete' || c.op === 'DeleteTweet') && state.tweets.length === 2, state.calls]
+      ];
+    }
+  },
+  {
+    name: 'limits: API off Stop during pending cooldown read never starts DOM afterward',
+    state: { own: 2 },
+    async run(env, state) {
+      // This test-only adapter holds the worker's local metadata read, not X traffic.
+      // Navigate first so the isolated-world adapter survives the action dispatch.
+      const xTab = env.context.pages().find(page => page.url().startsWith('https://x.com/'));
+      await xTab.goto(`https://x.com/${ME.screen}`);
+      await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+          const original = chrome.storage.local.get.bind(chrome.storage.local);
+          chrome.storage.local.get = keys => keys === null ? new Promise(resolve => { window.__releaseCooldownRead = () => { chrome.storage.local.get = original; resolve({}); }; }) : original(keys);
+        } });
+      });
+      const popup = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
+      await popup.waitForFunction(() => document.getElementById('accountCard')?.dataset.state === 'ready');
+      await popup.evaluate(() => { const box = document.getElementById('apiMode'); if (box.checked) box.click(); document.getElementById('startDelete').click(); });
+      await popup.waitForFunction(() => document.getElementById('confirmDialog').open);
+      await popup.locator('#confirmStart').click();
+      await waitFor(() => env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => !!window.__releaseCooldownRead });
+        return r.result;
+      }), { label: 'held manual cooldown read' });
+      const result = await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: async () => {
+          await window.__xCleanerStop(); window.__releaseCooldownRead();
+          await new Promise(resolve => setTimeout(resolve, 100));
+          return { running: !!window.__xCleaner.interval, issue: window.__xCleaner.issue, mode: window.__xCleaner.mode };
+        } });
+        return r.result;
+      });
+      await popup.close();
+      return [
+        ['Stop survives delayed storage completion', !result.running && result.mode !== 'dom' && /Stopped by user/.test(result.issue), result],
+        ['no actions were dispatched', !state.calls.some(c => c.op === 'dom-delete' || c.op === 'DeleteTweet') && state.tweets.length === 2, state.calls]
+      ];
+    }
+  },
+  ...[
+    { name: '403 with Retry-After', response: { status: 403, body: {}, resetSeconds: 5, headers: { 'Retry-After': '3600' } }, reason: /suspended/ },
+    { name: 'binding with Retry-After', response: { status: 401, body: {}, resetSeconds: 5, headers: { 'x-tfe-auth-result-code': '3071', 'Retry-After': '3600' } }, reason: /suspended/ },
+    { name: '403 with backoff', response: { status: 403, body: {}, resetSeconds: 5, headers: { 'backoff-policy': 'backoff=3600000' } }, reason: /suspended/ },
+    { name: '403 with remaining zero', response: { status: 403, body: {}, resetSeconds: 3600, headers: { 'x-rate-limit-remaining': '0' } }, reason: /suspended/ },
+    { name: 'one hour reset', response: { resetSeconds: 3600 }, reason: /suspended/ },
+    { name: 'one hour Retry-After', response: { resetSeconds: 5, headers: { 'Retry-After': '3600' } }, reason: /suspended/ },
+    { name: 'daily 344 in HTTP 429', response: { code: 344, resetSeconds: 5 }, reason: /daily limit/ },
+    { name: 'daily 344 in HTTP 400', response: { status: 400, code: 344 }, reason: /daily limit/ },
+    { name: 'automation in HTTP 429', response: { code: 226 }, reason: /looks automated/ }
+  ].map(({ name, response, reason }) => ({
+    name: `limits: ${name} stops without DOM and survives a new job`,
+    state: { own: 2 },
+    async run(env, state) {
+      state.misbehave.responses.DeleteTweet = [response];
+      const first = await quickClean(env, 'delete');
+      const callsBefore = state.calls.filter(c => c.op === 'DeleteTweet').length;
+      // Header-backed waits and daily restrictions survive api.init in the next job.
+      // Automation without a deadline stops this job; no unlock time is invented.
+      const persistent = response.resetSeconds != null || response.code === 344;
+      const second = persistent ? await quickClean(env, 'delete') : null;
+      return [
+        ['first job is interrupted with a clear reason', first.job.status === 'interrupted' && reason.test(first.job.statusText), first.job],
+        ['only the refused mutation was attempted', callsBefore === 1, callsBefore],
+        ['no DOM fallback or mutation after restriction', first.worker?.mode === 'api' && !first.worker.apiFallback && !state.calls.some(c => c.op === 'dom-delete'), first.worker],
+        ['fixture posts stay intact', state.tweets.length === 2, state.tweets.length],
+        ['next job respects persisted restriction', !persistent || (second.job.status === 'interrupted' && state.calls.filter(c => c.op === 'DeleteTweet').length === 1 && !second.worker.apiFallback), second?.job]
+      ];
+    }
+  })),
+  ...[
+    { name: 'daily 429', response: { code: 344, resetSeconds: 5 }, reason: /daily limit/ },
+    { name: '403 with Retry-After', response: { status: 403, body: {}, headers: { 'Retry-After': '3600' } }, reason: /suspended/ },
+    { name: 'binding with Retry-After', response: { status: 401, body: {}, headers: { 'x-tfe-auth-result-code': '3071', 'Retry-After': '3600' } }, reason: /suspended/ }
+  ].map(({ name, response, reason }) => ({
+    name: `limits: preview scan stops on ${name} without starting DOM`,
+    state: { own: 2 },
+    async run(env, state) {
+      // Prime the profile first: its own discovery GET must not consume the worker fixture.
+      const xTab = env.context.pages().find(page => page.url().startsWith('https://x.com/'));
+      await xTab.goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
+      state.misbehave.responses.UserTweets = [response];
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.locator('#startScan').click();
+      await panel.waitForFunction(() => /Scan stopped/.test(document.getElementById('scanState').textContent));
+      const result = await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+          const p = window.__xbcPreview;
+          return { mode: p.mode, fallback: p.apiFallback || null, done: p.done, issue: p.issue, waiting: p.waitUntil, running: !!p.interval };
+        } });
+        return r.result;
+      });
+      await panel.close();
+      return [
+        ['scan interrupted without DOM/completion', result.mode === 'api' && !result.fallback && !result.done && !result.running, result],
+        ['restriction message preserved', reason.test(result.issue), result.issue],
+        ['no destructive request', !state.calls.some(c => c.method === 'POST'), state.calls]
+      ];
+    }
+  })),
+  ...[
+    { name: '403', status: 403, headers: { 'Retry-After': '3600' } },
+    { name: 'binding', status: 401, headers: { 'x-tfe-auth-result-code': '3071', 'Retry-After': '3600' } }
+  ].map(({ name, ...response }) => ({
+    name: `limits: selected delete stops on ${name} cooldown without DOM`,
+    state: { own: 2 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { beforeAct: () => { state.misbehave.responses.DeleteTweet = [{ ...response, body: {} }]; } });
+      return [
+        ['scan still completes before confirmation', r.scan.mode === 'api' && r.scan.items.length === 2, r.scan],
+        ['selected job stops with no success', r.job.status === 'interrupted' && r.job.total === 0 && /suspended/.test(r.job.statusText), r.job],
+        ['no DOM fallback or subsequent mutation', r.worker.mode === 'api' && !r.worker.apiFallback && state.calls.filter(c => c.op === 'DeleteTweet').length === 1 && !state.calls.some(c => c.op === 'dom-delete'), r.worker],
+        ['posts unchanged', state.tweets.length === 2, state.tweets.length]
+      ];
+    }
+  })),
+  {
+    name: 'limits: Stop during rate wait persists deadline and partial history',
+    state: { own: 2 },
+    async run(env, state) {
+      state.misbehave.responses.DeleteTweet = [{ resetSeconds: 120 }];
+      const popup = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
+      await popup.waitForFunction(() => document.getElementById('accountCard')?.dataset.state === 'ready');
+      await popup.locator('#startDelete').click();
+      await popup.waitForFunction(() => document.getElementById('confirmDialog').open);
+      await popup.locator('#confirmStart').click();
+      await waitFor(async () => Object.entries(await storage(env.worker, null)).some(([key, value]) => key.startsWith(`xbcApiCooldown:${ME.id}:DeleteTweet:claim:`) && value.until > Date.now()), { timeout: 10000, label: 'persisted cooldown' });
+      await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => window.__xCleanerStop() });
+      });
+      const job = await waitFor(async () => (await storage(env.worker, ['jobHistory'])).jobHistory?.[0], { timeout: 10000, label: 'Stop history' });
+      await popup.close();
+      return [
+        ['Stop records stopped history and zero successful mutations', job.status === 'stopped' && job.total === 0, job],
+        ['no second mutation or DOM fallback', state.calls.filter(c => c.op === 'DeleteTweet').length === 1 && !state.calls.some(c => c.op === 'dom-delete'), state.calls],
+        ['posts unchanged', state.tweets.length === 2, state.tweets.length]
+      ];
+    }
+  },
   {
     name: 'preview: pause resume pause without new items restores cached review',
     state: { own: 0 },
@@ -498,7 +703,7 @@ const filter = process.argv[2];
 let failed = 0;
 for (const scenario of SCENARIOS.filter(s => !filter || s.name.includes(filter))) {
   const env = await launch();
-  await env.worker.evaluate(() => chrome.storage.local.set({ apiPace: 0.05 }));
+  await env.worker.evaluate(() => chrome.storage.local.set({ apiPace: 1 }));
   const state = createState(scenario.state);
   scenario.setup?.(state);
   await installFakeX(env.context, state);

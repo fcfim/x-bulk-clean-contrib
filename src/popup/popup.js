@@ -850,8 +850,11 @@ function runWorker(action, performanceMode, account, useApi = false) {
     const token = X.interval = { api: true };
     const active = () => X.interval === token;
     const onWait = (until) => { X.waitUntil = until; updateJobOverlay(); };
-    const fallback = (reason) => {
+    const fallback = async (reason) => {
       if (!active()) return;
+      const cooldown = await domCooldown();
+      if (!active()) return;
+      if (cooldown) return stopAll(cooldown);
       X.apiFallback = reason;
       console.warn('[Postscrub] API mode unavailable, clicking instead:', reason);
       X.interval = null;
@@ -1226,11 +1229,33 @@ function runWorker(action, performanceMode, account, useApi = false) {
     followVerified: { follows: 0, foundFollowers: 0 }, followAll: { follows: 0, foundFollowers: 0 },
     bulkUnfollow: { unfollows: 0, foundFollowing: 0 }
   }[action] || {};
+  // Kept inside this serialized worker: DOM mode may run without xapi injected.
+  async function domCooldown() {
+    const operation = { delete: 'DeleteTweet', deleteReplies: 'DeleteTweet', unrepost: 'DeleteRetweet', unlike: 'UnfavoriteTweet', bulkUnfollow: 'friendships/destroy', followAll: 'friendships/create', followVerified: 'friendships/create' }[action];
+    const operations = [LIST_OP[action], operation];
+    const raw = (document.cookie || '').match(/(?:^|;\s*)twid=([^;]*)/)?.[1] || '';
+    const accountId = decodeURIComponent(raw).match(/u=(\d+)/)?.[1];
+    if (!accountId) throw new Error('Cannot identify the signed-in account for cooldown checks');
+    const prefixes = operations.filter(Boolean).map(op => `xbcApiCooldown:${accountId}:${op}`);
+    const records = await chrome.storage.local.get(null);
+    let until = 0;
+    for (const [key, value] of Object.entries(records)) {
+      if (prefixes.some(prefix => key === prefix || key.startsWith(prefix + ':claim:')) && Number.isFinite(value?.until) && value.until > Date.now()) {
+        until = Math.max(until, value.until);
+      }
+    }
+    return until ? `X API cooldown. Job suspended; try again after ${new Date(until).toISOString()}.` : null;
+  }
   const api = useApi ? globalThis.__xbcApi : null;
   if (api) {
     runApiJob(api).catch(error => { if (X.interval) stopAll(`Error: ${error?.message || error}`); });
   } else {
-    startDomLoop();
+    const token = X.interval = { cooldown: true };
+    domCooldown().then(reason => {
+      if (X.interval !== token) return;
+      if (reason) return stopAll(reason);
+      startDomLoop();
+    }).catch(() => { if (X.interval === token) stopAll('Could not check X cooldown for the signed-in account. Reload X before trying again.'); });
   }
 }
 

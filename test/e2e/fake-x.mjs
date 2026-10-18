@@ -31,7 +31,7 @@ export function createState({ own = 12, replies = 0, retweets = 0, likes = 0, fo
     followers: stamp(users(followers, 'r', i => ({ following: i < followedBack, verified: i % 2 === 0 }))),
     pageSize,
     calls: [],
-    misbehave: { rateLimitAfter: null, rateLimitSeconds: 3, refuse: {}, binding: {}, errorCode: null },
+    misbehave: { rateLimitAfter: null, rateLimitSeconds: 3, refuse: {}, binding: {}, errorCode: null, responses: {} },
     mutations: 0
   };
 }
@@ -116,6 +116,14 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
       const [, queryId, op] = graphql;
       call.op = op;
       if (QUERY_IDS[op] !== queryId) return json(route, 404, { errors: [{ message: 'Query not found' }] });
+      // One-shot synthetic responses, including server deadlines. Tests can enqueue these
+      // after the page's discovery request, so they target the extension worker alone.
+      const forcedResponse = state.misbehave.responses[op]?.shift();
+      if (forcedResponse) {
+        const headers = { ...(forcedResponse.headers || {}) };
+        if (forcedResponse.resetSeconds != null) headers['x-rate-limit-reset'] = String(Math.ceil(Date.now() / 1000) + forcedResponse.resetSeconds);
+        return json(route, forcedResponse.status ?? 429, forcedResponse.body || { errors: [{ code: forcedResponse.code ?? 88, message: 'synthetic restriction' }] }, headers);
+      }
       if (request.method() === 'GET') {
         const variables = JSON.parse(url.searchParams.get('variables') || '{}');
         call.variables = variables;
