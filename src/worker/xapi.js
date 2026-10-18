@@ -97,14 +97,60 @@
     } catch (_) { return {}; }
   }
 
-  const state = { ready: false, bearer: FALLBACK_BEARER, ops: {}, me: null, sources: {}, backoffUntil: 0, paceFactor: 1 };
+  const MIN_RATE_WAIT = 15 * 60000;
+  const MAX_JOB_WAIT = 30 * 60000;
+  const MAX_RATE_RETRIES = 3;
+  const state = { ready: false, bearer: FALLBACK_BEARER, ops: {}, me: null, sources: {}, paceFactor: 1, slowdown: 1, waited: 0, rateRetries: 0 };
+
+  // Query ids change with X builds; the operation name, not its query id, is the bucket.
+  // Separate storage keys avoid overwriting another account/operation's cooldown.
+  const cooldownKey = operation => `xbcApiCooldown:${state.me.id}:${operation}`;
+  const readCooldown = async operation => (await chrome.storage.local.get([cooldownKey(operation)]))[cooldownKey(operation)] || {};
+  async function rememberCooldown(operation, update) {
+    const stored = await readCooldown(operation);
+    const previous = stored.until > Date.now() ? stored : {};
+    const value = {
+      ...previous, ...update,
+      blocked: !!(previous.blocked || update.blocked),
+      reason: previous.blocked ? previous.reason : update.reason,
+      until: Math.max(previous.until || 0, update.until || 0),
+      slowdown: Math.max(previous.slowdown || 1, state.slowdown)
+    };
+    await chrome.storage.local.set({ [cooldownKey(operation)]: value });
+  }
+  const suspension = (until, reason = 'X API cooldown') => ({
+    kind: 'stop', retryAt: until,
+    message: `${reason}. Job suspended; try again after ${new Date(until).toISOString()}.`
+  });
+
+  async function waitForCooldown(operation, { isActive, onWait }) {
+    const saved = await readCooldown(operation);
+    if (isActive && !isActive()) return { kind: 'stopped' };
+    if (!(saved.until > Date.now())) return null;
+    state.slowdown = Math.max(state.slowdown, saved.slowdown || 1);
+    // Never shorten a server deadline to fit the job. Keep it for the next job instead.
+    if (saved.blocked || saved.until - Date.now() > MAX_JOB_WAIT - state.waited) return suspension(saved.until, saved.reason);
+    const started = Date.now();
+    onWait?.(saved.until);
+    try {
+      if (!(await waitUntil(saved.until, isActive))) return { kind: 'stopped' };
+    } finally {
+      state.waited += Math.max(0, Date.now() - started);
+      onWait?.(null);
+    }
+    // Another active job may have extended this bucket while we were waiting.
+    return waitForCooldown(operation, { isActive, onWait });
+  }
 
   async function init(account) {
     const live = captured();
     const settings = await chrome.storage.local.get(['xbcApiCache', 'apiPace']);
     const stored = settings.xbcApiCache || {};
-    // Speed multiplier for the pauses between actions (1 = default; the end-to-end tests use less).
-    state.paceFactor = Number(settings.apiPace) > 0 ? Number(settings.apiPace) : 1;
+    // Production never runs faster than click-like pacing. Tests control their clocks instead.
+    const configuredPace = Number(settings.apiPace);
+    state.paceFactor = Number.isFinite(configuredPace) ? Math.max(1, configuredPace) : 1;
+    state.slowdown = 1;
+    state.waited = state.rateRetries = 0;
     const bundle = await bundleOps();
     state.bearer = live.bearer || stored.bearer || bundle.bearer || FALLBACK_BEARER;
 
@@ -163,7 +209,19 @@
     return h;
   }
 
-  // One HTTP call. Returns { status, json, codes, messages, reset, binding } and never throws.
+  const headerNumber = (response, name) => {
+    const raw = response.headers.get(name);
+    const value = raw == null || raw.trim() === '' ? NaN : Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  const validDeadline = value => Number.isFinite(value) && value > Date.now() && value <= 8640000000000000 ? value : 0;
+  function retryAfter(response) {
+    const raw = response.headers.get('retry-after');
+    if (!raw?.trim()) return 0;
+    return validDeadline(/^\d+(?:\.\d+)?$/.test(raw.trim()) ? Date.now() + Number(raw) * 1000 : Date.parse(raw));
+  }
+
+  // One HTTP call. No credentials or response bodies enter the cooldown store.
   async function call(method, path, { params, body, form } = {}) {
     const url = new URL(path, location.origin);
     for (const [key, value] of Object.entries(params || {})) {
@@ -180,9 +238,7 @@
     } catch (error) {
       return { status: 0, json: null, codes: [], messages: [String(error?.message || error)], reset: null };
     }
-    // Server-driven backoff, honored the way X's own client does (capped at 10 s).
     const backoff = Number((response.headers.get('backoff-policy') || '').match(/(?:^|;)\s*backoff=(\d+)/)?.[1]);
-    if (backoff > 0) state.backoffUntil = Date.now() + Math.min(backoff, 10000);
     let json = null;
     try { json = await response.json(); } catch (_) {}
     const errors = Array.isArray(json?.errors) ? json.errors : [];
@@ -191,7 +247,11 @@
       json,
       codes: errors.map(e => Number(e.code ?? e.extensions?.code)).filter(Number.isFinite),
       messages: errors.map(e => e.message).filter(Boolean),
-      reset: Number(response.headers.get('x-rate-limit-reset')) || null,
+      reset: headerNumber(response, 'x-rate-limit-reset'),
+      limit: headerNumber(response, 'x-rate-limit-limit'),
+      remaining: headerNumber(response, 'x-rate-limit-remaining'),
+      retryAt: retryAfter(response),
+      backoffAt: validDeadline(Date.now() + backoff),
       binding: response.headers.get('x-tfe-auth-result-code') === '3071'
     };
   }
@@ -212,13 +272,11 @@
   function classify(r, { okWhen } = {}) {
     const has = (...codes) => codes.some(c => r.codes.includes(c));
     const message = r.messages[0] || (r.status ? `HTTP ${r.status}` : 'network error');
-    if (r.status === 429 || has(88, 143)) {
-      return { kind: 'rate', resetAt: r.reset ? r.reset * 1000 + 10000 : Date.now() + 15 * 60000, message };
-    }
-    if (has(353)) return { kind: 'csrf', message };
     const stop = r.codes.find(c => STOP_CODES[c]);
     if (stop) return { kind: 'stop', message: STOP_CODES[stop] };
     if (has(...AUTOMATION_CODES)) return { kind: 'stop', message: `X says this looks automated (code ${r.codes.join(', ')}). Wait a few hours before trying again.` };
+    if (r.status === 429 || has(88, 143)) return { kind: 'rate', message };
+    if (has(353)) return { kind: 'csrf', message };
     if (r.binding) return { kind: 'refused', message: 'X requires a signed session for this action' };
     // Success is judged the way X's app judges each operation (some tolerate errors[] beside data).
     if (r.status >= 200 && r.status < 300 && r.json && (okWhen ? okWhen(r.json) : !r.codes.length)) return { kind: 'ok' };
@@ -228,25 +286,43 @@
     return { kind: 'error', message };
   }
 
-  // Runs a request, waiting out rate limits and retrying CSRF and transient failures.
-  async function perform(send, { okWhen, isActive, onWait } = {}) {
+  // All callers share the job's retry/wait budget. A restriction is never a refusal,
+  // so callers stop rather than switching to the click path.
+  async function perform(operation, send, { okWhen, isActive, onWait } = {}) {
     let transient = 0, csrf = 0;
     for (;;) {
       if (isActive && !isActive()) return { kind: 'stopped' };
-      if (state.backoffUntil > Date.now() && !(await waitUntil(state.backoffUntil, isActive))) return { kind: 'stopped' };
-      const result = classify(await send(), { okWhen });
+      try {
+        const gate = await waitForCooldown(operation, { isActive, onWait });
+        if (gate) return gate;
+      } catch (_) { return { kind: 'stop', message: 'Could not read the X API cooldown. Job stopped.' }; }
+      if (isActive && !isActive()) return { kind: 'stopped' };
+      const response = await send();
+      const result = classify(response, { okWhen });
+      const limited = result.kind === 'rate' || response.remaining === 0;
+      if (result.kind === 'rate') state.slowdown = Math.min(state.slowdown * 2, 8);
+      if (response.limit > 0 && response.remaining != null && response.remaining <= Math.max(1, response.limit * 0.1)) state.slowdown = Math.max(state.slowdown, 2);
+      const resetAt = response.reset * 1000 > Date.now() ? validDeadline(response.reset * 1000 + 10000) : 0;
+      let until = Math.max(response.retryAt || 0, response.backoffAt || 0, limited ? resetAt || Date.now() + MIN_RATE_WAIT : 0, result.kind === 'stop' ? resetAt : 0);
+      // X gives no daily reset here: conservatively retain code 344 for 24 hours.
+      // Other stops keep any server deadline, without inventing an unlock time.
+      if (response.codes.includes(344)) until = Math.max(until, Date.now() + 24 * 60 * 60000);
+      if (until) {
+        try {
+          await rememberCooldown(operation, { until, reason: result.kind === 'stop' ? result.message : 'X API cooldown', blocked: result.kind === 'stop', limit: response.limit ?? null, remaining: response.remaining ?? null });
+        } catch (_) { return { kind: 'stop', message: 'Could not save the X API cooldown. Job stopped.' }; }
+      }
+      if (isActive && !isActive()) return { kind: 'stopped' };
       if (result.kind === 'rate') {
-        // Wait for the window to reset, then go slower for the rest of the job.
-        state.paceFactor = Math.min(state.paceFactor * 2, 8);
-        const until = Math.min(result.resetAt, Date.now() + 30 * 60000);
-        onWait?.(until);
-        const resumed = await waitUntil(until, isActive);
-        onWait?.(null);
-        if (!resumed) return { kind: 'stopped' };
+        if (++state.rateRetries > MAX_RATE_RETRIES) return suspension(until, 'X API rate retry budget reached');
         continue;
       }
       if (result.kind === 'csrf' && csrf++ < 1) continue;
-      if (result.kind === 'retry' && transient++ < 3) { await sleep(5000 * 3 ** (transient - 1)); continue; }
+      if (result.kind === 'retry' && transient++ < 3) {
+        try { await rememberCooldown(operation, { until: Date.now() + 5000 * 3 ** (transient - 1), reason: 'X API retry backoff' }); }
+        catch (_) { return { kind: 'stop', message: 'Could not save the X API cooldown. Job stopped.' }; }
+        continue;
+      }
       return result;
     }
   }
@@ -259,13 +335,13 @@
 
   function mutate(name, variables, options) {
     const op = graphql(name);
-    return perform(() => call('POST', `/i/api/graphql/${op.queryId}/${name}`, { body: { variables, queryId: op.queryId } }), options);
+    return perform(name, () => call('POST', `/i/api/graphql/${op.queryId}/${name}`, { body: { variables, queryId: op.queryId } }), options);
   }
 
   function friendship(kind, user, options) {
     const form = { ...FRIENDSHIP_PARAMS };
     if (user.id) form.user_id = String(user.id); else form.screen_name = user.username;
-    return perform(() => call('POST', `/i/api/1.1/friendships/${kind}.json`, { form }), {
+    return perform(`friendships/${kind}`, () => call('POST', `/i/api/1.1/friendships/${kind}.json`, { form }), {
       ...options,
       okWhen: json => !!json && (json.id_str || json.id || json.screen_name)
     });
@@ -354,7 +430,7 @@
     for (let page = 0; page < 2000; page++) {
       const variables = cursor ? { ...base, cursor } : base;
       let parsed = null;
-      const result = await perform(async () => {
+      const result = await perform(name, async () => {
         // X sends features and fieldToggles only when the operation defines some.
         const nonEmpty = (o) => (o && Object.keys(o).length ? o : undefined);
         const r = await call('GET', `/i/api/graphql/${op.queryId}/${name}`, { params: { variables, features: nonEmpty(op.features), fieldToggles: nonEmpty(op.fieldToggles) } });
@@ -371,7 +447,7 @@
       yield fresh;
       if (!parsed.bottom || parsed.bottom === cursor || empty >= 2) return;
       cursor = parsed.bottom;
-      await sleep(pause);
+      if (!(await waitUntil(Date.now() + Math.max(900, Number(pause) || 900) * state.paceFactor * state.slowdown, isActive))) return;
     }
   }
 
@@ -386,7 +462,7 @@
     pages,
     parsePage,
     sleep,
-    pace: (action) => jitter((PACE_MS[action] || 2500) * state.paceFactor),
+    pace: (action) => jitter((PACE_MS[action] || 2500) * state.paceFactor * state.slowdown),
     // DeleteTweet fails on any error, as in X's app; the others succeed on their data check.
     deleteTweet: (id, options) => mutate('DeleteTweet', { tweet_id: String(id) }, { ...options, okWhen: json => !!json?.data && !json.errors?.length }),
     deleteRetweet: (sourceId, options) => mutate('DeleteRetweet', { source_tweet_id: String(sourceId) }, { ...options, okWhen: json => !!json?.data?.unretweet?.source_tweet_results?.result }),

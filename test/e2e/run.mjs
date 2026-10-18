@@ -139,6 +139,12 @@ if (process.argv[2] === '--preview-polling') {
   process.exit(0);
 }
 
+if (process.argv[2] === '--api-limits') {
+  const { testApiLimits } = await import('./api-limits.mjs');
+  await testApiLimits();
+  process.exit(0);
+}
+
 const BUTTONS = { delete: 'startDelete', unrepost: 'startUnrepost', unlike: 'startUnlike', bulkUnfollow: 'bulkUnfollow', followAll: 'followAllFollowers', followVerified: 'followVerifiedFollowers' };
 
 async function quickClean(env, action, { apiMode = true } = {}) {
@@ -206,6 +212,81 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true } 
 }
 
 const SCENARIOS = [
+  ...[
+    { name: 'one hour reset', response: { resetSeconds: 3600 }, reason: /suspended/ },
+    { name: 'one hour Retry-After', response: { resetSeconds: 5, headers: { 'Retry-After': '3600' } }, reason: /suspended/ },
+    { name: 'daily 344 in HTTP 429', response: { code: 344, resetSeconds: 5 }, reason: /daily limit/ },
+    { name: 'daily 344 in HTTP 400', response: { status: 400, code: 344 }, reason: /daily limit/ },
+    { name: 'automation in HTTP 429', response: { code: 226 }, reason: /looks automated/ }
+  ].map(({ name, response, reason }) => ({
+    name: `limits: ${name} stops without DOM and survives a new job`,
+    state: { own: 2 },
+    async run(env, state) {
+      state.misbehave.responses.DeleteTweet = [response];
+      const first = await quickClean(env, 'delete');
+      const callsBefore = state.calls.filter(c => c.op === 'DeleteTweet').length;
+      // Header-backed waits and daily restrictions survive api.init in the next job.
+      // Automation without a deadline stops this job; no unlock time is invented.
+      const persistent = response.resetSeconds != null || response.code === 344;
+      const second = persistent ? await quickClean(env, 'delete') : null;
+      return [
+        ['first job is interrupted with a clear reason', first.job.status === 'interrupted' && reason.test(first.job.statusText), first.job],
+        ['only the refused mutation was attempted', callsBefore === 1, callsBefore],
+        ['no DOM fallback or mutation after restriction', first.worker?.mode === 'api' && !first.worker.apiFallback && !state.calls.some(c => c.op === 'dom-delete'), first.worker],
+        ['fixture posts stay intact', state.tweets.length === 2, state.tweets.length],
+        ['next job respects persisted restriction', !persistent || (second.job.status === 'interrupted' && state.calls.filter(c => c.op === 'DeleteTweet').length === 1 && !second.worker.apiFallback), second?.job]
+      ];
+    }
+  })),
+  {
+    name: 'limits: preview scan stops on a daily 429 without starting DOM',
+    state: { own: 2 },
+    async run(env, state) {
+      state.misbehave.responses.UserTweets = [{ code: 344, resetSeconds: 5 }];
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.locator('#startScan').click();
+      await panel.waitForFunction(() => /Scan stopped/.test(document.getElementById('scanState').textContent));
+      const result = await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+          const p = window.__xbcPreview;
+          return { mode: p.mode, fallback: p.apiFallback || null, done: p.done, issue: p.issue, waiting: p.waitUntil, running: !!p.interval };
+        } });
+        return r.result;
+      });
+      await panel.close();
+      return [
+        ['scan interrupted without DOM/completion', result.mode === 'api' && !result.fallback && !result.done && !result.running, result],
+        ['daily message preserved', /daily limit/.test(result.issue), result.issue],
+        ['no destructive request', !state.calls.some(c => c.method === 'POST'), state.calls]
+      ];
+    }
+  },
+  {
+    name: 'limits: Stop during rate wait persists deadline and partial history',
+    state: { own: 2 },
+    async run(env, state) {
+      state.misbehave.responses.DeleteTweet = [{ resetSeconds: 120 }];
+      const popup = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
+      await popup.waitForFunction(() => document.getElementById('accountCard')?.dataset.state === 'ready');
+      await popup.locator('#startDelete').click();
+      await popup.waitForFunction(() => document.getElementById('confirmDialog').open);
+      await popup.locator('#confirmStart').click();
+      await waitFor(async () => (await storage(env.worker, [`xbcApiCooldown:${ME.id}:DeleteTweet`]))[`xbcApiCooldown:${ME.id}:DeleteTweet`], { timeout: 10000, label: 'persisted cooldown' });
+      await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => window.__xCleanerStop() });
+      });
+      const job = await waitFor(async () => (await storage(env.worker, ['jobHistory'])).jobHistory?.[0], { timeout: 10000, label: 'Stop history' });
+      await popup.close();
+      return [
+        ['Stop records stopped history and zero successful mutations', job.status === 'stopped' && job.total === 0, job],
+        ['no second mutation or DOM fallback', state.calls.filter(c => c.op === 'DeleteTweet').length === 1 && !state.calls.some(c => c.op === 'dom-delete'), state.calls],
+        ['posts unchanged', state.tweets.length === 2, state.tweets.length]
+      ];
+    }
+  },
   {
     name: 'preview: pause resume pause without new items restores cached review',
     state: { own: 0 },
@@ -498,7 +579,7 @@ const filter = process.argv[2];
 let failed = 0;
 for (const scenario of SCENARIOS.filter(s => !filter || s.name.includes(filter))) {
   const env = await launch();
-  await env.worker.evaluate(() => chrome.storage.local.set({ apiPace: 0.05 }));
+  await env.worker.evaluate(() => chrome.storage.local.set({ apiPace: 1 }));
   const state = createState(scenario.state);
   scenario.setup?.(state);
   await installFakeX(env.context, state);
