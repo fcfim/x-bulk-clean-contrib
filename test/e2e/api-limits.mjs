@@ -52,36 +52,49 @@ async function harness(responses, { store = {}, clock = { now: START }, account 
   return { api, calls, sleeps, store, clock, schedule, Date: ClockDate, runtime, storage: context.chrome.storage, document: context.document };
 }
 
-async function scan(h) {
+async function scan(h, { useApi = true, type = 'tweets' } = {}) {
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
-  const context = vm.createContext({ window, __xbcApi: h.api, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {} }, chrome: { runtime: h.runtime },
-    document: { hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } });
-  vm.runInContext(panelSource, context);
-  context.startPreviewScanner('tweets', { username: 'synthetic_me' }, false, 'fast', true);
-  for (let i = 0; i < 20000 && window.__xbcPreview?.interval; i++) await Promise.resolve();
-  assert.equal(window.__xbcPreview.interval, null, 'scan settled');
-  return window.__xbcPreview;
+  const globals = { window, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {} }, chrome: { runtime: h.runtime, storage: h.storage },
+    document: { cookie: h.document.cookie, hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } };
+  const definitions = vm.createContext({ ...globals });
+  vm.runInContext(panelSource, definitions);
+  const context = vm.createContext({ ...globals });
+  vm.runInContext('globalThis.worker = ' + definitions.startPreviewScanner.toString(), context);
+  h.workerWindow = window;
+  context.worker(type, { username: 'synthetic_me' }, false, 'fast', useApi);
+  for (let i = 0; i < 20000; i++) {
+    await Promise.resolve();
+    if (!window.__xbcPreview?.interval || (!useApi && window.__xbcPreview.interval.loop)) break;
+  }
+  const result = { ...window.__xbcPreview, domStarted: !!window.__xbcPreview.interval?.loop };
+  if (window.__xbcPreview.interval) window.__xbcPreviewStop();
+  return result;
 }
 
 // Execute the complete real workers; synthetic DOM nodes only support rendering overlays.
-async function deletion(h, selected = false) {
+async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets' } = {}) {
   const node = () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, remove() {}, appendChild() {}, setAttribute() {},
     querySelector: () => node(), getElementById: () => node(), attachShadow: () => node() });
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
-  const context = vm.createContext({ window, __xbcApi: h.api, Date: h.Date, Math, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, navigator: {}, crypto: { randomUUID: () => `synthetic-job-${++syntheticUuid}` },
+  const globals = { window, __xbcApi: useApi ? h.api : undefined, Date: h.Date, Math, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, navigator: {}, crypto: { randomUUID: () => `synthetic-job-${++syntheticUuid}` },
     console: { warn() {}, info() {} }, chrome: { runtime: h.runtime, storage: h.storage },
-    document: { body: node(), hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, createElement: node, getElementById: () => null,
-      querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } });
-  vm.runInContext(selected ? panelSource : popupSource, context);
-  if (selected) context.runSelectedDelete('tweets', [{ id: 'synthetic-selected', text: 'synthetic post' }], { username: 'synthetic_me' }, false, true);
-  else context.runWorker('delete', false, { username: 'synthetic_me' }, true);
+    document: { cookie: h.document.cookie, body: node(), hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, createElement: node, getElementById: () => null,
+      querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } };
+  const definitions = vm.createContext({ ...globals });
+  vm.runInContext(selected ? panelSource : popupSource, definitions);
+  const context = vm.createContext({ ...globals });
+  const serialized = selected ? definitions.runSelectedDelete : definitions.runWorker;
+  vm.runInContext('globalThis.worker = ' + serialized.toString(), context);
+  h.workerWindow = window;
+  if (selected) context.worker(type, [{ id: 'synthetic-selected', text: 'synthetic post' }], { username: 'synthetic_me' }, false, useApi);
+  else context.worker(action, false, { username: 'synthetic_me' }, useApi);
   for (let i = 0; i < 20000; i++) {
     await Promise.resolve();
-    if (window.__xCleaner?.historyPersisted || window.__xCleaner?.apiFallback) break;
+    if (window.__xCleaner?.historyPersisted || window.__xCleaner?.apiFallback || (!useApi && window.__xCleaner?.interval?.loop)) break;
   }
   const x = window.__xCleaner;
-  assert(x.historyPersisted || x.apiFallback, 'worker settled or entered fallback');
-  const result = { mode: x.mode, apiFallback: x.apiFallback || null, issue: x.issue, historyPersisted: x.historyPersisted, successCount: x.successCount };
+  assert(x.historyPersisted || x.apiFallback || (!useApi && x.interval?.loop), 'worker settled or entered DOM');
+  const result = { domStarted: !!x.interval?.loop, mode: x.mode, apiFallback: x.apiFallback || null, issue: x.issue, historyPersisted: x.historyPersisted, successCount: x.successCount };
   if (x.interval) await window.__xCleanerStop();
   return result;
 }
@@ -100,6 +113,72 @@ export async function testApiLimits() {
     try { await fn(); passed++; console.log(`PASS ${name}`); }
     catch (error) { failures.push({ name, error }); console.log(`FAIL ${name}: ${error.message}`); }
   };
+  const manualFlows = [
+    { name: 'Quick Clean', operation: 'DeleteTweet', list: 'UserTweets', run: h => deletion(h, false, { useApi: false }) },
+    { name: 'selected delete', operation: 'DeleteTweet', list: 'UserTweets', run: h => deletion(h, true, { useApi: false }) },
+    { name: 'preview scan', operation: 'UserTweets', list: 'UserTweets', run: h => scan(h, { useApi: false }) }
+  ];
+  for (const flow of manualFlows) {
+    for (const blocked of [false, true]) await check(`API off ${flow.name} stops on active ${blocked ? 'blocked' : 'cooldown'} claim without injected client`, async () => {
+      const store = { [`xbcApiCooldown:42:${flow.operation}:claim:manual`]: { until: START + 3600000, blocked } };
+      const h = await harness([], { store }); const result = await flow.run(h);
+      assert.equal(result.domStarted, false); assert.match(result.issue, /suspended/); assert.equal(h.calls.length, 0);
+      assert.equal(persisted(store, '42', flow.operation).until, START + 3600000);
+    });
+    if (flow.list !== flow.operation) await check(`API off ${flow.name} also respects its source list cooldown`, async () => {
+      const h = await harness([], { store: { [`xbcApiCooldown:42:${flow.list}`]: { until: START + 60000 } } });
+      const result = await flow.run(h); assert.equal(result.domStarted, false); assert.match(result.issue, /suspended/); assert.equal(h.calls.length, 0);
+    });
+    for (const condition of ['expired', 'other account', 'other operation', 'none']) await check(`API off ${flow.name} preserves DOM when claim is ${condition}`, async () => {
+      const account = condition === 'other account' ? '99' : '42';
+      const operation = condition === 'other operation' ? 'UnfavoriteTweet' : flow.operation;
+      const store = condition === 'none' ? {} : { [`xbcApiCooldown:${account}:${operation}:claim:control`]: { until: condition === 'expired' ? START - 1 : START + 3600000, blocked: true } };
+      const h = await harness([], { store }); const result = await flow.run(h);
+      assert.equal(result.domStarted, true); assert.equal(h.calls.length, 0);
+    });
+    await check(`API off ${flow.name} honors Stop while cooldown read is pending`, async () => {
+      let h;
+      h = await harness([], { onGet: async keys => { if (keys == null) { if (h.workerWindow?.__xCleanerStop) await h.workerWindow.__xCleanerStop(); else h.workerWindow?.__xbcPreviewStop?.(); } } });
+      const result = await flow.run(h); assert.equal(result.domStarted, false); assert.match(result.issue, /stopped by user/i); assert.equal(h.calls.length, 0);
+    });
+    await check(`API off ${flow.name} fails closed when account identity is unavailable`, async () => {
+      const h = await harness([]); h.document.cookie = '';
+      const result = await flow.run(h); assert.equal(result.domStarted, false); assert.match(result.issue, /cooldown/i); assert.equal(h.calls.length, 0);
+    });
+    await check(`API off ${flow.name} fails closed when cooldown storage is unavailable`, async () => {
+      const h = await harness([], { failGet: true }); const result = await flow.run(h);
+      assert.equal(result.domStarted, false); assert.match(result.issue, /cooldown/i); assert.equal(h.calls.length, 0);
+    });
+  }
+  for (const selected of [false, true]) for (const active of [false, true]) await check(`API unavailable ${selected ? 'selected' : 'quick'} delete ${active ? 'stops on known cooldown' : 'preserves unrestricted fallback'}`, async () => {
+    const store = active ? { 'xbcApiCooldown:42:DeleteTweet:claim:unavailable': { until: START + 3600000, blocked: true } } : {};
+    const h = await harness([], { store }); h.api.init = async () => ({ ok: false, reason: 'synthetic unavailable' });
+    const x = await deletion(h, selected); assert.equal(!!x.apiFallback, !active); assert.match(x.issue || '', active ? /suspended/ : /^$/); assert.equal(h.calls.length, 0);
+  });
+  for (const active of [false, true]) await check(`API unavailable scanner ${active ? 'stops on known cooldown' : 'preserves unrestricted fallback'}`, async () => {
+    const store = active ? { 'xbcApiCooldown:42:UserTweets:claim:unavailable': { until: START + 3600000 } } : {};
+    const h = await harness([], { store }); h.api.init = async () => ({ ok: false, reason: 'synthetic unavailable' });
+    const p = await scan(h); assert.equal(!!p.apiFallback, !active); if (active) assert.match(p.issue, /suspended/); assert.equal(h.calls.length, 0);
+  });
+  const quickActions = {
+    delete: ['UserTweets', 'DeleteTweet'], deleteReplies: ['UserTweetsAndReplies', 'DeleteTweet'], unrepost: ['UserTweets', 'DeleteRetweet'],
+    unlike: ['Likes', 'UnfavoriteTweet'], bulkUnfollow: ['Following', 'friendships/destroy'], followAll: ['Followers', 'friendships/create'], followVerified: ['BlueVerifiedFollowers', 'friendships/create']
+  };
+  for (const [action, operations] of Object.entries(quickActions)) for (const operation of operations) await check(`API off Quick Clean ${action} checks ${operation}`, async () => {
+    const h = await harness([], { store: { [`xbcApiCooldown:42:${operation}:claim:mapped`]: { until: START + 3600000 } } });
+    const x = await deletion(h, false, { useApi: false, action }); assert.equal(x.domStarted, false); assert.match(x.issue, /suspended/);
+  });
+  const previewTypes = { replies: ['UserTweetsAndReplies', 'DeleteTweet'], reposts: ['UserTweets', 'DeleteRetweet'], unfollow: ['Following', 'friendships/destroy'] };
+  for (const [type, [list, operation]] of Object.entries(previewTypes)) {
+    await check(`API off ${type} scanner checks its own list ${list}`, async () => {
+      const h = await harness([], { store: { [`xbcApiCooldown:42:${list}:claim:typed`]: { until: START + 3600000 } } });
+      const p = await scan(h, { useApi: false, type }); assert.equal(p.domStarted, false); assert.match(p.issue, /suspended/);
+    });
+    for (const bucket of [list, operation]) await check(`API off selected ${type} checks ${bucket}`, async () => {
+      const h = await harness([], { store: { [`xbcApiCooldown:42:${bucket}:claim:typed`]: { until: START + 3600000 } } });
+      const x = await deletion(h, true, { useApi: false, type }); assert.equal(x.domStarted, false); assert.match(x.issue, /suspended/);
+    });
+  }
   const refusals = [
     { name: '403 Retry-After 1h', status: 403, headers: { 'Retry-After': '3600' } },
     { name: 'binding 3071 Retry-After 1h', status: 401, headers: { 'x-tfe-auth-result-code': '3071', 'Retry-After': '3600' } },
