@@ -7,6 +7,10 @@ let previewItems = [];
 let shownItems = PAGE_SIZE;
 let pollTimer = null;
 let cleanupRunning = false;
+let previewSnapshot = null;
+let pollGeneration = 0;
+let pollBusy = false;
+let selectionQueue = Promise.resolve();
 
 const $ = (id) => document.getElementById(id);
 const selectedType = () => document.querySelector('input[name="previewType"]:checked')?.value || 'tweets';
@@ -358,6 +362,7 @@ function readPreviewState(includeItems = false) {
   const P = window.__xbcPreview;
   if (!P) return null;
   return {
+    startedAt: P.startedAt,
     type: P.type,
     replyScope: P.replyScope,
     account: P.account,
@@ -388,9 +393,9 @@ function controlPreviewScanner(command) {
   return { paused: P.paused, running: !!P.interval, count: P.items.length };
 }
 
-function updatePreviewSelection(ids, selected) {
+function updatePreviewSelection(ids, selected, startedAt) {
   const P = window.__xbcPreview;
-  if (!P) return 0;
+  if (!P || P.startedAt !== startedAt) return 0;
   const wanted = new Set(ids || []);
   P.items.forEach(item => { if (wanted.has(item.id)) item.selected = selected; });
   return P.items.filter(item => item.selected).length;
@@ -733,6 +738,15 @@ async function executeInTab(func, args = []) {
   return result?.[0]?.result;
 }
 
+function savePreviewSelection(ids, selected) {
+  const tabId = activeTab.id, startedAt = previewSnapshot?.startedAt;
+  // Preserve click order, including rapid toggles, and never write into a later scan.
+  selectionQueue = selectionQueue.then(() => chrome.scripting.executeScript({
+    target: { tabId }, func: updatePreviewSelection, args: [ids, selected, startedAt]
+  })).catch(error => showError(`Could not save selection: ${error?.message || error}`));
+  return selectionQueue;
+}
+
 async function startScan() {
   showError('');
   activeTab = await findActiveXTab();
@@ -754,49 +768,84 @@ async function startScan() {
   const result = await executeInTab(startPreviewScanner, [type, activeAccount, $('previewPerformance').checked, selectedReplyScope(), useApi]);
   if (!result?.ok) { showError(result?.error || 'Could not start the scan.'); return; }
   await chrome.storage.local.set({ activePreviewSession: { tabId: activeTab.id, type, replyScope: selectedReplyScope(), account: activeAccount, startedAt: Date.now() } });
-  previewItems = []; shownItems = PAGE_SIZE;
+  previewItems = []; shownItems = PAGE_SIZE; previewSnapshot = null;
   $('setupSection').style.display = 'none'; $('scanCard').style.display = 'block'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
   $('pauseScan').style.display = 'block'; $('pauseScan').disabled = false; $('stopScan').textContent = 'Stop scan'; $('stopScan').disabled = false;
   startPolling();
 }
 
 async function pollPreview() {
-  if (!activeTab) return;
-  if (cleanupRunning) {
-    const state = await executeInTab(readCleanupState);
-    if (!state) return;
-    const count = state.action === 'deleteReplies' ? state.stats?.repliesDeleted || 0 : state.action === 'unrepost' ? state.stats?.unreposts || 0 : state.action === 'bulkUnfollow' ? state.stats?.unfollows || 0 : state.stats?.deleted || 0;
-    $('scanCount').textContent = `${count}`; $('scanState').textContent = state.action === 'bulkUnfollow' ? 'Unfollowing selected' : state.action === 'unrepost' ? 'Removing selected' : 'Deleting selected';
-    $('scanCard').classList.toggle('done', !state.running);
-    if (!state.running && (state.historyPersisted || state.historySaveError)) {
-      cleanupRunning = false;
-      await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']);
-      $('scanCard').classList.add('done'); $('scanState').textContent = state.issue || 'Finished';
-      $('pauseScan').style.display = 'none'; $('stopScan').textContent = 'New scan'; $('stopScan').disabled = false;
-      $('stickyBar').style.display = 'none';
+  if (!activeTab || pollBusy) return;
+  const generation = pollGeneration;
+  pollBusy = true;
+  try {
+    if (cleanupRunning) {
+      const state = await executeInTab(readCleanupState);
+      if (generation !== pollGeneration) return;
+      if (!state) return;
+      const count = state.action === 'deleteReplies' ? state.stats?.repliesDeleted || 0 : state.action === 'unrepost' ? state.stats?.unreposts || 0 : state.action === 'bulkUnfollow' ? state.stats?.unfollows || 0 : state.stats?.deleted || 0;
+      $('scanCount').textContent = `${count}`; $('scanState').textContent = state.action === 'bulkUnfollow' ? 'Unfollowing selected' : state.action === 'unrepost' ? 'Removing selected' : 'Deleting selected';
+      $('scanCard').classList.toggle('done', !state.running);
+      if (!state.running && (state.historyPersisted || state.historySaveError)) {
+        await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']);
+        if (generation !== pollGeneration) return;
+        cleanupRunning = false;
+        $('scanCard').classList.add('done'); $('scanState').textContent = state.issue || 'Finished';
+        $('pauseScan').style.display = 'none'; $('stopScan').textContent = 'New scan'; $('stopScan').disabled = false;
+        $('stickyBar').style.display = 'none';
+        stopPolling();
+      }
+      return;
     }
-    return;
-  }
-  const state = await executeInTab(readPreviewState, [false]);
-  if (!state) return;
-  $('scanCount').textContent = `${state.count || 0}`;
-  $('scanCard').classList.toggle('paused', !!state.paused);
-  $('scanCard').classList.toggle('done', !state.running);
-  $('scanState').textContent = state.done ? 'Scan complete' : state.paused ? 'Scan paused' : state.running ? `Scanning ${typeLabel(state.type)}` : state.issue || 'Scan stopped';
-  $('pauseScan').textContent = state.done ? 'Scan complete' : state.paused ? 'Resume scan' : 'Pause & review';
-  $('pauseScan').disabled = !!state.done || (!state.running && !state.paused);
-  $('stopScan').textContent = state.running ? 'Stop scan' : 'New scan';
-  if (state.paused || state.done || !state.running) {
-    const full = await executeInTab(readPreviewState, [true]);
-    previewItems = full?.items || [];
-    renderReview();
+    let state = await executeInTab(readPreviewState, [false]);
+    if (generation !== pollGeneration) return;
+    if (!state) { stopPolling(); return; }
+    let refreshed = false;
+    if ((state.paused || state.done || !state.running) && previewStateKey(state) !== previewSnapshot?.key) {
+      const full = await executeInTab(readPreviewState, [true]);
+      if (generation !== pollGeneration) return;
+      if (!full) { stopPolling(); return; }
+      // The scanner appends items. Existing local choices remain authoritative while
+      // selection writes or this snapshot are in flight.
+      const previous = new Map((previewSnapshot?.startedAt === full.startedAt ? previewItems : []).map(item => [item.id, item]));
+      previewItems = (full.items || []).map(item => {
+        const existing = previous.get(item.id);
+        return existing ? Object.assign(existing, item, { selected: existing.selected }) : item;
+      });
+      state = full;
+      previewSnapshot = { startedAt: full.startedAt, key: previewStateKey(full) };
+      refreshed = true;
+    }
+    $('scanCount').textContent = `${state.count || 0}`;
+    $('scanCard').classList.toggle('paused', !!state.paused);
+    $('scanCard').classList.toggle('done', !state.running);
+    $('scanState').textContent = state.done ? 'Scan complete' : state.paused ? 'Scan paused' : state.running ? `Scanning ${typeLabel(state.type)}` : state.issue || 'Scan stopped';
+    $('pauseScan').textContent = state.done ? 'Scan complete' : state.paused ? 'Resume scan' : 'Pause & review';
+    $('pauseScan').disabled = !!state.done || (!state.running && !state.paused);
+    $('stopScan').textContent = state.running ? 'Stop scan' : 'New scan';
+    if (refreshed && (state.paused || state.done || !state.running)) renderReview();
+    if (!state.running) stopPolling();
+  } catch (error) {
+    if (generation === pollGeneration) showError(`Could not refresh preview: ${error?.message || error}`);
+  } finally {
+    pollBusy = false;
   }
 }
 
-function startPolling() {
+function previewStateKey(state) {
+  return JSON.stringify([state.startedAt, state.type, state.replyScope, state.running, state.paused, state.done, state.count, state.issue]);
+}
+
+function stopPolling() {
   clearInterval(pollTimer);
-  pollPreview();
+  pollTimer = null;
+  pollGeneration++;
+}
+
+function startPolling() {
+  stopPolling();
   pollTimer = setInterval(pollPreview, 800);
+  pollPreview();
 }
 
 async function togglePause() {
@@ -811,9 +860,10 @@ async function stopScan() {
   if (cleanupRunning) { await executeInTab(() => window.__xCleanerStop?.()); return; }
   const state = await executeInTab(readPreviewState, [false]);
   if (state && !state.running) {
+    stopPolling();
     await executeInTab(controlPreviewScanner, ['reset']);
     await chrome.storage.local.remove(['activePreviewSession']);
-    previewItems = []; shownItems = PAGE_SIZE;
+    previewItems = []; shownItems = PAGE_SIZE; previewSnapshot = null;
     $('setupSection').style.display = 'block'; $('scanCard').style.display = 'none'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
     return;
   }
@@ -839,9 +889,10 @@ function formatItemDate(value) {
 
 function createResult(item) {
   const label = document.createElement('label'); label.className = `result${item.type === 'account' ? ' account-result' : ''}`;
+  label.dataset.id = item.id;
   const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = item.selected; checkbox.disabled = item.classification === 'unresolved';
   if (checkbox.disabled) { label.classList.add('unverified'); label.title = 'Could not safely compare this item with the main profile. It is excluded from deletion.'; }
-  checkbox.addEventListener('change', async () => { item.selected = checkbox.checked; updateSelectionCounts(); await executeInTab(updatePreviewSelection, [[item.id], item.selected]); });
+  checkbox.addEventListener('change', async () => { item.selected = checkbox.checked; updateSelectionCounts(); await savePreviewSelection([item.id], item.selected); });
   const text = document.createElement('span'); text.className = 'result-text'; text.textContent = item.type === 'account' ? (item.displayName || item.username) : item.text || '(No text content)';
   const meta = document.createElement('span'); meta.className = 'result-meta';
   meta.append(document.createTextNode(item.type === 'account' ? `@${item.username || item.author} · Following` : `${formatItemDate(item.date)} · ${item.type}`));
@@ -860,10 +911,17 @@ function createResult(item) {
 }
 
 function renderReview() {
+  const focusedRow = document.activeElement?.closest('.result');
+  const focusedId = focusedRow?.dataset.id;
+  const focusedIndex = focusedRow ? Array.from(focusedRow.querySelectorAll('input, a')).indexOf(document.activeElement) : -1;
   $('reviewSection').style.display = 'block'; $('stickyBar').style.display = 'block';
   $('reviewTitle').textContent = `Review ${typeLabel()}`;
   const filtered = filteredItems(); const visible = filtered.slice(0, shownItems);
   $('resultsList').replaceChildren(...visible.map(createResult));
+  if (focusedIndex >= 0) {
+    const row = Array.from($('resultsList').children).find(item => item.dataset.id === focusedId);
+    row?.querySelectorAll('input, a')[focusedIndex]?.focus({ preventScroll: true });
+  }
   $('loadMore').hidden = visible.length >= filtered.length;
   $('loadMore').textContent = `Load more (${filtered.length-visible.length} remaining)`;
   $('noResults').hidden = filtered.length !== 0;
@@ -885,11 +943,13 @@ function updateSelectionCounts() {
 async function setFilteredSelection(mode) {
   const items = filteredItems().filter(item => item.classification !== 'unresolved');
   items.forEach(item => { item.selected = mode === 'invert' ? !item.selected : mode === 'all'; });
+  const writes = [];
   if (mode === 'invert') {
     const yes = items.filter(item => item.selected).map(item => item.id), no = items.filter(item => !item.selected).map(item => item.id);
-    if (yes.length) await executeInTab(updatePreviewSelection, [yes, true]); if (no.length) await executeInTab(updatePreviewSelection, [no, false]);
-  } else if (items.length) await executeInTab(updatePreviewSelection, [items.map(item => item.id), mode === 'all']);
+    if (yes.length) writes.push(savePreviewSelection(yes, true)); if (no.length) writes.push(savePreviewSelection(no, false));
+  } else if (items.length) writes.push(savePreviewSelection(items.map(item => item.id), mode === 'all'));
   renderReview();
+  await Promise.all(writes);
 }
 
 function openDeleteDialog() {
@@ -954,6 +1014,7 @@ async function initialize() {
   if (activeTab) {
     const state = await executeInTab(readPreviewState, [true]);
     if (state) {
+      previewSnapshot = { startedAt: state.startedAt, key: previewStateKey(state) };
       previewItems = state.items || []; document.querySelector(`input[name="previewType"][value="${state.type}"]`).checked=true;
       if (state.replyScope) document.querySelector(`input[name="replyScope"][value="${state.replyScope}"]`).checked=true;
       updateSetupOptions();
