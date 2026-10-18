@@ -2,6 +2,142 @@
 // the fake x.com in fake-x.mjs. Usage: node test/e2e/run.mjs [scenario-name-filter]
 import { launch, openExtensionPage, storage, waitFor } from './launch.mjs';
 import { createState, installFakeX, fakeQueryIds, ME } from './fake-x.mjs';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+
+// Deterministic polling regressions using the entire real side-panel script and
+// synthetic DOM/tab/timer adapters. No browser or network is used in this mode.
+// Run: npm run test:e2e -- --preview-polling
+async function testPreviewPolling() {
+  const document = { activeElement: null, addEventListener() {}, querySelector: () => ({ value: 'tweets' }) };
+  class Node {
+    constructor(tag = 'div') { this.tag = tag; this.children = []; this.dataset = {}; this.style = {}; this.listeners = {}; this.className = ''; this.value = ''; this.classList = { add() {}, remove() {}, toggle() {} }; this.rebuilds = 0; }
+    append(...children) { for (const child of children) { child.parent = this; this.children.push(child); } }
+    replaceChildren(...children) { if (document.activeElement?.closest('.result')?.parent === this) document.activeElement = null; this.children = []; this.append(...children); this.rebuilds++; }
+    addEventListener(name, fn) { this.listeners[name] = fn; }
+    closest() { return this.className.split(' ').includes('result') ? this : this.parent?.closest() || null; }
+    querySelectorAll() { return this.children.flatMap(child => ['input', 'a'].includes(child.tag) ? [child] : child.querySelectorAll()); }
+    focus() { document.activeElement = this; }
+    showModal() { this.open = true; }
+    close() { this.open = false; }
+  }
+  const nodes = new Map();
+  document.getElementById = id => { if (!nodes.has(id)) nodes.set(id, new Node()); return nodes.get(id); };
+  document.createElement = tag => new Node(tag);
+  document.createTextNode = text => Object.assign(new Node('text'), { textContent: text });
+  const timers = new Map(); let timerId = 0, fullReads = 0, holdFull = null, holdWrite = null, dispatch = null, stops = 0;
+  const makeItems = n => Array.from({ length: n }, (_, i) => ({ id: `synthetic-${i}`, type: 'tweet', classification: 'tweets', text: `post ${i}`, date: '2024-01-01', selected: true }));
+  const window = { __xbcPreview: { startedAt: 1, type: 'tweets', items: makeItems(2000), interval: {}, paused: true, done: false } };
+  const context = vm.createContext({ document, window, console, setInterval: fn => { timers.set(++timerId, fn); return timerId; }, clearInterval: id => timers.delete(id),
+    chrome: { storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } }, scripting: { executeScript: async ({ func, args = [] }) => {
+      if (func.name === 'runSelectedDelete') { dispatch = args; return [{ result: { ok: true } }]; }
+      if (func.name === 'updatePreviewSelection' && holdWrite) await holdWrite;
+      const result = JSON.parse(JSON.stringify(func(...args) ?? null));
+      if (func.name === 'readPreviewState' && args[0]) { fullReads++; if (holdFull) await holdFull; }
+      return [{ result }];
+    } } }
+  });
+  vm.runInContext(fs.readFileSync(new URL('../../src/sidepanel/sidepanel.js', import.meta.url), 'utf8'), context);
+  const run = code => vm.runInContext(code, context);
+  run('activeTab = { id: 42 }; activeAccount = { username: "synthetic_owner" };');
+  // Flush deterministic adapter promises without wall-clock sleeps or private poll state.
+  const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+  const list = document.getElementById('resultsList');
+  const first = () => list.children[0].querySelectorAll()[0];
+  const checks = [];
+  const check = (label, fn) => { fn(); checks.push(label); console.log(`PASS ${label}`); };
+
+  run('startPolling()'); await settle();
+  const original = first(); original.focus();
+  for (let i = 0; i < 4; i++) await run('pollPreview()');
+  check('2,000 paused items are fetched/rendered once; checkbox and focus stay attached', () => { assert.equal(fullReads, 1); assert.equal(list.rebuilds, 1); assert.equal(first(), original); assert.equal(document.activeElement, original); assert.equal(timers.size, 1); });
+
+  original.checked = false; await original.listeners.change();
+  await run('togglePause()'); await settle();
+  assert.equal(document.getElementById('reviewSection').style.display, 'none', 'resume hides the review');
+  await run('togglePause()'); await settle();
+  check('pause resume pause with no new items shows the cached review and selection bar', () => { assert.equal(document.getElementById('reviewSection').style.display, 'block'); assert.equal(document.getElementById('stickyBar').style.display, 'block'); assert.equal(first().checked, false); assert.equal(document.getElementById('selectedCount').textContent, '1999 selected'); });
+  for (let i = 0; i < 3; i++) await run('pollPreview()');
+  check('repeated pause preserves cached rows and focus without another fetch', () => { assert.equal(fullReads, 1); assert.equal(list.rebuilds, 1); assert.equal(first(), original); assert.equal(document.activeElement, original); });
+  original.checked = true; await original.listeners.change();
+
+  let releaseWrite;
+  holdWrite = new Promise(resolve => { releaseWrite = resolve; });
+  original.checked = false; const change = original.listeners.change();
+  window.__xbcPreview.done = true; window.__xbcPreview.paused = false; window.__xbcPreview.interval = null;
+  await run('pollPreview()');
+  check('completion snapshot cannot undo an in-flight choice and restores focus', () => { assert.equal(first().checked, false); assert.equal(document.activeElement, first()); assert.equal(document.getElementById('selectedCount').textContent, '1999 selected'); assert.equal(timers.size, 0); });
+  const completedRebuilds = list.rebuilds;
+  await run('pollPreview()'); await run('pollPreview()');
+  check('unchanged completed preview with 2,000 items does not rebuild', () => assert.equal(list.rebuilds, completedRebuilds));
+  releaseWrite(); await change; holdWrite = null;
+  const toggle = selected => { first().checked = selected; return first().listeners.change(); };
+  await Promise.all([toggle(true), toggle(false)]);
+  check('rapid toggles are written in click order', () => assert.equal(window.__xbcPreview.items[0].selected, false));
+
+  let releaseFull;
+  holdFull = new Promise(resolve => { releaseFull = resolve; });
+  window.__xbcPreview.interval = {}; window.__xbcPreview.paused = true; window.__xbcPreview.done = false;
+  window.__xbcPreview.items.push({ ...makeItems(1)[0], id: 'synthetic-extra' });
+  run('startPolling()');
+  for (let i = 0; i < 20 && fullReads < 3; i++) await Promise.resolve();
+  assert.equal(fullReads, 3, 'snapshot captured before edit');
+  await toggle(true);
+  await run('pollPreview()');
+  releaseFull(); holdFull = null; await settle();
+  check('overlapping polls are skipped and a delayed snapshot preserves a later edit', () => { assert.equal(fullReads, 3); assert.equal(first().checked, true); assert.equal(document.activeElement, first()); });
+  const afterChange = list.rebuilds;
+  await run('pollPreview()');
+  check('unchanged paused state after append does not rebuild', () => assert.equal(list.rebuilds, afterChange));
+
+  holdWrite = new Promise(resolve => { releaseWrite = resolve; });
+  const oldChange = toggle(false);
+  window.__xbcPreview = { startedAt: 2, type: 'tweets', items: makeItems(2001), interval: {}, paused: true, done: false };
+  await run('pollPreview()'); releaseWrite(); await oldChange; holdWrite = null;
+  check('new scan with the same count/IDs replaces the cache; old writes cannot change it', () => { assert.equal(first().checked, true); assert.equal(window.__xbcPreview.items[0].selected, true); });
+  await run('setFilteredSelection("none")'); await toggle(true); run('openDeleteDialog()');
+  check('confirmation uses the current selected count and account', () => { assert.equal(document.getElementById('deleteCount').textContent, '1 item'); assert.equal(document.getElementById('deleteAccount').textContent, '@synthetic_owner'); assert.equal(dispatch, null); });
+
+  window.__xbcPreviewStop = () => { window.__xbcPreview.interval = null; window.__xbcPreview.paused = false; window.__xbcPreview.issue = 'Scan stopped by user'; };
+  await run('stopScan()');
+  check('Stop scan refreshes once and stops polling', () => assert.equal(timers.size, 0));
+  await run('stopScan()');
+  check('New scan resets the review and its snapshot', () => { assert.equal(run('previewItems.length'), 0); assert.equal(run('previewSnapshot'), null); });
+
+  holdFull = new Promise(resolve => { releaseFull = resolve; });
+  window.__xbcPreview = { startedAt: 3, type: 'tweets', items: makeItems(2), interval: {}, paused: true };
+  const beforeRestart = fullReads;
+  const rebuildsBeforeRestart = list.rebuilds;
+  run('startPolling()');
+  for (let i = 0; i < 20 && fullReads === beforeRestart; i++) await Promise.resolve();
+  assert.equal(fullReads, beforeRestart + 1);
+  window.__xbcPreview = { startedAt: 4, type: 'tweets', items: makeItems(2).map(item => ({ ...item, selected: false })), interval: null, done: true };
+  run('stopPolling(); startPolling(); startPolling();');
+  releaseFull(); holdFull = null; await settle();
+  check('pending restarts coalesce into an immediate refresh after the in-flight poll', () => assert.equal(fullReads, beforeRestart + 2));
+  check('earlier polling responses are discarded and the next scan loads without a timer tick', () => { assert.equal(list.rebuilds, rebuildsBeforeRestart + 1); assert.equal(first().checked, false); assert.equal(run('previewSnapshot.startedAt'), 4); });
+
+  run('startPolling()'); await settle();
+  await run('setFilteredSelection("none")'); await toggle(true);
+  context.detectAccount = async () => ({ username: 'synthetic_owner' });
+  context.ensurePreviewPage = async () => {};
+  context.findActiveXTab = async () => ({ id: 42 });
+  window.__xCleaner = { action: 'delete', stats: { deleted: 0 }, interval: {}, historyPersisted: false };
+  window.__xCleanerStop = () => { stops++; window.__xCleaner.interval = null; window.__xCleaner.issue = 'Stopped by user'; window.__xCleaner.historyPersisted = true; };
+  await run('beginSelectedDelete()'); await settle();
+  check('new confirmed action dispatches only selected IDs and restarts polling', () => { assert.equal(dispatch[1].map(item => item.id).join(','), 'synthetic-0'); assert.equal(timers.size, 1); });
+  window.__xCleaner.stats.deleted = 1; await run('pollPreview()');
+  check('cleanup progress still updates', () => assert.equal(document.getElementById('scanCount').textContent, '1'));
+  await run('stopScan()'); await run('pollPreview()');
+  check('Stop deletion still responds and final history state stops polling', () => { assert.equal(stops, 1); assert.equal(timers.size, 0); assert.equal(run('cleanupRunning'), false); });
+  console.log(`${checks.length}/${checks.length} synthetic polling checks passed (not browser e2e)`);
+}
+
+if (process.argv[2] === '--preview-polling') {
+  await testPreviewPolling();
+  process.exit(0);
+}
 
 const BUTTONS = { delete: 'startDelete', unrepost: 'startUnrepost', unlike: 'startUnlike', bulkUnfollow: 'bulkUnfollow', followAll: 'followAllFollowers', followVerified: 'followVerifiedFollowers' };
 
@@ -70,6 +206,96 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true } 
 }
 
 const SCENARIOS = [
+  {
+    name: 'preview: pause resume pause without new items restores cached review',
+    state: { own: 0 },
+    async run(env) {
+      await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+          window.__xbcPreview = {
+            startedAt: 1, type: 'tweets', account: { username: 'me' }, interval: {}, paused: true, done: false,
+            items: Array.from({ length: 2000 }, (_, i) => ({ id: `9${1000 + i}`, type: 'tweet', classification: 'tweets', text: `post ${i}`, date: '2024-01-01', selected: false }))
+          };
+        } });
+      });
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => document.getElementById('scanState').textContent === 'Scan paused' && document.getElementById('reviewSection').style.display === 'block');
+      await panel.locator('#resultsList input').first().check();
+      await panel.evaluate(() => {
+        window.__cachedCheckbox = document.querySelector('#resultsList input');
+        window.__fullReads = 0;
+        const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+        chrome.scripting.executeScript = details => {
+          if (details.func?.name === 'readPreviewState' && details.args?.[0]) window.__fullReads++;
+          return execute(details);
+        };
+      });
+      await panel.locator('#pauseScan').click();
+      await panel.waitForFunction(() => document.getElementById('reviewSection').style.display === 'none');
+      await panel.locator('#pauseScan').click();
+      await panel.waitForFunction(() => document.getElementById('scanState').textContent === 'Scan paused' && document.getElementById('reviewSection').style.display === 'block' && document.getElementById('stickyBar').style.display === 'block', null, { timeout: 5000 });
+      await panel.locator('#resultsList input').first().focus();
+      await panel.waitForTimeout(1800);
+      const result = await panel.evaluate(() => ({ sameNode: document.querySelector('#resultsList input') === window.__cachedCheckbox, focused: document.activeElement === window.__cachedCheckbox, checked: window.__cachedCheckbox.checked, count: document.getElementById('selectedCount').textContent, fullReads: window.__fullReads }));
+      await panel.close();
+      return [
+        ['second pause restores the same cached row without a full read', result.sameNode && result.fullReads === 0, result],
+        ['selected checkbox and count survive resume and re-pause', result.checked && result.count === '1 selected', result],
+        ['focus remains stable during subsequent paused ticks', result.focused, result]
+      ];
+    }
+  },
+  {
+    name: 'preview: 2000 paused items preserve checkbox focus and selection',
+    state: { own: 3 },
+    async run(env, state) {
+      await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+          // Synthetic scanner state; deletion below still goes through fake-x's API.
+          window.__xbcPreview = {
+            startedAt: 1, type: 'tweets', account: { username: 'me' }, interval: {}, paused: true, done: false,
+            items: Array.from({ length: 2000 }, (_, i) => ({ id: `9${1000 + i}`, type: 'tweet', classification: 'tweets', text: `post ${i}`, date: '2024-01-01', author: 'me', selected: false }))
+          };
+        } });
+      });
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.locator('#resultsList input').first().waitFor();
+      await panel.evaluate(() => {
+        window.__firstCheckbox = document.querySelector('#resultsList input');
+        window.__firstCheckbox.focus();
+        window.__firstCheckbox.click();
+      });
+      // Span multiple real polling ticks; this is the regression's time boundary.
+      await panel.waitForTimeout(1800);
+      const stable = await panel.evaluate(() => ({
+        sameNode: document.querySelector('#resultsList input') === window.__firstCheckbox,
+        focused: document.activeElement === window.__firstCheckbox,
+        checked: window.__firstCheckbox.checked,
+        count: document.getElementById('selectedCount').textContent
+      }));
+      await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { window.__xbcPreview.interval = null; window.__xbcPreview.paused = false; window.__xbcPreview.done = true; } });
+      });
+      await panel.waitForFunction(() => document.getElementById('scanState').textContent === 'Scan complete');
+      const completed = await panel.evaluate(() => ({ focused: document.activeElement === document.querySelector('#resultsList input'), checked: document.querySelector('#resultsList input').checked, stopped: pollTimer === null }));
+      await panel.locator('#deleteSelected').click();
+      const confirmation = await panel.locator('#deleteCount').textContent();
+      await panel.locator('#confirmDelete').click();
+      const history = await waitFor(async () => (await storage(env.worker, ['jobHistory'])).jobHistory?.[0], { label: 'single selected deletion' });
+      await panel.close();
+      return [
+        ['paused list preserves its checkbox node', stable.sameNode, stable],
+        ['keyboard focus and checked state survive polling', stable.focused && stable.checked, stable],
+        ['only one item remains selected', stable.count === '1 selected', stable],
+        ['completion preserves selection/focus and stops polling', completed.focused && completed.checked && completed.stopped, completed],
+        ['confirmation and result match the selected ID', confirmation === '1 item' && history.total === 1 && state.calls.filter(c => c.op === 'DeleteTweet').map(c => c.body.variables.tweet_id).join(',') === '91000', history],
+        ['other real fixture posts remain', state.tweets.length === 2, state.tweets.length]
+      ];
+    }
+  },
   {
     name: 'delete posts via API, leaving reposts alone',
     state: { own: 15, retweets: 4 },
