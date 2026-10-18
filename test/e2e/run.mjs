@@ -222,6 +222,8 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true, b
 
 const SCENARIOS = [
   ...[
+    { name: 'ten empty pages interrupt with empty_streak', expected: 0, complete: false, reason: /10 consecutive pages without new items/, sequence: state => Array.from({ length: 10 }, (_, i) => scriptedTimeline(state, { cursor: `empty-${i}` })) },
+    { name: 'nine empty pages still reach a post', expected: 1, complete: true, sequence: state => [...Array.from({ length: 9 }, (_, i) => scriptedTimeline(state, { cursor: `empty-${i}` })), scriptedTimeline(state, { indices: [0], end: true })] },
     { name: 'empty advancing pages reach a later post', expected: 1, complete: true, sequence: state => [scriptedTimeline(state, { cursor: 'c1' }), scriptedTimeline(state, { cursor: 'c2' }), scriptedTimeline(state, { indices: [0], end: true })] },
     { name: 'duplicate pages reach a later distinct post', expected: 2, complete: true, sequence: state => [scriptedTimeline(state, { indices: [0], cursor: 'c1' }), scriptedTimeline(state, { indices: [0], cursor: 'c2' }), scriptedTimeline(state, { indices: [0], cursor: 'c3' }), scriptedTimeline(state, { indices: [1], end: true })] },
     { name: 'cursor cycle interrupts with partial items', expected: 2, complete: false, sequence: state => [scriptedTimeline(state, { indices: [0], cursor: 'c1' }), scriptedTimeline(state, { indices: [1], cursor: 'c2' }), scriptedTimeline(state, { indices: [0], cursor: 'c1' })] },
@@ -232,7 +234,7 @@ const SCENARIOS = [
     { name: 'server error preserves earlier items', expected: 1, complete: false, sequence: state => [scriptedTimeline(state, { indices: [0], cursor: 'c1' }), ...Array.from({ length: 4 }, () => ({ status: 500, body: { errors: [{ code: 130, message: 'synthetic server error' }] } }))] },
     { name: 'explicit empty end is inconclusive zero', expected: 0, complete: false, sequence: state => [scriptedTimeline(state, { end: true })] },
     { name: 'partial response preserves items and interrupts', expected: 1, complete: false, sequence: state => [scriptedTimeline(state, { indices: [0], end: true, errors: [{ code: 999, message: 'synthetic partial response' }] })] }
-  ].map(({ name, expected, complete, sequence }) => ({
+  ].map(({ name, expected, complete, sequence, reason }) => ({
     name: `pagination: scan ${name}`,
     state: { own: 2 },
     async run(env, state) {
@@ -255,7 +257,8 @@ const SCENARIOS = [
         ['expected items and terminal state', result.items === expected && result.done === complete && !result.running, result],
         ['completion label only for proven nonzero end', complete ? result.issue === 'Scan complete' : !/Scan complete/.test(result.issue) && result.issue.includes(String(expected)), result.issue],
         ['API mode retained without DOM fallback or mutations', result.mode === 'api' && !result.fallback && !state.calls.some(c => c.method === 'POST'), result],
-        ['all intended pages requested', state.calls.filter(c => c.op === 'UserTweets').length - before === responses.length, state.calls]
+        ['all intended pages requested', state.calls.filter(c => c.op === 'UserTweets').length - before === responses.length, state.calls],
+        ['specific safety reason is preserved when required', !reason || reason.test(result.issue), result.issue]
       ];
     }
   })),

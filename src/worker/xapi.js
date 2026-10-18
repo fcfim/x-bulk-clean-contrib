@@ -480,6 +480,11 @@
     return error;
   };
 
+  // Heuristic, not proof of completion: ten empty pages allows more progress than
+  // the old two-page cutoff (a typical page has about 20 items), without spending
+  // up to 2,000 requests on empty continuations. Explicit termination still wins.
+  const MAX_EMPTY_PAGE_STREAK = 10;
+
   // Normal return means an explicit bottom termination in a recognized timeline.
   // Every incomplete/cancelled path throws, so callers cannot mistake it for completion.
   async function* pages(name, { isActive, onWait, pause = 900 } = {}) {
@@ -489,7 +494,7 @@
     base.userId = job.me.id;
     delete base.cursor;
     const seen = new Set(), cursors = new Set();
-    let cursor = null;
+    let cursor = null, emptyStreak = 0;
     for (let page = 0; page < 2000; page++) {
       const variables = cursor ? { ...base, cursor } : base;
       let parsed = null;
@@ -507,6 +512,7 @@
         users: parsed.users.filter(u => !seen.has(`u${u.id}`) && seen.add(`u${u.id}`)),
         partial: parsed.partial
       };
+      emptyStreak = fresh.tweets.length || fresh.users.length ? 0 : emptyStreak + 1;
       yield fresh;
       if (isActive && !isActive()) throw paginationError('cancelled', 'API pagination cancelled', 'stopped');
       if (parsed.partial) throw paginationError('partial_response', 'X returned a partial or unsupported timeline response');
@@ -514,6 +520,7 @@
       if (!parsed.bottom) throw paginationError('missing_cursor', 'Timeline has no bottom cursor or explicit end');
       if (parsed.bottom === cursor) throw paginationError('cursor_stalled', 'Timeline cursor stopped advancing');
       if (cursors.has(parsed.bottom)) throw paginationError('cursor_cycle', 'Timeline cursor entered a cycle');
+      if (emptyStreak >= MAX_EMPTY_PAGE_STREAK) throw paginationError('empty_streak', `${MAX_EMPTY_PAGE_STREAK} consecutive pages without new items; API safety limit reached`);
       if (page === 1999) throw paginationError('page_budget', 'API page safety limit reached');
       cursors.add(parsed.bottom);
       cursor = parsed.bottom;
