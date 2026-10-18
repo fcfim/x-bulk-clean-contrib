@@ -5,6 +5,8 @@ import vm from 'node:vm';
 import assert from 'node:assert/strict';
 
 const apiSource = fs.readFileSync(new URL('../../src/worker/xapi.js', import.meta.url), 'utf8');
+const popupSource = fs.readFileSync(new URL('../../src/popup/popup.js', import.meta.url), 'utf8');
+let syntheticUuid = 0;
 const panelSource = fs.readFileSync(new URL('../../src/sidepanel/sidepanel.js', import.meta.url), 'utf8');
 const START = 1800000000000;
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -16,9 +18,9 @@ const timeline = cursor => ({ data: { timeline: { instructions: [{ type: 'Timeli
   ...(cursor ? [{ content: { cursorType: 'Bottom', value: cursor } }] : [])
 ] }] } } });
 
-async function harness(responses, { store = {}, clock = { now: START }, account = '42', queryId = 'synthetic-id', onSleep, failGet = false, failSet = false } = {}) {
+async function harness(responses, { store = {}, clock = { now: START }, account = '42', queryId = 'synthetic-id', onSleep, failGet = false, failSet = false, onGet, beforeSet, afterSet } = {}) {
   const calls = [], sleeps = [];
-  let responseIndex = 0;
+  let responseIndex = 0, initialized = false;
   class ClockDate extends Date {
     constructor(...args) { super(...(args.length ? args : [clock.now])); }
     static now() { return clock.now; }
@@ -26,16 +28,17 @@ async function harness(responses, { store = {}, clock = { now: START }, account 
   const schedule = (fn, ms = 0) => { sleeps.push(ms); clock.now += Math.max(0, ms); onSleep?.(ms); queueMicrotask(fn); return 1; };
   const runtime = { sendMessage(message, callback) { if (message.type === 'xbc:sleep') { callback?.(); return; } return Promise.resolve({ ok: false }); } };
   const math = Object.create(Math); math.random = () => 0;
-  const context = vm.createContext({ URL, URLSearchParams, Date: ClockDate, Math: math, console, setTimeout: schedule,
+  const context = vm.createContext({ URL, URLSearchParams, Date: ClockDate, Math: math, console, setTimeout: schedule, crypto: { randomUUID: () => `synthetic-${++syntheticUuid}` },
     location: { origin: 'https://x.com' }, document: { cookie: `ct0=synthetic; twid=u%3D${account}`, scripts: [], documentElement: { lang: 'en', dataset: { xbcApi: JSON.stringify({ viewerId: account, ops: { UserTweets: { queryId }, DeleteTweet: { queryId } } }) } } },
     chrome: { runtime, storage: { local: {
-      get: async keys => { if (failGet && keys.some(k => k.startsWith('xbcApiCooldown:'))) throw new Error('synthetic storage failure'); return Object.fromEntries(keys.filter(k => k in store).map(k => [k, clone(store[k])])); },
-      set: async values => { if (failSet && Object.keys(values).some(k => k.startsWith('xbcApiCooldown:'))) throw new Error('synthetic storage failure'); Object.assign(store, clone(values)); }
+      get: async keys => { if (failGet && (keys == null || keys.some(k => k.startsWith('xbcApiCooldown:')))) throw new Error('synthetic storage failure'); const value = Object.fromEntries((keys ?? Object.keys(store)).filter(k => k in store).map(k => [k, clone(store[k])])); if (initialized) await onGet?.(keys, value); return value; },
+      remove: async keys => { for (const key of keys) delete store[key]; },
+      set: async values => { if (failSet && Object.keys(values).some(k => k.startsWith('xbcApiCooldown:'))) throw new Error('synthetic storage failure'); await beforeSet?.(values); Object.assign(store, clone(values)); afterSet?.(values); }
     } } },
     fetch: async (url, options) => {
       calls.push({ at: clock.now, operation: url.pathname.split('/').at(-1), method: options.method });
       assert(calls.length <= 50, 'finite synthetic request budget');
-      const spec = responses[responseIndex++];
+      const spec = await responses[responseIndex++];
       assert(spec, `unplanned synthetic request ${calls.length}`);
       const headers = Object.fromEntries(Object.entries(spec.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
       return { status: spec.status ?? 200, headers: { get: name => headers[name.toLowerCase()] ?? null }, json: async () => clone(spec.body) };
@@ -43,8 +46,10 @@ async function harness(responses, { store = {}, clock = { now: START }, account 
   });
   vm.runInContext(apiSource, context);
   const api = context.__xbcApi;
+  const originalInit = api.init;
+  api.init = async (...args) => { initialized = false; try { return await originalInit(...args); } finally { initialized = true; } };
   await api.init({ username: 'synthetic_me' });
-  return { api, calls, sleeps, store, clock, schedule, Date: ClockDate, runtime };
+  return { api, calls, sleeps, store, clock, schedule, Date: ClockDate, runtime, storage: context.chrome.storage, document: context.document };
 }
 
 async function scan(h) {
@@ -58,6 +63,36 @@ async function scan(h) {
   return window.__xbcPreview;
 }
 
+// Execute the complete real workers; synthetic DOM nodes only support rendering overlays.
+async function deletion(h, selected = false) {
+  const node = () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, remove() {}, appendChild() {}, setAttribute() {},
+    querySelector: () => node(), getElementById: () => node(), attachShadow: () => node() });
+  const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
+  const context = vm.createContext({ window, __xbcApi: h.api, Date: h.Date, Math, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, navigator: {}, crypto: { randomUUID: () => `synthetic-job-${++syntheticUuid}` },
+    console: { warn() {}, info() {} }, chrome: { runtime: h.runtime, storage: h.storage },
+    document: { body: node(), hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, createElement: node, getElementById: () => null,
+      querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } });
+  vm.runInContext(selected ? panelSource : popupSource, context);
+  if (selected) context.runSelectedDelete('tweets', [{ id: 'synthetic-selected', text: 'synthetic post' }], { username: 'synthetic_me' }, false, true);
+  else context.runWorker('delete', false, { username: 'synthetic_me' }, true);
+  for (let i = 0; i < 20000; i++) {
+    await Promise.resolve();
+    if (window.__xCleaner?.historyPersisted || window.__xCleaner?.apiFallback) break;
+  }
+  const x = window.__xCleaner;
+  assert(x.historyPersisted || x.apiFallback, 'worker settled or entered fallback');
+  const result = { mode: x.mode, apiFallback: x.apiFallback || null, issue: x.issue, historyPersisted: x.historyPersisted, successCount: x.successCount };
+  if (x.interval) await window.__xCleanerStop();
+  return result;
+}
+
+const persisted = (store, account = '42', operation = 'DeleteTweet') => {
+  const prefix = `xbcApiCooldown:${account}:${operation}`;
+  const records = Object.entries(store).filter(([key]) => key === prefix || key.startsWith(prefix + ':')).map(([, value]) => value);
+  return { until: Math.max(0, ...records.map(r => r.until || 0)), blocked: records.some(r => r.blocked) };
+};
+const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+
 export async function testApiLimits() {
   let passed = 0;
   const failures = [];
@@ -65,11 +100,99 @@ export async function testApiLimits() {
     try { await fn(); passed++; console.log(`PASS ${name}`); }
     catch (error) { failures.push({ name, error }); console.log(`FAIL ${name}: ${error.message}`); }
   };
+  const refusals = [
+    { name: '403 Retry-After 1h', status: 403, headers: { 'Retry-After': '3600' } },
+    { name: 'binding 3071 Retry-After 1h', status: 401, headers: { 'x-tfe-auth-result-code': '3071', 'Retry-After': '3600' } },
+    { name: '403 backoff 60s', status: 403, headers: { 'backoff-policy': 'backoff=60000' } },
+    { name: '403 remaining zero', status: 403, headers: { ...reset(20), 'x-rate-limit-remaining': '0' } }
+  ];
+  for (const response of refusals) {
+    const spec = { ...response, body: {} };
+    await check(`refusal cooldown stops direct delete: ${response.name}`, async () => {
+      const h = await harness([spec]); const r = await h.api.deleteTweet('synthetic');
+      assert.equal(r.kind, 'stop'); assert.equal(h.calls.length, 1); assert(r.retryAt > START);
+    });
+    await check(`refusal cooldown blocks real scan fallback: ${response.name}`, async () => {
+      const h = await harness([spec]); const p = await scan(h);
+      assert.equal(p.mode, 'api'); assert.equal(!!p.apiFallback, false); assert.equal(p.done, false); assert.match(p.issue, /suspended/); assert.equal(h.calls.length, 1);
+    });
+    for (const selected of [false, true]) await check(`refusal cooldown blocks real ${selected ? 'selected' : 'quick'} delete fallback: ${response.name}`, async () => {
+      const h = await harness(selected ? [spec] : [{ body: timeline(null) }, spec]); const x = await deletion(h, selected);
+      assert.equal(x.mode, 'api'); assert.equal(x.apiFallback, null); assert.match(x.issue, /suspended/); assert.equal(x.historyPersisted, true); assert.equal(x.successCount, 0);
+      assert.equal(h.calls.length, selected ? 1 : 2);
+    });
+  }
+  await check('plain refusal without a valid deadline preserves direct/scanner/delete fallback contracts', async () => {
+    const spec = { status: 403, headers: { 'Retry-After': 'invalid', 'x-rate-limit-remaining': 'invalid' }, body: {} };
+    const direct = await harness([spec]); assert.equal((await direct.api.deleteTweet('synthetic')).kind, 'refused');
+    const h = await harness([spec]); const p = await scan(h); assert.equal(p.mode, 'dom'); assert(!!p.apiFallback);
+    for (const selected of [false, true]) {
+      const x = await deletion(await harness(selected ? [spec] : [{ body: timeline(null) }, spec]), selected);
+      assert.equal(x.mode, 'dom'); assert(!!x.apiFallback);
+    }
+  });
+  await check('Stop during refusal persistence retains cooldown and suppresses fallback', async () => {
+    let active = true;
+    const h = await harness([{ status: 403, headers: { 'Retry-After': '3600' }, body: {} }], {
+      afterSet: values => { if (Object.keys(values).some(k => k.startsWith('xbcApiCooldown:'))) active = false; }
+    });
+    assert.equal((await h.api.deleteTweet('synthetic', { isActive: () => active })).kind, 'stopped');
+    assert.equal(persisted(h.store).until, START + 3600000); assert.equal(h.calls.length, 1);
+  });
+  await check('late stopped response keeps original account and cannot change new job pacing', async () => {
+    const late = deferred(); let oldActive = true;
+    const h = await harness([late.promise, ok]);
+    const old = h.api.deleteTweet('old', { isActive: () => oldActive });
+    for (let i = 0; i < 100 && !h.calls.length; i++) await Promise.resolve();
+    assert.equal(h.calls.length, 1); oldActive = false;
+    const capture = JSON.parse(h.document.documentElement.dataset.xbcApi); capture.viewerId = '99';
+    h.document.documentElement.dataset.xbcApi = JSON.stringify(capture);
+    await h.api.init({ username: 'synthetic_other' });
+    late.resolve(rate(reset(5))); assert.equal((await old).kind, 'stopped');
+    assert.equal(persisted(h.store).until, START + 15000); assert.equal(persisted(h.store, '99').until, 0);
+    assert.equal(h.api.pace('delete'), 2500); assert.equal((await h.api.deleteTweet('new')).kind, 'ok'); assert.equal(h.calls[1].at, START);
+  });
+  await check('expired immutable claims are pruned without deleting legacy or active claims', async () => {
+    const prefix = 'xbcApiCooldown:42:DeleteTweet';
+    const store = { [prefix]: { until: START - 1 }, [prefix + ':claim:old']: { until: START - 1 }, [prefix + ':claim:live']: { until: START + 3600000, blocked: true } };
+    const h = await harness([], { store });
+    assert(!(prefix + ':claim:old' in store)); assert(prefix in store); assert(prefix + ':claim:live' in store);
+    assert.equal((await h.api.deleteTweet('synthetic')).kind, 'stop'); assert.equal(h.calls.length, 0);
+  });
+  await check('simultaneous writers cannot shorten a deadline or erase blocked=true', async () => {
+    const store = {}; const bothRead = deferred(), longSaved = deferred(); let reads = 0;
+    const hooks = () => { let gets = 0; return {
+      onGet: async keys => { if (keys == null || keys.some(k => k.startsWith('xbcApiCooldown:'))) if (++gets === 2) { if (++reads === 2) bothRead.resolve(); await bothRead.promise; } },
+      beforeSet: async values => { const v = Object.entries(values).find(([key]) => key.startsWith('xbcApiCooldown:'))?.[1]; if (v && !v.blocked) await longSaved.promise; },
+      afterSet: values => { if (Object.entries(values).some(([key, v]) => key.startsWith('xbcApiCooldown:') && v.blocked)) longSaved.resolve(); }
+    }; };
+    let longActive = true, shortActive = true;
+    const a = hooks(), b = hooks();
+    const long = await harness([rate(reset(3600), 344)], { store, ...a, afterSet: values => { a.afterSet(values); if (Object.keys(values).some(k => k.startsWith('xbcApiCooldown:'))) longActive = false; } });
+    const short = await harness([rate(reset(5))], { store, ...b, afterSet: values => { b.afterSet(values); if (Object.keys(values).some(k => k.startsWith('xbcApiCooldown:'))) shortActive = false; } });
+    await Promise.all([long.api.deleteTweet('one', { isActive: () => longActive }), short.api.deleteTweet('two', { isActive: () => shortActive })]);
+    assert.equal(persisted(store).blocked, true); assert.equal(persisted(store).until, START + 86400000);
+  });
+  await check('late stopped response cannot be overwritten by the new job shorter write', async () => {
+    const late = deferred(), shortRead = deferred(), releaseShort = deferred(), longSaved = deferred(); let gets = 0, oldActive = true;
+    const h = await harness([late.promise, rate({ 'Retry-After': '3600' }, 999, 403)], {
+      onGet: async keys => { if (keys == null || keys.some(k => k.startsWith('xbcApiCooldown:'))) if (++gets === 3) { shortRead.resolve(); await releaseShort.promise; } },
+      afterSet: values => { if (Object.entries(values).some(([key, v]) => key.startsWith('xbcApiCooldown:') && v.blocked)) longSaved.resolve(); }
+    });
+    const old = h.api.deleteTweet('old', { isActive: () => oldActive });
+    for (let i = 0; i < 100 && !h.calls.length; i++) await Promise.resolve();
+    assert.equal(h.calls.length, 1); oldActive = false;
+    await h.api.init({ username: 'synthetic_me' });
+    const current = h.api.deleteTweet('new'); await shortRead.promise;
+    late.resolve(rate(reset(3600), 344)); await longSaved.promise; releaseShort.resolve();
+    assert.equal((await old).kind, 'stopped'); await current;
+    assert.equal(persisted(h.store).blocked, true); assert.equal(persisted(h.store).until, START + 86400000);
+  });
   await check('reset one hour away suspends with full persisted deadline, without retry', async () => {
     const h = await harness([rate(reset(3600))]);
     const r = await h.api.deleteTweet('synthetic');
     assert.equal(r.kind, 'stop'); assert.equal(r.retryAt, START + 3610000); assert.equal(h.calls.length, 1); assert.equal(h.clock.now, START);
-    assert.equal(h.store['xbcApiCooldown:42:DeleteTweet'].until, r.retryAt);
+    assert.equal(persisted(h.store).until, r.retryAt);
   });
   for (const value of [undefined, 'invalid', 'Infinity', '-1', String(START / 1000 - 60), '']) await check(`missing/invalid/expired reset ${JSON.stringify(value)} waits conservatively`, async () => {
     const h = await harness([rate(value === undefined ? {} : { 'x-rate-limit-reset': value }), ok]);
@@ -96,7 +219,7 @@ export async function testApiLimits() {
   await check('a stop retains a longer server reset instead of inventing an earlier unlock', async () => {
     const h = await harness([rate(reset(48 * 3600), 344)]);
     assert.equal((await h.api.deleteTweet('synthetic')).kind, 'stop');
-    assert.equal(h.store['xbcApiCooldown:42:DeleteTweet'].until, START + 48 * 3600000 + 10000);
+    assert.equal(persisted(h.store).until, START + 48 * 3600000 + 10000);
   });
   for (const headers of [{ 'backoff-policy': 'backoff=60000' }, { 'Retry-After': '60' }]) await check(`success still gates next request on ${Object.keys(headers)[0]}`, async () => {
     const h = await harness([{ ...ok, headers }, ok]);

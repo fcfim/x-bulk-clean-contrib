@@ -100,46 +100,61 @@
   const MIN_RATE_WAIT = 15 * 60000;
   const MAX_JOB_WAIT = 30 * 60000;
   const MAX_RATE_RETRIES = 3;
-  const state = { ready: false, bearer: FALLBACK_BEARER, ops: {}, me: null, sources: {}, paceFactor: 1, slowdown: 1, waited: 0, rateRetries: 0 };
+  const state = { ready: false, bearer: FALLBACK_BEARER, ops: {}, me: null, sources: {}, job: null };
 
-  // Query ids change with X builds; the operation name, not its query id, is the bucket.
-  // Separate storage keys avoid overwriting another account/operation's cooldown.
-  const cooldownKey = operation => `xbcApiCooldown:${state.me.id}:${operation}`;
-  const readCooldown = async operation => (await chrome.storage.local.get([cooldownKey(operation)]))[cooldownKey(operation)] || {};
-  async function rememberCooldown(operation, update) {
-    const stored = await readCooldown(operation);
-    const previous = stored.until > Date.now() ? stored : {};
-    const value = {
-      ...previous, ...update,
-      blocked: !!(previous.blocked || update.blocked),
-      reason: previous.blocked ? previous.reason : update.reason,
-      until: Math.max(previous.until || 0, update.until || 0),
-      slowdown: Math.max(previous.slowdown || 1, state.slowdown)
-    };
-    await chrome.storage.local.set({ [cooldownKey(operation)]: value });
+  // Each response writes a unique, immutable claim. chrome.storage has no atomic
+  // read/modify/write; a short wait must never overwrite another job's longer stop.
+  // This also works across tabs/origins, where a page-scoped Web Lock would not.
+  const cooldownKey = (job, operation) => `xbcApiCooldown:${job.me.id}:${operation}`;
+  async function readCooldown(job, operation) {
+    const prefix = cooldownKey(job, operation);
+    const records = await chrome.storage.local.get(null);
+    const active = Object.entries(records).filter(([key, value]) =>
+      (key === prefix || key.startsWith(prefix + ':claim:')) && value?.until > Date.now());
+    const result = { until: 0, slowdown: 1, blocked: false };
+    for (const [, value] of active) {
+      if (value.until > result.until && !result.blocked) result.reason = value.reason;
+      if (value.blocked) { result.reason = value.reason; result.blocked = true; }
+      result.until = Math.max(result.until, value.until);
+      result.slowdown = Math.max(result.slowdown, value.slowdown || 1);
+    }
+    return result;
+  }
+  async function rememberCooldown(job, operation, update) {
+    const claim = `${cooldownKey(job, operation)}:claim:${crypto.randomUUID()}`;
+    await chrome.storage.local.set({ [claim]: { ...update, slowdown: job.slowdown } });
+    return readCooldown(job, operation);
+  }
+  async function pruneCooldowns() {
+    const records = await chrome.storage.local.get(null);
+    const expired = Object.entries(records).filter(([key, value]) =>
+      key.startsWith('xbcApiCooldown:') && key.includes(':claim:') && value?.until <= Date.now()).map(([key]) => key);
+    // Claims are never reused or extended. Removing an expired claim cannot erase a
+    // concurrent writer; legacy shared keys are read for compatibility, never removed.
+    if (expired.length) await chrome.storage.local.remove(expired);
   }
   const suspension = (until, reason = 'X API cooldown') => ({
     kind: 'stop', retryAt: until,
     message: `${reason}. Job suspended; try again after ${new Date(until).toISOString()}.`
   });
 
-  async function waitForCooldown(operation, { isActive, onWait }) {
-    const saved = await readCooldown(operation);
+  async function waitForCooldown(job, operation, { isActive, onWait }) {
+    const saved = await readCooldown(job, operation);
     if (isActive && !isActive()) return { kind: 'stopped' };
     if (!(saved.until > Date.now())) return null;
-    state.slowdown = Math.max(state.slowdown, saved.slowdown || 1);
+    job.slowdown = Math.max(job.slowdown, saved.slowdown || 1);
     // Never shorten a server deadline to fit the job. Keep it for the next job instead.
-    if (saved.blocked || saved.until - Date.now() > MAX_JOB_WAIT - state.waited) return suspension(saved.until, saved.reason);
+    if (saved.blocked || saved.until - Date.now() > MAX_JOB_WAIT - job.waited) return suspension(saved.until, saved.reason);
     const started = Date.now();
     onWait?.(saved.until);
     try {
       if (!(await waitUntil(saved.until, isActive))) return { kind: 'stopped' };
     } finally {
-      state.waited += Math.max(0, Date.now() - started);
+      job.waited += Math.max(0, Date.now() - started);
       onWait?.(null);
     }
     // Another active job may have extended this bucket while we were waiting.
-    return waitForCooldown(operation, { isActive, onWait });
+    return waitForCooldown(job, operation, { isActive, onWait });
   }
 
   async function init(account) {
@@ -148,9 +163,7 @@
     const stored = settings.xbcApiCache || {};
     // Production never runs faster than click-like pacing. Tests control their clocks instead.
     const configuredPace = Number(settings.apiPace);
-    state.paceFactor = Number.isFinite(configuredPace) ? Math.max(1, configuredPace) : 1;
-    state.slowdown = 1;
-    state.waited = state.rateRetries = 0;
+    const job = { paceFactor: Number.isFinite(configuredPace) ? Math.max(1, configuredPace) : 1, slowdown: 1, waited: 0, rateRetries: 0 };
     const bundle = await bundleOps();
     state.bearer = live.bearer || stored.bearer || bundle.bearer || FALLBACK_BEARER;
 
@@ -186,6 +199,10 @@
     state.ops = ops;
     state.me = { id: live.viewerId || viewerId(), username: (account?.username || '').toLowerCase() };
     state.ready = !!cookie('ct0') && !!state.me.id;
+    job.me = { ...state.me };
+    state.job = job;
+    // A late response keeps its original job/account context, even after another init.
+    try { await pruneCooldowns(); } catch (_) { /* Gates below fail closed on storage errors. */ }
     try {
       await chrome.storage.local.set({ xbcApiCache: { bearer: state.bearer, ops, savedAt: Date.now() } });
     } catch (_) {}
@@ -288,20 +305,20 @@
 
   // All callers share the job's retry/wait budget. A restriction is never a refusal,
   // so callers stop rather than switching to the click path.
-  async function perform(operation, send, { okWhen, isActive, onWait } = {}) {
+  async function perform(operation, send, { okWhen, isActive, onWait } = {}, job = state.job) {
     let transient = 0, csrf = 0;
     for (;;) {
       if (isActive && !isActive()) return { kind: 'stopped' };
       try {
-        const gate = await waitForCooldown(operation, { isActive, onWait });
+        const gate = await waitForCooldown(job, operation, { isActive, onWait });
         if (gate) return gate;
       } catch (_) { return { kind: 'stop', message: 'Could not read the X API cooldown. Job stopped.' }; }
       if (isActive && !isActive()) return { kind: 'stopped' };
       const response = await send();
       const result = classify(response, { okWhen });
       const limited = result.kind === 'rate' || response.remaining === 0;
-      if (result.kind === 'rate') state.slowdown = Math.min(state.slowdown * 2, 8);
-      if (response.limit > 0 && response.remaining != null && response.remaining <= Math.max(1, response.limit * 0.1)) state.slowdown = Math.max(state.slowdown, 2);
+      if (result.kind === 'rate') job.slowdown = Math.min(job.slowdown * 2, 8);
+      if (response.limit > 0 && response.remaining != null && response.remaining <= Math.max(1, response.limit * 0.1)) job.slowdown = Math.max(job.slowdown, 2);
       const resetAt = response.reset * 1000 > Date.now() ? validDeadline(response.reset * 1000 + 10000) : 0;
       let until = Math.max(response.retryAt || 0, response.backoffAt || 0, limited ? resetAt || Date.now() + MIN_RATE_WAIT : 0, result.kind === 'stop' ? resetAt : 0);
       // X gives no daily reset here: conservatively retain code 344 for 24 hours.
@@ -309,17 +326,27 @@
       if (response.codes.includes(344)) until = Math.max(until, Date.now() + 24 * 60 * 60000);
       if (until) {
         try {
-          await rememberCooldown(operation, { until, reason: result.kind === 'stop' ? result.message : 'X API cooldown', blocked: result.kind === 'stop', limit: response.limit ?? null, remaining: response.remaining ?? null });
+          const saved = await rememberCooldown(job, operation, { until, reason: result.kind === 'stop' ? result.message : 'X API cooldown', blocked: result.kind === 'stop', limit: response.limit ?? null, remaining: response.remaining ?? null });
+          until = saved.until;
         } catch (_) { return { kind: 'stop', message: 'Could not save the X API cooldown. Job stopped.' }; }
       }
       if (isActive && !isActive()) return { kind: 'stopped' };
+      if (result.kind === 'refused') {
+        // A refusal with an active server wait is a stop in every caller, never
+        // permission to switch to DOM. Recheck claims written during this request too.
+        try {
+          const saved = await readCooldown(job, operation);
+          if (isActive && !isActive()) return { kind: 'stopped' };
+          if (saved.until > Date.now()) return suspension(saved.until, saved.reason);
+        } catch (_) { return { kind: 'stop', message: 'Could not read the X API cooldown. Job stopped.' }; }
+      }
       if (result.kind === 'rate') {
-        if (++state.rateRetries > MAX_RATE_RETRIES) return suspension(until, 'X API rate retry budget reached');
+        if (++job.rateRetries > MAX_RATE_RETRIES) return suspension(until, 'X API rate retry budget reached');
         continue;
       }
       if (result.kind === 'csrf' && csrf++ < 1) continue;
       if (result.kind === 'retry' && transient++ < 3) {
-        try { await rememberCooldown(operation, { until: Date.now() + 5000 * 3 ** (transient - 1), reason: 'X API retry backoff' }); }
+        try { await rememberCooldown(job, operation, { until: Date.now() + 5000 * 3 ** (transient - 1), reason: 'X API retry backoff' }); }
         catch (_) { return { kind: 'stop', message: 'Could not save the X API cooldown. Job stopped.' }; }
         continue;
       }
@@ -422,8 +449,9 @@
   // Pages through a list operation. Yields { tweets, users } until the list ends.
   async function* pages(name, { isActive, onWait, pause = 900 } = {}) {
     const op = graphql(name);
+    const job = state.job;
     const base = { ...(LIST_DEFAULT_VARIABLES[name] || {}), ...(op.variables || {}) };
-    base.userId = state.me.id; // always the signed-in account, whatever page the template came from
+    base.userId = job.me.id; // always the signed-in account, whatever page the template came from
     delete base.cursor;
     const seen = new Set();
     let cursor = null, empty = 0;
@@ -436,7 +464,7 @@
         const r = await call('GET', `/i/api/graphql/${op.queryId}/${name}`, { params: { variables, features: nonEmpty(op.features), fieldToggles: nonEmpty(op.fieldToggles) } });
         parsed = r.json ? parsePage(r.json) : null;
         return r;
-      }, { isActive, onWait, okWhen: json => !!json?.data });
+      }, { isActive, onWait, okWhen: json => !!json?.data }, job);
       if (result.kind === 'stopped') return;
       if (result.kind !== 'ok') { const error = new Error(result.message || result.kind); error.result = result; throw error; }
       const fresh = {
@@ -447,7 +475,7 @@
       yield fresh;
       if (!parsed.bottom || parsed.bottom === cursor || empty >= 2) return;
       cursor = parsed.bottom;
-      if (!(await waitUntil(Date.now() + Math.max(900, Number(pause) || 900) * state.paceFactor * state.slowdown, isActive))) return;
+      if (!(await waitUntil(Date.now() + Math.max(900, Number(pause) || 900) * job.paceFactor * job.slowdown, isActive))) return;
     }
   }
 
@@ -462,7 +490,7 @@
     pages,
     parsePage,
     sleep,
-    pace: (action) => jitter((PACE_MS[action] || 2500) * state.paceFactor * state.slowdown),
+    pace: (action) => jitter((PACE_MS[action] || 2500) * state.job.paceFactor * state.job.slowdown),
     // DeleteTweet fails on any error, as in X's app; the others succeed on their data check.
     deleteTweet: (id, options) => mutate('DeleteTweet', { tweet_id: String(id) }, { ...options, okWhen: json => !!json?.data && !json.errors?.length }),
     deleteRetweet: (sourceId, options) => mutate('DeleteRetweet', { source_tweet_id: String(sourceId) }, { ...options, okWhen: json => !!json?.data?.unretweet?.source_tweet_results?.result }),
