@@ -242,6 +242,10 @@ const SCENARIOS = [
     name: 'limits: preview scan stops on a daily 429 without starting DOM',
     state: { own: 2 },
     async run(env, state) {
+      // Prime the profile first: its own discovery GET must not consume the worker fixture.
+      const xTab = env.context.pages().find(page => page.url().startsWith('https://x.com/'));
+      await xTab.goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
       state.misbehave.responses.UserTweets = [{ code: 344, resetSeconds: 5 }];
       const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
       await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
