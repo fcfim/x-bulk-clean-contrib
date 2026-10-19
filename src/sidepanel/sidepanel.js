@@ -162,6 +162,12 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); }); } catch (_) {}
   });
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
+  // X draws tweets and UserCells outside the list being scanned too ("Who to follow" in the
+  // sidebar), so the scan only looks inside the main column. No column, no items.
+  const scopeRoot = () => document.querySelector('[data-testid="primaryColumn"]');
+  const inColumn = selector => Array.from(scopeRoot()?.querySelectorAll(selector) || []);
+  // X is a single-page app: startDomScan records the page, and the scan stops on any other.
+  const routeKey = () => location.pathname.replace(/\/+$/, '').toLowerCase();
   const ownHandle = () => {
     const link = document.querySelector('[data-testid="AppTabBar_Profile_Link"]') || document.querySelector('a[aria-label="Profile"]');
     return link?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
@@ -221,11 +227,15 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
 
   const scanTick = () => {
     if (P.busy || P.paused || !P.interval) return;
+    if (routeKey() !== P.route) {
+      finish('The page changed — scan stopped', false);
+      return;
+    }
     P.busy = true;
     try {
       let added = 0;
       if (type === 'unfollow') {
-        for (const cell of document.querySelectorAll('[data-testid="UserCell"]')) {
+        for (const cell of inColumn('[data-testid="UserCell"]')) {
           const username = userHandle(cell);
           const id = username?.toLowerCase();
           if (!id || P.seen.has(id)) continue;
@@ -240,7 +250,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
           P.items.push({ id, type: 'account', classification: 'unfollow', text: `${displayName} @${username}`, displayName, username, bio, avatarUrl: avatar?.currentSrc || avatar?.src || '', date: '', author: username, url: `/${username}`, hasMedia: false, selected: true });
           added++;
         }
-      } else for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+      } else for (const article of inColumn('article[data-testid="tweet"]')) {
         const id = tweetId(article);
         if (!id || P.seen.has(id)) continue;
         const repost = !!article.querySelector('[data-testid="unretweet"]');
@@ -271,7 +281,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
       // A hidden tab is not rendered: X draws no more items until it is visible, so neither count
       // an empty cycle as the end of the list nor scroll blind past items it has yet to draw.
       if (hidden()) {
-        if (!document.querySelector('article[data-testid="tweet"], [data-testid="UserCell"]')) return;
+        if (!scopeRoot()?.querySelector('article[data-testid="tweet"], [data-testid="UserCell"]')) return;
       } else if (!added && atBottom()) P.emptyCycles++;
       else P.emptyCycles = 0;
       if (P.emptyCycles >= 6) {
@@ -286,6 +296,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   };
   const startDomScan = () => {
     P.mode = 'dom';
+    P.route = routeKey();
     window.scrollTo({ top: 0, behavior: 'auto' });
     const token = P.interval = { loop: true };
     (async () => {
@@ -472,6 +483,18 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); }); } catch (_) {}
   });
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
+  // X draws tweets and UserCells outside the list being cleaned too ("Who to follow" in the
+  // sidebar), so click mode only looks inside the main column. No column, no candidates.
+  const scopeRoot = () => document.querySelector('[data-testid="primaryColumn"]');
+  const inColumn = selector => Array.from(scopeRoot()?.querySelectorAll(selector) || []);
+  // X is a single-page app: startDomLoop records the page; on any other page the job stops.
+  const routeKey = () => location.pathname.replace(/\/+$/, '').toLowerCase();
+  const onPage = () => X.route == null || routeKey() === X.route;
+  const leftPage = async () => {
+    if (onPage()) return false;
+    await stop('The page changed — job stopped');
+    return true;
+  };
   const ownHandle = () => document.querySelector('[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
   const me = ownHandle();
   const tweetId = article => article.querySelector('a[href*="/status/"]')?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1] || null;
@@ -506,6 +529,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   const atBottom = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 240;
   const clickConfirm = async testId => {
     for (let i = 0; i < 10; i++) {
+      if (!onPage()) return false;
       const button = document.querySelector(`[data-testid="${testId}"]`);
       if (button && button.offsetParent !== null) { button.click(); return true; }
       await sleep(200);
@@ -528,6 +552,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   };
   const clickDeleteMenu = async () => {
     for (let i = 0; i < 9; i++) {
+      if (!onPage()) return false;
       const items = Array.from(document.querySelectorAll('[role="menuitem"]')).filter(item => item.offsetParent !== null);
       let button = items.find(item => DELETE_LABELS.has((item.textContent || '').trim().toLowerCase()));
       if (!button && items[0] && isRedText(items[0].querySelector('span') || items[0])) button = items[0];
@@ -549,7 +574,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   // Element references go stale once X re-renders after a deletion; re-find by id.
   const liveArticle = (article, id) => {
     if (article?.isConnected) return article;
-    for (const a of document.querySelectorAll('article[data-testid="tweet"]')) if (tweetId(a) === id) return a;
+    for (const a of inColumn('article[data-testid="tweet"]')) if (tweetId(a) === id) return a;
     return null;
   };
   // Mark an id processed only after it succeeds or fails three times.
@@ -647,10 +672,11 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   const tick=async()=>{
     if(X.busy||!X.interval)return;X.busy=true;
     try{
+      if(await leftPage())return;
       const issue=detectIssue();if(issue){await stop(issue);return}
       const candidates=[];
       if(type==='unfollow'){
-        for(const cell of document.querySelectorAll('[data-testid="UserCell"]')){
+        for(const cell of inColumn('[data-testid="UserCell"]')){
           const id=userHandle(cell);if(!id||!selected.has(id)||X.processed.has(id))continue;
           const control=Array.from(cell.querySelectorAll('button')).find(button=>{
             const testId=button.getAttribute('data-testid')||'';
@@ -658,7 +684,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
           });
           if(control&&control.offsetParent!==null)candidates.push({cell,id,control});
         }
-      }else for(const article of document.querySelectorAll('article[data-testid="tweet"]')){
+      }else for(const article of inColumn('article[data-testid="tweet"]')){
         const id=tweetId(article);if(!id||!selected.has(id)||X.processed.has(id))continue;
         if(type==='reposts'){
           const control=article.querySelector('[data-testid="unretweet"]');
@@ -673,7 +699,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       }
       let handled=0;
       for(const {article:initial,cell,id,control:initialControl} of candidates){
-        if(!X.interval)break;const snap=selected.get(id);
+        if(!X.interval||await leftPage())break;const snap=selected.get(id);
         let control=initialControl;
         if(type!=='unfollow'){const article=liveArticle(initial,id);control=article?.querySelector(type==='reposts'?'[data-testid="unretweet"]':'[data-testid="caret"]');}
         else if(!cell.isConnected)control=null;
@@ -703,7 +729,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       if(X.successCount>=selected.size){stop(`Finished — ${X.successCount} selected items ${resultVerb}`);return}
       // A hidden tab is not rendered: X draws no more items until it is visible, so neither count
       // an empty cycle as the end nor scroll blind past items it has yet to draw.
-      const blind=hidden()&&!document.querySelector('article[data-testid="tweet"],[data-testid="UserCell"]');
+      const blind=hidden()&&!scopeRoot()?.querySelector('article[data-testid="tweet"],[data-testid="UserCell"]');
       if(!hidden()){if(!candidates.length&&atBottom())X.emptyCycles++;else X.emptyCycles=0}
       if(X.emptyCycles>=6){stop(`Finished — ${X.successCount} ${resultVerb}, ${Math.max(0,selected.size-X.successCount)} not found`);return}
       if(candidates.length<=handled&&!blind){window.scrollBy(0,Math.max(520,window.innerHeight*.75));window.dispatchEvent(new Event('scroll'))}
@@ -711,7 +737,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   };
   // Sequential loop paced by sleep() instead of setInterval, so it keeps running in a background tab.
   const startDomLoop=()=>{
-    X.mode='dom';window.scrollTo({top:0,behavior:'auto'});
+    X.mode='dom';X.route=routeKey();window.scrollTo({top:0,behavior:'auto'});
     const token=X.interval={loop:true};
     (async()=>{
       while(X.interval===token){

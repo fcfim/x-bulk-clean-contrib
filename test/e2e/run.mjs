@@ -220,6 +220,31 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true, b
   return { scanned, scan, job, worker };
 }
 
+// Click-mode safety (VER-628): a DOM scan the test can watch and act on while it runs.
+async function readPreview(env) {
+  return env.worker.evaluate(async () => {
+    const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+    const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+      const P = window.__xbcPreview;
+      return P && { mode: P.mode, running: !!P.interval, issue: P.issue, done: P.done, ids: P.items.map(i => i.id) };
+    } });
+    return r?.result;
+  });
+}
+const xPage = env => env.context.pages().find(page => page.url().startsWith('https://x.com/'));
+const domActions = state => state.calls.filter(c => /^dom-/.test(c.op));
+async function startDomScan(env, type) {
+  const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+  await panel.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
+  await panel.evaluate((type) => {
+    document.querySelector(`input[name="previewType"][value="${type}"]`).click();
+    const box = document.getElementById('previewApi');
+    if (box.checked) box.click();
+    document.getElementById('startScan').click();
+  }, type);
+  return panel;
+}
+
 const SCENARIOS = [
   ...[
     { name: 'ten empty pages interrupt with empty_streak', expected: 0, complete: false, reason: /10 consecutive pages without new items/, sequence: state => Array.from({ length: 10 }, (_, i) => scriptedTimeline(state, { cursor: `empty-${i}` })) },
@@ -813,6 +838,108 @@ const SCENARIOS = [
         ['scan found the 5 reposts by original id', r.scan?.mode === 'api' && r.scan.items.length === 5 && r.scan.items.every(i => /^5/.test(i.id)), r.scan],
         ['reposts removed, posts kept', state.tweets.filter(t => t.retweetOf).length === 0 && state.tweets.length === 2],
         ['history: 5 unreposted', r.job.counts.unreposted === 5, r.job.counts]
+      ];
+    }
+  },
+  {
+    name: 'click mode: Follow all leaves suggested accounts outside the main column alone',
+    state: { followers: 3 },
+    setup: (state) => { state.dom = { users: true, sidebar: [{ id: '900', screen: 'suggested0', name: 'Suggested 0' }, { id: '901', screen: 'suggested1', name: 'Suggested 1' }] }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'followAll', { apiMode: false });
+      const follows = state.calls.filter(c => c.op === 'dom-follow');
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['no action outside the main column', domActions(state).every(c => c.where === 'column'), domActions(state)],
+        ['the 3 followers were followed', follows.length === 3 && state.followers.every(u => u.following), follows],
+        ['history: 3 follows', r.job.counts.follows === 3 && r.record.backup.follows.every(u => /^r\d$/.test(u.username)), r.record.backup.follows]
+      ];
+    }
+  },
+  {
+    name: 'click mode: navigating away mid-job stops it with no action on the new page',
+    state: { own: 6 },
+    setup: (state) => { state.dom = { navigateAfter: 2 }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      const deletes = state.calls.filter(c => c.op === 'dom-delete');
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['job stopped because the page changed', r.job.status === 'interrupted' && /The page changed/.test(r.job.statusText), r.job.statusText],
+        ['no action after the switch', deletes.length === 2 && deletes.every(c => c.path === `/${ME.screen}`), deletes],
+        ['the other 4 posts remain', state.tweets.length === 4, state.tweets.length],
+        ['history: the 2 deletions', r.job.total === 2, r.job]
+      ];
+    }
+  },
+  {
+    name: 'click mode: without a main column nothing is a candidate',
+    state: { own: 3 },
+    setup: (state) => { state.dom = { noPrimaryColumn: true }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['no click action', domActions(state).length === 0 && state.tweets.length === 3, domActions(state)],
+        ['zero found, zero deleted', r.worker?.stats.found === 0 && r.job.total === 0, { stats: r.worker?.stats, job: r.job }]
+      ];
+    }
+  },
+  {
+    name: 'preview: DOM scan and selected unfollow stay inside the main column',
+    state: { following: 2 },
+    // "f1" also shows in the sidebar with its own Unfollow button, like X's "Relevant people".
+    setup: (state) => { state.dom = { users: true, sidebar: [{ id: '900', screen: 'suggested0', name: 'Suggested 0' }, { id: 'f101', screen: 'f1', name: 'F 1', following: true }] }; },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'unfollow', { apiMode: false });
+      const unfollows = state.calls.filter(c => c.op === 'dom-unfollow');
+      return [
+        ['scan ran by clicking', r.scan?.mode === 'dom' && r.worker?.mode === 'dom', { scan: r.scan?.mode, worker: r.worker }],
+        ['scan listed only the 2 accounts in the main column', r.scan?.items.map(i => i.id).sort().join() === 'f0,f1', r.scan?.items],
+        ['no action outside the main column', domActions(state).every(c => c.where === 'column'), domActions(state)],
+        ['both accounts unfollowed once', unfollows.length === 2 && state.following.length === 0, unfollows],
+        ['history: 2 unfollows', r.job.counts.unfollows === 2, r.job.counts]
+      ];
+    }
+  },
+  {
+    name: 'preview: DOM scan stops when the page changes',
+    state: { own: 4 },
+    setup: (state) => { state.dom = {}; },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      await waitFor(async () => { const P = await readPreview(env); return P?.mode === 'dom' && P.ids.length > 0; }, { interval: 100, label: 'first scanned items' });
+      // Like X's SPA: a new path, and a post of yours on the new page.
+      await xPage(env).evaluate(() => {
+        history.pushState({}, '', '/explore');
+        const cell = document.createElement('div');
+        cell.dataset.testid = 'cellInnerDiv';
+        cell.innerHTML = '<article data-testid="tweet"><div data-testid="User-Name"><a role="link" href="/me">me</a> <a href="/me/status/91999">t</a></div><button data-testid="caret">…</button></article>';
+        document.getElementById('list').appendChild(cell);
+      });
+      const scan = await waitFor(async () => { const P = await readPreview(env); return !P.running && P; }, { timeout: 20000, label: 'scan to stop' });
+      const label = await panel.waitForFunction(() => /The page changed/.test(document.getElementById('scanState').textContent), null, { timeout: 5000 })
+        .then(() => 'The page changed', () => panel.evaluate(() => document.getElementById('scanState').textContent));
+      await panel.close();
+      return [
+        ['scan stopped because the page changed', !scan.done && /The page changed/.test(scan.issue || ''), scan],
+        ['nothing listed from the new page', scan.ids.length === 4 && !scan.ids.includes('91999'), scan.ids],
+        ['the panel says why', /The page changed/.test(label), label]
+      ];
+    }
+  },
+  {
+    name: 'preview: selected deletion stops when the page changes',
+    state: { own: 6 },
+    setup: (state) => { state.dom = { navigateAfter: 2 }; },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false });
+      const deletes = state.calls.filter(c => c.op === 'dom-delete');
+      return [
+        ['scan and deletion ran by clicking', r.scan?.mode === 'dom' && r.scan.items.length === 6 && r.worker?.mode === 'dom', { scan: r.scan, worker: r.worker }],
+        ['job stopped because the page changed', r.job.status === 'interrupted' && /The page changed/.test(r.job.statusText), r.job.statusText],
+        ['no action after the switch', deletes.length === 2 && deletes.every(c => c.path === `/${ME.screen}`), deletes],
+        ['the other 4 posts remain', state.tweets.length === 4, state.tweets.length]
       ];
     }
   }
