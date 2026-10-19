@@ -204,8 +204,27 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
       const id = url.searchParams.get('id');
       const i = state.tweets.findIndex(t => t.id === id && !t.retweetOf);
       if (i >= 0) state.tweets.splice(i, 1);
-      state.calls.push({ method: 'DOM', op: 'dom-delete', id });
+      state.calls.push({ method: 'DOM', op: 'dom-delete', id, ...(url.searchParams.has('path') ? { path: url.searchParams.get('path') } : {}) });
       return json(route, 200, { ok: i >= 0 });
+    }
+    // Account lists and their buttons, only for pages built with state.dom (see domScript).
+    if (url.pathname === '/__fake/users') {
+      const op = url.searchParams.get('op');
+      const list = op === 'Following' ? state.following.map(u => ({ ...u, following: true })) : listFor(state, op);
+      return json(route, 200, list.map(({ id, screen, name, following }) => ({ id, screen, name, following: !!following })));
+    }
+    const friendship = url.pathname.match(/^\/__fake\/(follow|unfollow)$/);
+    if (friendship) {
+      const screen = url.searchParams.get('id');
+      state.calls.push({ method: 'DOM', op: `dom-${friendship[1]}`, id: screen, where: url.searchParams.get('where'), path: url.searchParams.get('path') });
+      if (friendship[1] === 'follow') {
+        const user = state.followers.find(u => u.screen === screen);
+        if (user) user.following = true;
+      } else {
+        const i = state.following.findIndex(u => u.screen === screen);
+        if (i >= 0) state.following.splice(i, 1);
+      }
+      return json(route, 200, { ok: true });
     }
     return json(route, 404, {});
   });
@@ -214,11 +233,11 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
     const path = new URL(route.request().url()).pathname.replace(/^\/|\/$/g, '');
     const [handle, tab = ''] = path.split('/');
     const op = handle === ME.screen ? PATH_OP[tab] : null;
-    route.fulfill({ status: 200, contentType: 'text/html', body: pageHtml(op) });
+    route.fulfill({ status: 200, contentType: 'text/html', body: pageHtml(op, state.dom) });
   });
 }
 
-function pageHtml(op) {
+function pageHtml(op, dom) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <script type="text/plain" src="https://abs.twimg.com/responsive-web/client-web/main.b09082b07a640734a.js"></script>
 <script>
@@ -271,7 +290,71 @@ function openMenu(id, mine) {
   };
 }
 render();
-</script></body></html>`;
+</script>${dom ? domScript(dom) : ''}</body></html>`;
+}
+
+// Opt-in page behaviors, set as state.dom by a scenario; without it the page is unchanged.
+//  users:           list followers/following as clickable UserCells in the main column
+//  sidebar:         accounts drawn as UserCells in a sidebar outside the main column
+//                   ({ id, screen, name, following }), like X's "Who to follow"
+//  noPrimaryColumn: the main column carries no data-testid
+//  navigateAfter:   after that many actions, move to /explore with pushState, as X's SPA does,
+//                   keeping the same content on screen
+// Every action is recorded with the pathname it happened on and where its button was.
+function domScript(dom) {
+  return `<script>
+(() => {
+  const dom = ${JSON.stringify(dom)};
+  const main = document.querySelector('[data-testid="primaryColumn"]');
+  if (dom.noPrimaryColumn) main.removeAttribute('data-testid');
+  const layers = document.getElementById('layers');
+  let acted = 0;
+  const counted = () => { if (++acted === dom.navigateAfter) history.pushState({}, '', '/explore'); };
+  const realFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    if (!String(input).startsWith('/__fake/delete')) return realFetch(input, init);
+    const response = await realFetch(String(input) + '&path=' + encodeURIComponent(location.pathname), init);
+    counted();
+    return response;
+  };
+  async function act(kind, user, where) {
+    await realFetch('/__fake/' + kind + '?id=' + user.screen + '&where=' + where + '&path=' + encodeURIComponent(location.pathname));
+    if (where === 'sidebar') user.following = kind === 'follow';
+    counted();
+    if (where === 'sidebar') renderSidebar();
+    else renderUsers();
+  }
+  function userCell(user, where) {
+    const cell = document.createElement('div');
+    cell.dataset.testid = 'UserCell';
+    cell.innerHTML = '<a role="link" href="/' + user.screen + '"><span>' + user.name + '</span></a><span>@' + user.screen + '</span>' +
+      '<button data-testid="' + user.id + (user.following ? '-unfollow' : '-follow') + '">' + (user.following ? 'Following' : 'Follow') + '</button>';
+    cell.querySelector('button').onclick = () => {
+      if (!user.following) return act('follow', user, where);
+      layers.innerHTML = '<button data-testid="confirmationSheetConfirm">Unfollow</button>';
+      layers.firstChild.onclick = () => { layers.innerHTML = ''; act('unfollow', user, where); };
+    };
+    return cell;
+  }
+  async function renderUsers() {
+    if (!dom.users || !['Followers', 'Following', 'BlueVerifiedFollowers'].includes(op)) return;
+    const users = await (await realFetch('/__fake/users?op=' + op)).json();
+    document.getElementById('list').replaceChildren(...users.map(user => userCell(user, 'column')));
+  }
+  let aside = null;
+  function renderSidebar() {
+    if (!dom.sidebar) return;
+    if (!aside) {
+      aside = document.createElement('aside');
+      aside.dataset.testid = 'sidebarColumn';
+      document.body.insertBefore(aside, layers);
+    }
+    aside.replaceChildren(Object.assign(document.createElement('h2'), { textContent: 'Who to follow' }), ...dom.sidebar.map(user => userCell(user, 'sidebar')));
+  }
+  renderUsers();
+  renderSidebar();
+})();
+<\/script>`;
 }
 
 export const fakeQueryIds = QUERY_IDS;

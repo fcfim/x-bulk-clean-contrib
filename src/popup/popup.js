@@ -492,6 +492,21 @@ function runWorker(action, performanceMode, account, useApi = false) {
   }
   const me = ownHandle();
 
+  // X draws tweets and UserCells outside the list being cleaned too ("Who to follow" in the
+  // sidebar), so click mode only looks inside the main column. No column, no candidates.
+  const scopeRoot = () => document.querySelector('[data-testid="primaryColumn"]');
+  const inColumn = selector => Array.from(scopeRoot()?.querySelectorAll(selector) || []);
+
+  // X is a single-page app: following a link in this tab changes the page without ending the
+  // worker. startDomLoop records the page; on any other page the job stops, acting no further.
+  const routeKey = () => location.pathname.replace(/\/+$/, '').toLowerCase();
+  const onPage = () => X.route == null || routeKey() === X.route;
+  async function leftPage() {
+    if (onPage()) return false;
+    await stopAll('The page changed — job stopped');
+    return true;
+  }
+
   function tweetId(article) {
     const m = article.querySelector('a[href*="/status/"]')?.getAttribute('href')?.match(/\/status\/(\d+)/);
     return m ? m[1] : null;
@@ -674,6 +689,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   async function clickConfirm(testId, attempts = 10) {
     for (let i = 0; i < attempts; i++) {
+      if (!onPage()) return false;
       const btn = document.querySelector(`[data-testid="${testId}"]`);
       if (btn && btn.offsetParent !== null) {
         btn.click();
@@ -726,6 +742,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
   async function clickDeleteInMenu() {
     // Poll for the menu to render (it can take 300-700ms), then find Delete.
     for (let i = 0; i < 8; i++) {
+      if (!onPage()) return false;
       const menuItems = document.querySelectorAll('[role="menuitem"]');
       if (menuItems.length) {
         const del = findDeleteMenuItem(menuItems);
@@ -746,7 +763,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
   // start of a cycle go stale. Look the article up again by id right before acting on it.
   function liveArticle(article, id) {
     if (article?.isConnected) return article;
-    for (const a of document.querySelectorAll('article[data-testid="tweet"]')) {
+    for (const a of inColumn('article[data-testid="tweet"]')) {
       if (tweetId(a) === id) return a;
     }
     return null;
@@ -785,7 +802,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
   // listener see the new position, since real scroll events wait for the tab to render.
   function advance(found, handled) {
     if (found > handled) return;
-    if (hidden() && !document.querySelector('article[data-testid="tweet"], [data-testid="UserCell"]')) return;
+    if (hidden() && !scopeRoot()?.querySelector('article[data-testid="tweet"], [data-testid="UserCell"]')) return;
     window.scrollBy(0, window.innerHeight * 0.7);
     window.dispatchEvent(new Event('scroll'));
   }
@@ -914,6 +931,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   function startDomLoop() {
     X.mode = 'dom';
+    X.route = routeKey();
     if (action === 'delete' || action === 'unrepost') {
       X.stats = action === 'delete'
         ? { deleted: 0, found: 0 }
@@ -921,12 +939,13 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
       runLoop(async () => {
         if (X.busy || !X.interval) return;
+        if (await leftPage()) return;
         const issue = detectIssue();
         if (issue) { stopAll(issue); return; }
         X.busy = true;
         try {
           let processedThisCycle = 0;
-          const articles = document.querySelectorAll('article[data-testid="tweet"]');
+          const articles = inColumn('article[data-testid="tweet"]');
           const candidates = [];
 
           if (action === 'delete') {
@@ -951,7 +970,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
           const maxPerCycle = hidden() ? 2 : 4;
           for (const { article: initial, id, kind } of candidates) {
-            if (!X.interval) break;
+            if (!X.interval || await leftPage()) break;
             const article = liveArticle(initial, id);
             const control = article?.querySelector(kind === 'caret' ? '[data-testid="caret"]' : '[data-testid="unretweet"]');
             if (!control) continue; // virtualized away; picked up again next cycle
@@ -1006,11 +1025,12 @@ function runWorker(action, performanceMode, account, useApi = false) {
       X.stats = { unlikes: 0, foundLikes: 0 };
       runLoop(async () => {
         if (X.busy || !X.interval) return;
+        if (await leftPage()) return;
         const issue = detectIssue();
         if (issue) { stopAll(issue); return; }
         X.busy = true;
         try {
-          const buttons = Array.from(document.querySelectorAll('[data-testid="unlike"]'));
+          const buttons = inColumn('[data-testid="unlike"]');
           const candidates = [];
           for (const btn of buttons) {
             const article = btn.closest('article');
@@ -1024,7 +1044,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
           let processedThisCycle = 0;
           const maxPerCycle = hidden() ? 3 : 5;
           for (const { btn, article, id } of candidates) {
-            if (!X.interval) break;
+            if (!X.interval || await leftPage()) break;
             if (id) X.processed.add(id);
             const snap = tweetSnap(article);
             btn.click();
@@ -1053,11 +1073,12 @@ function runWorker(action, performanceMode, account, useApi = false) {
       X.stats = { repliesDeleted: 0, repliesFound: 0 };
       runLoop(async () => {
         if (X.busy || !X.interval) return;
+        if (await leftPage()) return;
         const issue = detectIssue();
         if (issue) { stopAll(issue); return; }
         X.busy = true;
         try {
-          const articles = document.querySelectorAll('article[data-testid="tweet"]');
+          const articles = inColumn('article[data-testid="tweet"]');
           const candidates = [];
           for (const a of articles) {
             const id = tweetId(a);
@@ -1072,7 +1093,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
           let processedThisCycle = 0;
           const maxPerCycle = hidden() ? 1 : 3;
           for (const { article: initial, id } of candidates) {
-            if (!X.interval) break;
+            if (!X.interval || await leftPage()) break;
             const article = liveArticle(initial, id);
             const caret = article?.querySelector('[data-testid="caret"]');
             if (!caret) continue; // virtualized away; picked up again next cycle
@@ -1114,11 +1135,12 @@ function runWorker(action, performanceMode, account, useApi = false) {
       X.stats = { follows: 0, foundFollowers: 0 };
       runLoop(async () => {
         if (X.busy || !X.interval) return;
+        if (await leftPage()) return;
         const issue = detectIssue();
         if (issue) { stopAll(issue); return; }
         X.busy = true;
         try {
-          const cells = document.querySelectorAll('[data-testid="UserCell"]');
+          const cells = inColumn('[data-testid="UserCell"]');
           const candidates = [];
           for (const cell of cells) {
             const link = cell.querySelector('a[role="link"][href^="/"]');
@@ -1141,7 +1163,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
           let processedThisCycle = 0;
           const maxPerCycle = hidden() ? 2 : 4;
           for (const { cell, button, key } of candidates) {
-            if (!X.interval) break;
+            if (!X.interval || await leftPage()) break;
             X.processed.add(key);
             const user = userSnap(cell);
             button.click();
@@ -1175,11 +1197,12 @@ function runWorker(action, performanceMode, account, useApi = false) {
       X.stats = { unfollows: 0, foundFollowing: 0 };
       runLoop(async () => {
         if (X.busy || !X.interval) return;
+        if (await leftPage()) return;
         const issue = detectIssue();
         if (issue) { stopAll(issue); return; }
         X.busy = true;
         try {
-          const cells = document.querySelectorAll('[data-testid="UserCell"]');
+          const cells = inColumn('[data-testid="UserCell"]');
           const candidates = [];
           for (const cell of cells) {
             const link = cell.querySelector('a[role="link"][href^="/"]');
@@ -1200,7 +1223,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
           let processedThisCycle = 0;
           const maxPerCycle = hidden() ? 2 : 3;
           for (const { cell, button, key } of candidates) {
-            if (!X.interval) break;
+            if (!X.interval || await leftPage()) break;
             X.processed.add(key);
             const user = userSnap(cell);
             button.click();
