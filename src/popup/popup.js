@@ -1245,7 +1245,10 @@ function runWorker(action, performanceMode, account, useApi = false) {
     const accountId = decodeURIComponent(raw).match(/u=(\d+)/)?.[1];
     if (!accountId) throw new Error('Cannot identify the signed-in account for cooldown checks');
     const prefixes = operations.filter(Boolean).map(op => `xbcApiCooldown:${accountId}:${op}`);
-    const records = await chrome.storage.local.get(null);
+    const keys = typeof chrome.storage.local.getKeys === 'function'
+      ? (await chrome.storage.local.getKeys()).filter(key => prefixes.some(prefix => key === prefix || key.startsWith(prefix + ':claim:')))
+      : null;
+    const records = await chrome.storage.local.get(keys);
     let until = 0;
     for (const [key, value] of Object.entries(records)) {
       if (prefixes.some(prefix => key === prefix || key.startsWith(prefix + ':claim:')) && Number.isFinite(value?.until) && value.until > Date.now()) {

@@ -108,7 +108,10 @@
   const cooldownKey = (job, operation) => `xbcApiCooldown:${job.me.id}:${operation}`;
   async function readCooldown(job, operation) {
     const prefix = cooldownKey(job, operation);
-    const records = await chrome.storage.local.get(null);
+    const keys = typeof chrome.storage.local.getKeys === 'function'
+      ? (await chrome.storage.local.getKeys()).filter(key => key === prefix || key.startsWith(prefix + ':claim:'))
+      : null;
+    const records = await chrome.storage.local.get(keys);
     const active = Object.entries(records).filter(([key, value]) =>
       (key === prefix || key.startsWith(prefix + ':claim:')) && value?.until > Date.now());
     const result = { until: 0, slowdown: 1, blocked: false };
@@ -126,7 +129,10 @@
     return readCooldown(job, operation);
   }
   async function pruneCooldowns() {
-    const records = await chrome.storage.local.get(null);
+    const keys = typeof chrome.storage.local.getKeys === 'function'
+      ? (await chrome.storage.local.getKeys()).filter(key => key.startsWith('xbcApiCooldown:') && key.includes(':claim:'))
+      : null;
+    const records = await chrome.storage.local.get(keys);
     const expired = Object.entries(records).filter(([key, value]) =>
       key.startsWith('xbcApiCooldown:') && key.includes(':claim:') && value?.until <= Date.now()).map(([key]) => key);
     // Claims are never reused or extended. Removing an expired claim cannot erase a

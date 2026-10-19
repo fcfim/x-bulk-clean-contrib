@@ -387,8 +387,13 @@ const SCENARIOS = [
       await env.worker.evaluate(async () => {
         const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
         await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
-          const original = chrome.storage.local.get.bind(chrome.storage.local);
-          chrome.storage.local.get = keys => keys === null ? new Promise(resolve => { window.__releaseCooldownRead = () => { chrome.storage.local.get = original; resolve({}); }; }) : original(keys);
+          if (typeof chrome.storage.local.getKeys === 'function') {
+            const original = chrome.storage.local.getKeys.bind(chrome.storage.local);
+            chrome.storage.local.getKeys = () => new Promise(resolve => { window.__releaseCooldownRead = () => { chrome.storage.local.getKeys = original; resolve([]); }; });
+          } else {
+            const original = chrome.storage.local.get.bind(chrome.storage.local);
+            chrome.storage.local.get = keys => keys === null ? new Promise(resolve => { window.__releaseCooldownRead = () => { chrome.storage.local.get = original; resolve({}); }; }) : original(keys);
+          }
         } });
       });
       const popup = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
