@@ -16,9 +16,9 @@ const reset = seconds => ({ 'x-rate-limit-reset': String(START / 1000 + seconds)
 const timeline = cursor => ({ data: { timeline: { instructions: [{ type: 'TimelineAddEntries', entries: [
   { content: { itemContent: { tweet_results: { result: { __typename: 'Tweet', rest_id: cursor || 'last', legacy: { full_text: 'synthetic', user_id_str: '42' } } } } } },
   ...(cursor ? [{ content: { cursorType: 'Bottom', value: cursor } }] : [])
-] }] } } });
+] }, ...(!cursor ? [{ type: 'TimelineTerminateTimeline', direction: 'Bottom' }] : [])] } } });
 
-async function harness(responses, { store = {}, clock = { now: START }, account = '42', queryId = 'synthetic-id', onSleep, failGet = false, failSet = false, onGet, beforeSet, afterSet } = {}) {
+export async function harness(responses, { store = {}, clock = { now: START }, account = '42', queryId = 'synthetic-id', onSleep, failGet = false, failSet = false, onGet, beforeSet, afterSet, requestBudget = 50 } = {}) {
   const calls = [], sleeps = [];
   let responseIndex = 0, initialized = false;
   class ClockDate extends Date {
@@ -37,8 +37,9 @@ async function harness(responses, { store = {}, clock = { now: START }, account 
     } } },
     fetch: async (url, options) => {
       calls.push({ at: clock.now, operation: url.pathname.split('/').at(-1), method: options.method });
-      assert(calls.length <= 50, 'finite synthetic request budget');
-      const spec = await responses[responseIndex++];
+      assert(calls.length <= requestBudget, 'finite synthetic request budget');
+      const index = responseIndex++;
+      const spec = await (typeof responses === 'function' ? responses(index, url, options) : responses[index]);
       assert(spec, `unplanned synthetic request ${calls.length}`);
       const headers = Object.fromEntries(Object.entries(spec.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
       return { status: spec.status ?? 200, headers: { get: name => headers[name.toLowerCase()] ?? null }, json: async () => clone(spec.body) };
@@ -52,7 +53,7 @@ async function harness(responses, { store = {}, clock = { now: START }, account 
   return { api, calls, sleeps, store, clock, schedule, Date: ClockDate, runtime, storage: context.chrome.storage, document: context.document };
 }
 
-async function scan(h, { useApi = true, type = 'tweets' } = {}) {
+export async function scan(h, { useApi = true, type = 'tweets' } = {}) {
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
   const globals = { window, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {} }, chrome: { runtime: h.runtime, storage: h.storage },
     document: { cookie: h.document.cookie, hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } };
@@ -72,7 +73,7 @@ async function scan(h, { useApi = true, type = 'tweets' } = {}) {
 }
 
 // Execute the complete real workers; synthetic DOM nodes only support rendering overlays.
-async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets' } = {}) {
+export async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets' } = {}) {
   const node = () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, remove() {}, appendChild() {}, setAttribute() {},
     querySelector: () => node(), getElementById: () => node(), attachShadow: () => node() });
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
@@ -150,15 +151,15 @@ export async function testApiLimits() {
       assert.equal(result.domStarted, false); assert.match(result.issue, /cooldown/i); assert.equal(h.calls.length, 0);
     });
   }
-  for (const selected of [false, true]) for (const active of [false, true]) await check(`API unavailable ${selected ? 'selected' : 'quick'} delete ${active ? 'stops on known cooldown' : 'preserves unrestricted fallback'}`, async () => {
+  for (const selected of [false, true]) for (const active of [false, true]) await check(`API unavailable ${selected ? 'selected' : 'quick'} delete ${active ? 'stops on known cooldown' : 'offers a new explicit job without automatic DOM'}`, async () => {
     const store = active ? { 'xbcApiCooldown:42:DeleteTweet:claim:unavailable': { until: START + 3600000, blocked: true } } : {};
     const h = await harness([], { store }); h.api.init = async () => ({ ok: false, reason: 'synthetic unavailable' });
-    const x = await deletion(h, selected); assert.equal(!!x.apiFallback, !active); assert.match(x.issue || '', active ? /suspended/ : /^$/); assert.equal(h.calls.length, 0);
+    const x = await deletion(h, selected); assert.equal(!!x.apiFallback, false); assert.equal(x.domStarted, false); assert.match(x.issue || '', active ? /suspended/ : /turn off API/); assert.equal(h.calls.length, 0);
   });
-  for (const active of [false, true]) await check(`API unavailable scanner ${active ? 'stops on known cooldown' : 'preserves unrestricted fallback'}`, async () => {
+  for (const active of [false, true]) await check(`API unavailable scanner ${active ? 'stops on known cooldown' : 'offers a new explicit job without automatic DOM'}`, async () => {
     const store = active ? { 'xbcApiCooldown:42:UserTweets:claim:unavailable': { until: START + 3600000 } } : {};
     const h = await harness([], { store }); h.api.init = async () => ({ ok: false, reason: 'synthetic unavailable' });
-    const p = await scan(h); assert.equal(!!p.apiFallback, !active); if (active) assert.match(p.issue, /suspended/); assert.equal(h.calls.length, 0);
+    const p = await scan(h); assert.equal(!!p.apiFallback, false); assert.equal(p.domStarted, false); assert.match(p.issue, active ? /suspended/ : /turn off API/); assert.equal(h.calls.length, 0);
   });
   const quickActions = {
     delete: ['UserTweets', 'DeleteTweet'], deleteReplies: ['UserTweetsAndReplies', 'DeleteTweet'], unrepost: ['UserTweets', 'DeleteRetweet'],
@@ -201,13 +202,13 @@ export async function testApiLimits() {
       assert.equal(h.calls.length, selected ? 1 : 2);
     });
   }
-  await check('plain refusal without a valid deadline preserves direct/scanner/delete fallback contracts', async () => {
+  await check('plain refusal stays refused in client and offers a new scan/job without automatic DOM', async () => {
     const spec = { status: 403, headers: { 'Retry-After': 'invalid', 'x-rate-limit-remaining': 'invalid' }, body: {} };
     const direct = await harness([spec]); assert.equal((await direct.api.deleteTweet('synthetic')).kind, 'refused');
-    const h = await harness([spec]); const p = await scan(h); assert.equal(p.mode, 'dom'); assert(!!p.apiFallback);
+    const h = await harness([spec]); const p = await scan(h); assert.equal(p.mode, 'api'); assert.equal(!!p.apiFallback, false); assert.match(p.issue, /turn off API/);
     for (const selected of [false, true]) {
       const x = await deletion(await harness(selected ? [spec] : [{ body: timeline(null) }, spec]), selected);
-      assert.equal(x.mode, 'dom'); assert(!!x.apiFallback);
+      assert.equal(x.mode, 'api'); assert.equal(!!x.apiFallback, false); assert.match(x.issue, /turn off API/);
     }
   });
   await check('Stop during refusal persistence retains cooldown and suppresses fallback', async () => {
@@ -368,7 +369,7 @@ export async function testApiLimits() {
   await check('Stop while paging never requests the next page', async () => {
     let active = true;
     const h = await harness([{ body: timeline('c1') }], { onSleep: () => { active = false; } });
-    for await (const _ of h.api.pages('UserTweets', { isActive: () => active })) { /* consume */ }
+    await assert.rejects(async () => { for await (const _ of h.api.pages('UserTweets', { isActive: () => active })) { /* consume */ } }, e => e.result?.reason === 'cancelled');
     assert.equal(h.calls.length, 1);
   });
   await check('storage read/write failures stop instead of bypassing cooldown', async () => {

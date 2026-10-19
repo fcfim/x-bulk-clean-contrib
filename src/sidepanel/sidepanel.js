@@ -328,19 +328,15 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
       const cooldown = await domCooldown([LIST_OP[type]]);
       if (!active()) return;
       if (cooldown) return finish(`Scan stopped: ${cooldown}`, false);
-      P.apiFallback = reason;
-      console.warn('[Postscrub] API scan unavailable, scrolling instead:', reason);
-      P.interval = null;
-      startDomScan();
+      finish(`Scan interrupted after ${P.items.length} items: ${reason}. Try again with API, or turn off API mode and start a new scan.`, false);
     };
+    P.mode = 'api';
     const ready = await api.init(account);
     if (!active()) return;
     if (!ready.ok || !api.canList(LIST_OP[type])) return fallback(ready.reason || `no ${LIST_OP[type]} operation`);
-    P.mode = 'api';
-    let pages = 0;
+
     try {
       for await (const page of api.pages(LIST_OP[type], { isActive: active, onWait: until => { P.waitUntil = until; } })) {
-        pages++;
         for (const item of toItems(page, ready.me.id)) {
           if (!P.seen.has(item.id)) { P.seen.add(item.id); P.items.push(item); }
         }
@@ -349,11 +345,16 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
       }
     } catch (error) {
       if (!active()) return;
-      if (!pages && error.result?.kind === 'refused') return fallback(error.message);
-      finish(`Scan stopped: ${error.message || error}`, false);
-      return;
+      if (['stop', 'stopped', 'rate'].includes(error.result?.kind)) {
+        finish(`Scan stopped after ${P.items.length} items: ${error.message || error}`, false);
+        return;
+      }
+      return fallback(error.message || 'API scan could not finish');
     }
-    if (active()) finish('Scan complete', true);
+    if (active()) {
+      if (!P.items.length) return fallback('No matching items returned by API (0 items)');
+      finish('Scan complete', true);
+    }
   };
 
   // Kept inside this serialized worker: DOM mode may run without xapi injected.
@@ -730,13 +731,12 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       const cooldown=await domCooldown();
       if(!active())return;
       if(cooldown)return stop(cooldown);
-      X.apiFallback=reason;console.warn('[Postscrub] API mode unavailable, clicking instead:',reason);
-      X.interval=null;startDomLoop();
+      return stop(`API job interrupted after ${X.successCount} items: ${reason}. Try again with API, or turn off API mode and start a new job; review and confirm again.`);
     };
+    X.mode='api';
     const ready=await api.init(account);
     if(!active())return;
     if(!ready.ok)return fallback(ready.reason);
-    X.mode='api';
     const pace=type==='unfollow'?'unfollow':type==='reposts'?'unrepost':'delete';
     let failures=0,gone=0;
     for(const [id,snap] of selected){
@@ -748,7 +748,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       if(result.kind==='ok'){failures=0;recordSuccess(id,snap)}
       else if(result.kind==='gone'){X.processed.add(id);gone++}
       else if(result.kind==='stop'){await stop(result.message);return}
-      else if(result.kind==='refused'&&!X.successCount)return fallback(result.message);
+      else if(result.kind==='refused')return fallback(result.message);
       else if(++failures>=5){await stop(`X API errors: ${result.message||result.kind}`);return}
       await api.sleep(api.pace(pace));
     }

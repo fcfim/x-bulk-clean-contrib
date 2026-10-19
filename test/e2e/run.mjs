@@ -1,7 +1,7 @@
 // End-to-end tests: the real unpacked extension in Chromium, driven through its popup, against
 // the fake x.com in fake-x.mjs. Usage: node test/e2e/run.mjs [scenario-name-filter]
 import { launch, openExtensionPage, storage, waitFor } from './launch.mjs';
-import { createState, installFakeX, fakeQueryIds, ME } from './fake-x.mjs';
+import { createState, installFakeX, fakeQueryIds, ME, scriptedTimeline } from './fake-x.mjs';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
@@ -145,6 +145,12 @@ if (process.argv[2] === '--api-limits') {
   process.exit(0);
 }
 
+if (process.argv[2] === '--api-pagination') {
+  const { testApiPagination } = await import('./api-pagination.mjs');
+  await testApiPagination();
+  process.exit(0);
+}
+
 const BUTTONS = { delete: 'startDelete', unrepost: 'startUnrepost', unlike: 'startUnlike', bulkUnfollow: 'bulkUnfollow', followAll: 'followAllFollowers', followVerified: 'followVerifiedFollowers' };
 
 async function quickClean(env, action, { apiMode = true } = {}) {
@@ -215,6 +221,109 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true, b
 }
 
 const SCENARIOS = [
+  ...[
+    { name: 'ten empty pages interrupt with empty_streak', expected: 0, complete: false, reason: /10 consecutive pages without new items/, sequence: state => Array.from({ length: 10 }, (_, i) => scriptedTimeline(state, { cursor: `empty-${i}` })) },
+    { name: 'nine empty pages still reach a post', expected: 1, complete: true, sequence: state => [...Array.from({ length: 9 }, (_, i) => scriptedTimeline(state, { cursor: `empty-${i}` })), scriptedTimeline(state, { indices: [0], end: true })] },
+    { name: 'empty advancing pages reach a later post', expected: 1, complete: true, sequence: state => [scriptedTimeline(state, { cursor: 'c1' }), scriptedTimeline(state, { cursor: 'c2' }), scriptedTimeline(state, { indices: [0], end: true })] },
+    { name: 'duplicate pages reach a later distinct post', expected: 2, complete: true, sequence: state => [scriptedTimeline(state, { indices: [0], cursor: 'c1' }), scriptedTimeline(state, { indices: [0], cursor: 'c2' }), scriptedTimeline(state, { indices: [0], cursor: 'c3' }), scriptedTimeline(state, { indices: [1], end: true })] },
+    { name: 'cursor cycle interrupts with partial items', expected: 2, complete: false, sequence: state => [scriptedTimeline(state, { indices: [0], cursor: 'c1' }), scriptedTimeline(state, { indices: [1], cursor: 'c2' }), scriptedTimeline(state, { indices: [0], cursor: 'c1' })] },
+    { name: 'stalled cursor interrupts', expected: 1, complete: false, sequence: state => [scriptedTimeline(state, { indices: [0], cursor: 'c1' }), scriptedTimeline(state, { indices: [0], cursor: 'c1' })] },
+    { name: 'missing cursor interrupts', expected: 1, complete: false, sequence: state => [scriptedTimeline(state, { indices: [0] })] },
+    { name: 'invalid data is interrupted zero', expected: 0, complete: false, sequence: () => [{ data: {} }] },
+    { name: 'refusal offers a new scan without automatic DOM', expected: 0, complete: false, sequence: () => [{ status: 400, body: {} }] },
+    { name: 'server error preserves earlier items', expected: 1, complete: false, sequence: state => [scriptedTimeline(state, { indices: [0], cursor: 'c1' }), ...Array.from({ length: 4 }, () => ({ status: 500, body: { errors: [{ code: 130, message: 'synthetic server error' }] } }))] },
+    { name: 'explicit empty end is inconclusive zero', expected: 0, complete: false, sequence: state => [scriptedTimeline(state, { end: true })] },
+    { name: 'partial response preserves items and interrupts', expected: 1, complete: false, sequence: state => [scriptedTimeline(state, { indices: [0], end: true, errors: [{ code: 999, message: 'synthetic partial response' }] })] }
+  ].map(({ name, expected, complete, sequence, reason }) => ({
+    name: `pagination: scan ${name}`,
+    state: { own: 2 },
+    async run(env, state) {
+      const xTab = env.context.pages().find(page => page.url().startsWith('https://x.com/'));
+      await xTab.goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
+      const before = state.calls.filter(c => c.op === 'UserTweets').length;
+      const responses = sequence(state); state.misbehave.responses.UserTweets = responses.map(body => typeof body.status === 'number' ? body : { status: 200, body });
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.locator('#startScan').click();
+      await panel.waitForFunction(() => /Scan complete|Scan interrupted|Scan stopped/.test(document.getElementById('scanState').textContent), null, { timeout: 100000 });
+      const result = await env.worker.evaluate(async () => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { const p = window.__xbcPreview; return { mode: p.mode, done: p.done, items: p.items.length, issue: p.issue, fallback: p.apiFallback || null, running: !!p.interval }; } });
+        return r.result;
+      });
+      await panel.close();
+      return [
+        ['expected items and terminal state', result.items === expected && result.done === complete && !result.running, result],
+        ['completion label only for proven nonzero end', complete ? result.issue === 'Scan complete' : !/Scan complete/.test(result.issue) && result.issue.includes(String(expected)), result.issue],
+        ['API mode retained without DOM fallback or mutations', result.mode === 'api' && !result.fallback && !state.calls.some(c => c.method === 'POST'), result],
+        ['all intended pages requested', state.calls.filter(c => c.op === 'UserTweets').length - before === responses.length, state.calls],
+        ['specific safety reason is preserved when required', !reason || reason.test(result.issue), result.issue]
+      ];
+    }
+  })),
+  {
+    name: 'pagination: Stop during paused page processing prevents the next request',
+    state: { own: 2 },
+    async run(env, state) {
+      const xTab = env.context.pages().find(page => page.url().startsWith('https://x.com/'));
+      await xTab.goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'));
+      const before = state.calls.filter(c => c.op === 'UserTweets').length;
+      let release; const firstPage = new Promise(resolve => { release = resolve; });
+      state.misbehave.responses.UserTweets = [{ status: 200, body: scriptedTimeline(state, { indices: [0], cursor: 'c1' }), waitFor: firstPage }];
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      try {
+        await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+        await panel.locator('#startScan').click();
+        await waitFor(() => state.calls.filter(c => c.op === 'UserTweets').length > before, { label: 'held first API page' });
+        await env.worker.evaluate(async () => {
+          const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { window.__xbcPreview.paused = true; } });
+        });
+        release();
+        await waitFor(() => env.worker.evaluate(async () => {
+          const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+          const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => window.__xbcPreview.items.length === 1 });
+          return r.result;
+        }), { label: 'first parsed item before Stop' });
+        await panel.locator('#stopScan').click();
+        await panel.waitForFunction(() => /stopped by user/i.test(document.getElementById('scanState').textContent));
+        await panel.waitForTimeout(1100);
+        const result = await env.worker.evaluate(async () => {
+          const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+          const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { const p = window.__xbcPreview; return { done: p.done, count: p.items.length, running: !!p.interval }; } });
+          return r.result;
+        });
+        await panel.close();
+        return [
+          ['Stop preserves partial items without completing', !result.done && !result.running && result.count === 1, result],
+          ['no next page or mutation', state.calls.filter(c => c.op === 'UserTweets').length - before === 1 && !state.calls.some(c => c.method === 'POST'), state.calls]
+        ];
+      } finally { release(); }
+    }
+  },
+  ...[
+    { name: 'explicit empty timeline', body: state => scriptedTimeline(state, { end: true }) },
+    { name: 'invalid timeline shape', body: () => ({ data: {} }) }
+  ].map(({ name, body }) => ({
+    name: `pagination: Quick Clean ${name} stops with zero actions`,
+    state: { own: 2 },
+    async run(env, state) {
+      // Profile discovery must complete before the fixture is installed for the worker.
+      const xTab = env.context.pages().find(page => page.url().startsWith('https://x.com/'));
+      state.misbehave.responses.UserTweets = [];
+      await xTab.goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'));
+      state.misbehave.responses.UserTweets = [{ status: 200, body: body(state) }];
+      const r = await quickClean(env, 'delete');
+      return [
+        ['job interrupted with zero recorded actions', r.job.status === 'interrupted' && r.job.total === 0 && !/^Finished/.test(r.worker.issue), r.job],
+        ['no automatic deletion or click fallback', r.worker.mode === 'api' && !r.worker.apiFallback && !state.calls.some(c => c.op === 'DeleteTweet' || c.op === 'dom-delete') && state.tweets.length === 2, r.worker],
+        ['explicit new choice offered', /turn off API.*new job/.test(r.worker.issue), r.worker.issue]
+      ];
+    }
+  })),
   ...[
     { name: 'active', account: ME.id, offset: 3600000, blocked: false, stops: true },
     { name: 'blocked', account: ME.id, offset: 3600000, blocked: true, stops: true },
@@ -607,29 +716,34 @@ const SCENARIOS = [
     }
   },
   {
-    name: 'falls back to clicking when X refuses the API',
+    name: 'API refusal requires a new confirmed click-mode job',
     state: { own: 5 },
     setup: (state) => { state.misbehave.refuse.DeleteTweet = 404; },
     async run(env, state) {
       const r = await quickClean(env, 'delete');
+      const beforeChoice = { remaining: state.tweets.length, dom: state.calls.filter(c => c.op === 'dom-delete').length };
+      const manual = await quickClean(env, 'delete', { apiMode: false });
       return [
-        ['fell back to click mode', r.worker?.mode === 'dom' && !!r.worker.apiFallback, r.worker],
-        ['all 5 deleted by clicking', state.tweets.length === 0 && state.calls.filter(c => c.op === 'dom-delete').length === 5, state.calls.filter(c => c.op === 'dom-delete').length],
-        ['history: 5 records', r.job.total === 5, r.job]
+        ['refusal interrupts without automatic DOM', r.worker?.mode === 'api' && !r.worker.apiFallback && r.job.status === 'interrupted' && r.job.total === 0, r],
+        ['choice mentions API off and new job', /turn off API.*new job/.test(r.worker.issue), r.worker.issue],
+        ['all posts untouched before explicit new choice', beforeChoice.remaining === 5 && beforeChoice.dom === 0, beforeChoice],
+        ['new confirmed click job deletes all 5', manual.worker.mode === 'dom' && state.tweets.length === 0 && state.calls.filter(c => c.op === 'dom-delete').length === 5, manual],
+        ['new history has 5 records', manual.job.total === 5, manual.job]
       ];
     }
   },
   {
-    name: 'falls back when X requires a signed session (session binding)',
+    name: 'signed-session refusal stops without automatic click fallback',
     state: { own: 2, retweets: 3 },
     setup: (state) => { state.misbehave.binding.DeleteRetweet = true; },
     async run(env, state) {
       const r = await quickClean(env, 'unrepost');
       return [
-        ['fell back to click mode', r.worker?.mode === 'dom', r.worker],
-        ['reason mentions the signed session', /signed session/.test(r.worker?.apiFallback || ''), r.worker?.apiFallback],
+        ['API job interrupted without automatic DOM', r.worker?.mode === 'api' && !r.worker.apiFallback && r.job.status === 'interrupted', r.worker],
+        ['reason mentions the signed session', /signed session/.test(r.worker?.issue || ''), r.worker?.issue],
         ['no repost removed through the API', state.tweets.filter(t => t.retweetOf).length === 3, state.tweets.length],
-        ['the refused DeleteRetweet was tried once, then no more', state.calls.filter(c => c.op === 'DeleteRetweet').length === 1]
+        ['the refused DeleteRetweet was tried once, then no more', state.calls.filter(c => c.op === 'DeleteRetweet').length === 1],
+        ['manual choice requires a new confirmed job', /turn off API.*new job/.test(r.worker.issue) && !state.calls.some(c => c.op === 'dom-delete'), r.worker.issue]
       ];
     }
   },
