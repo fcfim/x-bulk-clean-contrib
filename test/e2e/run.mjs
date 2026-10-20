@@ -169,7 +169,7 @@ async function quickClean(env, action, { apiMode = true } = {}) {
   const started = Date.now();
   const job = await waitFor(async () => {
     const history = (await storage(env.worker, ['jobHistory'])).jobHistory || [];
-    return history.length > before ? history[0] : null;
+    return history.length > before && history[0]?.status !== 'running' ? history[0] : null;
   }, { timeout: 120000, label: `${action} job to finish` });
   const worker = await env.worker.evaluate(async () => {
     const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
@@ -209,7 +209,7 @@ async function previewAndAct(env, type, { replyScope = 'fast', apiMode = true, b
   await panel.evaluate(() => document.getElementById('confirmDelete').click());
   const job = await waitFor(async () => {
     const history = (await storage(env.worker, ['jobHistory'])).jobHistory || [];
-    return history.length > before ? history[0] : null;
+    return history.length > before && history[0]?.status !== 'running' ? history[0] : null;
   }, { timeout: 120000, label: `selected ${type} job to finish` });
   const worker = await env.worker.evaluate(async () => {
     const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
