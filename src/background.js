@@ -17,8 +17,21 @@ async function updateSidePanel(tabId, url) {
   } catch (_) {}
 }
 
-chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.url || info.status === 'complete') updateSidePanel(tabId, tab.url);
+  // A reload kills the job's worker before it can call stopAll, so give the tab back to
+  // Memory Saver here. X's own pushState navigations also report 'loading' without touching
+  // the worker, so the tab is released only when no running worker answers in it; 'complete'
+  // checks again once a reloaded page has replaced the old one.
+  if (info.status === 'loading' || info.status === 'complete') {
+    const key = `jobTab_${tabId}`;
+    if (!(await chrome.storage.session.get([key]))[key]) return;
+    const alive = await chrome.scripting.executeScript({ target: { tabId }, func: () => !!window.__xCleaner?.interval })
+      .then(([result]) => result?.result === true, () => false);
+    if (alive) return;
+    await chrome.storage.session.remove([key]);
+    chrome.tabs.update(tabId, { autoDiscardable: true }).catch(() => {});
+  }
 });
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
@@ -29,8 +42,11 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 });
 
 chrome.tabs.onRemoved.addListener(async tabId => {
-  const stored = await chrome.storage.local.get(['activePreviewSession']);
+  const stored = await chrome.storage.local.get(['activePreviewSession', 'activeTabId']);
   if (stored.activePreviewSession?.tabId === tabId) await chrome.storage.local.remove(['activePreviewSession']);
+  // The job died with its tab; without this the popup stays on "running".
+  if (stored.activeTabId === tabId) await chrome.storage.local.remove(['activeAction', 'activeTabId', 'startTime', 'actionStats']);
+  await chrome.storage.session.remove([`jobTab_${tabId}`]);
 });
 
 // Cleanup workers run inside the X tab, where Chrome throttles timers once the tab is hidden.
@@ -49,6 +65,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'xbc:job' && sender.tab?.id != null) {
     // Memory Saver would otherwise discard the background tab and kill the job.
     chrome.tabs.update(sender.tab.id, { autoDiscardable: !message.running }).catch(() => {});
+    // Remember the job's tab (popup and side panel jobs alike) for onUpdated and onRemoved.
+    const key = `jobTab_${sender.tab.id}`;
+    (message.running ? chrome.storage.session.set({ [key]: true }) : chrome.storage.session.remove([key])).catch(() => {});
     sendResponse(true);
   }
 });

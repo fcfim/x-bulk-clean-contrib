@@ -148,6 +148,9 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
       if (state.misbehave.binding[op]) return json(route, 401, { errors: [{ code: 32, message: 'Could not authenticate you.' }] }, { 'x-tfe-auth-result-code': '3071' });
       if (state.misbehave.refuse[op]) return json(route, state.misbehave.refuse[op], {});
       state.mutations++;
+      // Opt-in: misbehave.hold = { after, released } holds every GraphQL mutation past `after`
+      // until the `released` promise settles, so a test can act while a job is mid-run.
+      if (state.misbehave.hold && state.mutations > state.misbehave.hold.after) await state.misbehave.hold.released;
       if (state.misbehave.rateLimitAfter != null && state.mutations === state.misbehave.rateLimitAfter + 1) {
         const reset = Math.ceil(Date.now() / 1000) + state.misbehave.rateLimitSeconds;
         return json(route, 429, { errors: [{ code: 88, message: 'Rate limit exceeded.' }] }, { 'x-rate-limit-reset': String(reset), 'x-rate-limit-remaining': '0' });
