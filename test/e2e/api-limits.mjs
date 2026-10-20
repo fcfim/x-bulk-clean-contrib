@@ -55,7 +55,7 @@ export async function harness(responses, { store = {}, clock = { now: START }, a
 
 export async function scan(h, { useApi = true, type = 'tweets' } = {}) {
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
-  const globals = { window, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {} }, chrome: { runtime: h.runtime, storage: h.storage },
+  const globals = { window, location: { pathname: '/synthetic_me' }, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {} }, chrome: { runtime: h.runtime, storage: h.storage },
     document: { cookie: h.document.cookie, hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } };
   const definitions = vm.createContext({ ...globals });
   vm.runInContext(panelSource, definitions);
@@ -77,7 +77,7 @@ export async function deletion(h, selected = false, { useApi = true, action = 'd
   const node = () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, remove() {}, appendChild() {}, setAttribute() {},
     querySelector: () => node(), getElementById: () => node(), attachShadow: () => node() });
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
-  const globals = { window, __xbcApi: useApi ? h.api : undefined, Date: h.Date, Math, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, navigator: {}, crypto: { randomUUID: () => `synthetic-job-${++syntheticUuid}` },
+  const globals = { window, location: { pathname: '/synthetic_me' }, __xbcApi: useApi ? h.api : undefined, Date: h.Date, Math, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, navigator: {}, crypto: { randomUUID: () => `synthetic-job-${++syntheticUuid}` },
     console: { warn() {}, info() {} }, chrome: { runtime: h.runtime, storage: h.storage },
     document: { cookie: h.document.cookie, body: node(), hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, createElement: node, getElementById: () => null,
       querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } };
