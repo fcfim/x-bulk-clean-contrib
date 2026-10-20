@@ -289,7 +289,11 @@ function runWorker(action, performanceMode, account, useApi = false) {
     startedAt: Date.now(),
     jobId: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     historySaved: false,
-    historyPersisted: false
+    historyPersisted: false,
+    checkpointCount: 0,
+    lastCheckpointAt: 0,
+    checkpointing: null,
+    checkpointPending: false
   };
 
   // Chrome throttles timers in hidden tabs (after ~5 min, to one wake-up per minute), which
@@ -614,10 +618,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
     return false;
   }
 
-  async function persistJob(reason) {
-    if (X.historySaved) return;
-    X.historySaved = true;
-    const completedAt = Date.now();
+  function jobSummary(status, statusText, at) {
     const counts = {
       tweets: X.backup.tweets.length,
       replies: X.backup.replies.length,
@@ -627,12 +628,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
       unfollows: X.backup.unfollows.length
     };
     const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
-    const status = /rate.?limit/i.test(reason || '')
-      ? 'rate_limited'
-      : /^Finished/i.test(reason || '')
-      ? 'completed'
-      : /Stopped by user/i.test(reason || '') ? 'stopped' : 'interrupted';
-    const summary = {
+    return {
       id: X.jobId,
       action,
       account: {
@@ -641,25 +637,61 @@ function runWorker(action, performanceMode, account, useApi = false) {
         avatarUrl: account?.avatarUrl || ''
       },
       startedAt: X.startedAt,
-      completedAt,
-      durationMs: completedAt - X.startedAt,
+      ...(status === 'running' ? { checkpointAt: at } : { completedAt: at }),
+      durationMs: at - X.startedAt,
       status,
-      statusText: reason || 'Action finished',
+      statusText,
       total,
       counts
     };
+  }
+
+  async function writeJob(summary) {
+    const stored = await chrome.storage.local.get(['jobHistory']);
+    const history = Array.isArray(stored.jobHistory) ? stored.jobHistory : [];
+    const nextHistory = [summary, ...history.filter(job => job?.id !== X.jobId)];
+    await chrome.storage.local.set({
+      jobHistory: nextHistory,
+      [`job_${X.jobId}`]: { ...summary, backup: X.backup }
+    });
+  }
+
+  async function persistJob(reason) {
+    if (X.historySaved) return;
+    X.historySaved = true;
+    // A checkpoint still being written must land before the final record, never after it.
+    await X.checkpointing;
+    const status = /rate.?limit/i.test(reason || '')
+      ? 'rate_limited'
+      : /^Finished/i.test(reason || '')
+      ? 'completed'
+      : /Stopped by user/i.test(reason || '') ? 'stopped' : 'interrupted';
     try {
-      const stored = await chrome.storage.local.get(['jobHistory']);
-      const history = Array.isArray(stored.jobHistory) ? stored.jobHistory : [];
-      const nextHistory = [summary, ...history.filter(job => job?.id !== X.jobId)];
-      await chrome.storage.local.set({
-        jobHistory: nextHistory,
-        [`job_${X.jobId}`]: { ...summary, backup: X.backup }
-      });
+      await writeJob(jobSummary(status, reason || 'Action finished', Date.now()));
       X.historyPersisted = true;
     } catch (error) {
       X.historySaveError = error?.message || 'Could not save job history';
     }
+  }
+
+  // Saves the job as 'running' every 10 actions or 30 s, so a reload, a closed tab or a crash
+  // keeps what was already done. One write at a time, never awaited by the job; a request made
+  // while one is in flight is written when it finishes. The final record replaces it.
+  function checkpointJob() {
+    if (X.historySaved) return;
+    const now = Date.now();
+    if (X.successCount - X.checkpointCount < 10 && now - (X.lastCheckpointAt || X.startedAt) < 30000) return;
+    X.checkpointCount = X.successCount;
+    X.lastCheckpointAt = now;
+    if (X.checkpointing) { X.checkpointPending = true; return; }
+    X.checkpointing = (async () => {
+      do {
+        X.checkpointPending = false;
+        if (X.historySaved) break;
+        try { await writeJob(jobSummary('running', 'Running', Date.now())); } catch (_) {}
+      } while (X.checkpointPending);
+      X.checkpointing = null;
+    })();
   }
 
   async function stopAll(reason) {
@@ -685,6 +717,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   async function bumpAndCheckCap() {
     X.successCount++;
+    checkpointJob();
   }
 
   async function clickConfirm(testId, attempts = 10) {
@@ -861,6 +894,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
     else if (action === 'bulkUnfollow') { X.stats.unfollows++; X.backup.unfollows.push({ ...userRow, action: 'unfollowed', actionAt: at }); }
     else { X.stats.follows++; X.backup.follows.push({ ...userRow, action: action === 'followVerified' ? 'followed_verified' : 'followed_all', actionAt: at }); }
     X.successCount++;
+    checkpointJob();
   }
 
   async function runApiJob(api) {
@@ -1312,6 +1346,7 @@ function readWorkerState() {
   const X = window.__xCleaner;
   if (!X) return null;
   return {
+    jobId: X.jobId || null,
     action: X.action,
     stats: X.stats,
     running: !!X.interval,
@@ -1852,6 +1887,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   await renderCurrentAccount();
+  try { await reconcileInterruptedJobs(readWorkerState); } catch (_) {}
   await renderRecentJobs();
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.jobHistory) renderRecentJobs();

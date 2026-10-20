@@ -942,7 +942,8 @@ const SCENARIOS = [
         ['the other 4 posts remain', state.tweets.length === 4, state.tweets.length]
       ];
     }
-  }
+  },
+  ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 
 const filter = process.argv[2];

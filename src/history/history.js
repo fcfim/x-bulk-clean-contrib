@@ -315,5 +315,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.jobHistory) loadHistory();
   });
+  try { await reconcileInterruptedJobs(); } catch (_) {}
   await loadHistory();
 });

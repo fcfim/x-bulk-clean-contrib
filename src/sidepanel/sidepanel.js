@@ -472,6 +472,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     backup: { tweets: [], replies: [], unliked: [], unreposted: [], follows: [], unfollows: [] },
     processed: new Set(), interval: null, keepAlive: null, busy: false, issue: null,
     emptyCycles: 0, successCount: 0, startedAt: Date.now(), historySaved: false, historyPersisted: false,
+    checkpointCount: 0, lastCheckpointAt: 0, checkpointing: null, checkpointPending: false,
     jobId: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     overlayHost: null, overlayTimer: null, performanceStyle: null
   };
@@ -598,19 +599,45 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     return false;
   };
   const counts = () => ({ tweets: X.backup.tweets.length, replies: X.backup.replies.length, unliked: 0, unreposted: X.backup.unreposted.length, follows: 0, unfollows: X.backup.unfollows.length });
+  const jobSummary = (status, statusText, at) => {
+    const jobCounts = counts();
+    const total = jobCounts.tweets + jobCounts.replies + jobCounts.unreposted + jobCounts.unfollows;
+    return { id: X.jobId, action, account, startedAt: X.startedAt, ...(status === 'running' ? { checkpointAt: at } : { completedAt: at }), durationMs: at-X.startedAt, status, statusText, total, counts: jobCounts, selectedTotal: selected.size, skipped: Math.max(0, selected.size-total) };
+  };
+  const writeJob = async summary => {
+    const stored = await chrome.storage.local.get(['jobHistory']);
+    const history = Array.isArray(stored.jobHistory) ? stored.jobHistory : [];
+    await chrome.storage.local.set({ jobHistory: [summary, ...history.filter(job => job?.id !== X.jobId)], [`job_${X.jobId}`]: { ...summary, backup: X.backup } });
+  };
   const persist = async reason => {
     if (X.historySaved) return;
     X.historySaved = true;
-    const completedAt = Date.now(), jobCounts = counts();
-    const total = jobCounts.tweets + jobCounts.replies + jobCounts.unreposted + jobCounts.unfollows;
+    // A checkpoint still being written must land before the final record, never after it.
+    await X.checkpointing;
     const status = /rate.?limit/i.test(reason || '') ? 'rate_limited' : /^Finished/i.test(reason || '') ? 'completed' : /Stopped by user/i.test(reason || '') ? 'stopped' : 'interrupted';
-    const summary = { id: X.jobId, action, account, startedAt: X.startedAt, completedAt, durationMs: completedAt-X.startedAt, status, statusText: reason || 'Action finished', total, counts: jobCounts, selectedTotal: selected.size, skipped: Math.max(0, selected.size-total) };
     try {
-      const stored = await chrome.storage.local.get(['jobHistory']);
-      const history = Array.isArray(stored.jobHistory) ? stored.jobHistory : [];
-      await chrome.storage.local.set({ jobHistory: [summary, ...history.filter(job => job?.id !== X.jobId)], [`job_${X.jobId}`]: { ...summary, backup: X.backup } });
+      await writeJob(jobSummary(status, reason || 'Action finished', Date.now()));
       X.historyPersisted = true;
     } catch (error) { X.historySaveError = error?.message || 'History save failed'; }
+  };
+  // Saves the job as 'running' every 10 actions or 30 s, so a reload, a closed tab or a crash
+  // keeps what was already done. One write at a time, never awaited by the job; a request made
+  // while one is in flight is written when it finishes. The final record replaces it.
+  const checkpoint = () => {
+    if (X.historySaved) return;
+    const now = Date.now();
+    if (X.successCount - X.checkpointCount < 10 && now - (X.lastCheckpointAt || X.startedAt) < 30000) return;
+    X.checkpointCount = X.successCount;
+    X.lastCheckpointAt = now;
+    if (X.checkpointing) { X.checkpointPending = true; return; }
+    X.checkpointing = (async () => {
+      do {
+        X.checkpointPending = false;
+        if (X.historySaved) break;
+        try { await writeJob(jobSummary('running', 'Running', Date.now())); } catch (_) {}
+      } while (X.checkpointPending);
+      X.checkpointing = null;
+    })();
   };
   const updateOverlay = () => {
     const shadow = X.overlayHost?.shadowRoot;
@@ -667,7 +694,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       const row={id,date:snap.date||'',text:snap.text||'',author:snap.author||me||'',url:snap.url||'',classification:snap.classification||'',action:type==='replies'&&!standalone?'deleted_reply':'deleted',actionAt};
       if(type==='replies'){X.stats.repliesDeleted++;if(standalone)X.backup.tweets.push(row);else X.backup.replies.push(row)}else{X.stats.deleted++;X.backup.tweets.push(row)}
     }
-    X.successCount++;updateOverlay();
+    X.successCount++;checkpoint();updateOverlay();
   };
   const tick=async()=>{
     if(X.busy||!X.interval)return;X.busy=true;
