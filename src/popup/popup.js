@@ -305,19 +305,31 @@ function runWorker(action, performanceMode, account, useApi = false) {
     const done = () => { if (!settled) { settled = true; resolve(); } };
     setTimeout(done, ms);
     try {
-      chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); });
+      // An error reply comes at once (the extension context went away): the local timer covers it.
+      chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { if (!chrome.runtime.lastError) done(); });
     } catch (_) {}
   });
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
 
   // Sequential replacement for setInterval, paced by sleep() so it keeps running in a
   // background tab. X.interval stays truthy while the job runs; stopAll() clears it.
+  // A step that throws is logged, and three in a row stop the job with the error as its reason.
   function runLoop(tick, periodMs) {
     const token = X.interval = { loop: true };
     (async () => {
+      let failures = 0;
       while (X.interval === token) {
         const started = Date.now();
-        try { await tick(); } catch (_) {}
+        try {
+          await tick();
+          failures = 0;
+        } catch (error) {
+          console.warn('[Postscrub] click-mode step failed:', error);
+          if (++failures >= 3 && X.interval === token) {
+            await stopAll(`Job stopped after ${failures} errors in a row: ${String(error?.message || error).slice(0, 200)}`);
+            break;
+          }
+        }
         if (X.interval !== token) break;
         await sleep(Math.max(250, periodMs - (Date.now() - started)));
       }
