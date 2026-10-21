@@ -33,11 +33,6 @@ function formatDuration(durationMs) {
   return minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
 }
 
-function csvEscape(value) {
-  const text = value == null ? '' : String(value);
-  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-}
-
 function flattenBackup(backup = {}) {
   const rows = [];
   const addPost = (type, item) => rows.push({
@@ -76,13 +71,7 @@ function downloadJob(job) {
   rows.forEach(row => lines.push([
     row.type, row.date, row.content, row.person, row.displayName, row.url, row.action, row.actionAt
   ].map(csvEscape).join(',')));
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = `postscrub_${job.action || 'job'}_${new Date(job.completedAt || Date.now()).toISOString().slice(0, 10)}.csv`;
-  anchor.click();
-  URL.revokeObjectURL(url);
+  downloadCsv(lines, `postscrub_${job.action || 'job'}_${new Date(job.completedAt || Date.now()).toISOString().slice(0, 10)}.csv`);
 }
 
 async function downloadAllHistory() {
@@ -97,13 +86,7 @@ async function downloadAllHistory() {
     if (!rows.length) lines.push([...jobValues, 'No affected records', '', '', '', '', '', '', ''].map(csvEscape).join(','));
     rows.forEach(row => lines.push([...jobValues, row.type, row.date, row.content, row.person, row.displayName, row.url, row.action, row.actionAt].map(csvEscape).join(',')));
   }
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = `postscrub_history_${new Date().toISOString().slice(0, 10)}.csv`;
-  anchor.click();
-  URL.revokeObjectURL(url);
+  downloadCsv(lines, `postscrub_history_${new Date().toISOString().slice(0, 10)}.csv`);
 }
 
 function makeButton(label, iconId, className, handler) {

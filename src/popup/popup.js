@@ -1685,43 +1685,7 @@ async function pollOnce() {
   }
 }
 
-// === CSV export ===
-
-function csvEscape(s) {
-  const str = (s == null ? '' : String(s));
-  return /[",\n\r]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
-}
-
-function downloadCSV(content, filename) {
-  const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-function exportTweetCSV(rows, headers, filename) {
-  if (!rows?.length) return;
-  const lines = [headers.join(',')];
-  for (const r of rows) {
-    lines.push([r.date, r.text, r.author, r.url, r.action, r.actionAt].map(csvEscape).join(','));
-  }
-  downloadCSV(lines.join('\n'), filename);
-}
-
-function exportUserCSV(rows, filename) {
-  if (!rows?.length) return;
-  const headers = ['Username', 'Display Name', 'Profile URL', 'Action', 'Action Date'];
-  const lines = [headers.join(',')];
-  for (const r of rows) {
-    lines.push([r.username, r.displayName, r.profileUrl, r.action, r.actionAt].map(csvEscape).join(','));
-  }
-  downloadCSV(lines.join('\n'), filename);
-}
+// === CSV export (csvEscape and downloadCsv come from shared/csv.js) ===
 
 function exportAllToCSV(backup, filename) {
   const headers = ['Type', 'Date', 'Content', 'Author/Username', 'Display Name', 'URL', 'Action', 'Action Date'];
@@ -1735,7 +1699,7 @@ function exportAllToCSV(backup, filename) {
   (backup.unreposted || []).forEach(t => push('Unreposted', t.date, t.text, t.author, '', t.url, t.action, t.actionAt));
   (backup.follows || []).forEach(u => push('Followed', '', '', u.username, u.displayName, u.profileUrl, u.action, u.actionAt));
   (backup.unfollows || []).forEach(u => push('Unfollowed', '', '', u.username, u.displayName, u.profileUrl, u.action, u.actionAt));
-  downloadCSV(lines.join('\n'), filename);
+  downloadCsv(lines, filename);
 }
 
 const HISTORY_ACTION_LABELS = {
