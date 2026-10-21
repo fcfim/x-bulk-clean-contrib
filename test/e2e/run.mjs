@@ -1015,6 +1015,8 @@ const SCENARIOS = [
           return [
             ['mode is dom', r.worker?.mode === 'dom', r.worker],
             ...checks(state, own),
+            // "found" counts your own posts whether they were deleted or tried 3 times (VER-824).
+            ['found counts your own posts only', r.worker?.stats.found === own.length, r.worker?.stats],
             ['reposts untouched', state.tweets.filter(t => t.retweetOf).length === 2, state.tweets.length],
             ['history total', r.job.total === (deletes ? own.length : 0), r.job]
           ];
