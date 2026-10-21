@@ -422,6 +422,19 @@ export async function testApiLimits() {
     await assert.rejects(async () => { for await (const _ of h.api.pages('UserTweets', { isActive: () => active })) { /* consume */ } }, e => e.result?.reason === 'cancelled');
     assert.equal(h.calls.length, 1);
   });
+  // The service worker times at most 20 s per sleep request, so a longer API pause is asked in
+  // steps; one request for the whole pause would end after 20 s (D19).
+  await check('a sleep longer than the service worker cap is asked in steps of up to 20 s', async () => {
+    const h = await harness([]);
+    const asked = [];
+    const send = h.runtime.sendMessage;
+    h.runtime.sendMessage = (message, callback) => { if (message.type === 'xbc:sleep') asked.push(message.ms); return send(message, callback); };
+    await h.api.sleep(50000);
+    assert.deepEqual(asked, [20000, 20000, 10000]);
+    asked.length = 0;
+    await h.api.sleep(1500);
+    assert.deepEqual(asked, [1500], 'a short sleep is one request, as before');
+  });
   await check('storage read/write failures stop instead of bypassing cooldown', async () => {
     const read = await harness([], { failGet: true }); assert.equal((await read.api.deleteTweet('synthetic')).kind, 'stop'); assert.equal(read.calls.length, 0);
     const write = await harness([rate(reset(5))], { failSet: true }); assert.equal((await write.api.deleteTweet('synthetic')).kind, 'stop'); assert.equal(write.calls.length, 1);

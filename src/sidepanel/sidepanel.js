@@ -155,13 +155,16 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   };
 
   // Chrome throttles timers in hidden tabs; the service worker times sleeps instead.
-  const sleep = ms => new Promise(resolve => {
+  const sleepStep = ms => new Promise(resolve => {
     let settled = false;
     const done = () => { if (!settled) { settled = true; resolve(); } };
     setTimeout(done, ms);
     // An error reply comes at once (the extension context went away): the local timer covers it.
     try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { if (!chrome.runtime.lastError) done(); }); } catch (_) {}
   });
+  // The service worker times at most 20 s per request (background.js), so a longer sleep is
+  // taken in steps of up to 20 s.
+  const sleep = async ms => { do { const step = Math.min(ms, 20000); await sleepStep(step); ms -= step; } while (ms > 0); };
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
   // X draws tweets and UserCells outside the list being scanned too ("Who to follow" in the
   // sidebar), so the scan only looks inside the main column. No column, no items.
@@ -508,13 +511,16 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     overlayHost: null, overlayTimer: null, performanceStyle: null
   };
   // Chrome throttles timers in hidden tabs; the service worker times sleeps instead.
-  const sleep = ms => new Promise(resolve => {
+  const sleepStep = ms => new Promise(resolve => {
     let settled = false;
     const done = () => { if (!settled) { settled = true; resolve(); } };
     setTimeout(done, ms);
     // An error reply comes at once (the extension context went away): the local timer covers it.
     try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { if (!chrome.runtime.lastError) done(); }); } catch (_) {}
   });
+  // The service worker times at most 20 s per request (background.js), so a longer sleep is
+  // taken in steps of up to 20 s.
+  const sleep = async ms => { do { const step = Math.min(ms, 20000); await sleepStep(step); ms -= step; } while (ms > 0); };
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
   // X draws tweets and UserCells outside the list being cleaned too ("Who to follow" in the
   // sidebar), so click mode only looks inside the main column. No column, no candidates.

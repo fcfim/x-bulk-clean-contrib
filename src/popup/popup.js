@@ -301,7 +301,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
   // Chrome throttles timers in hidden tabs (after ~5 min, to one wake-up per minute), which
   // stalled jobs while the user worked in other tabs. The service worker times each sleep
   // instead; the local timer is only a fallback if the extension context goes away.
-  const sleep = (ms) => new Promise(resolve => {
+  const sleepStep = (ms) => new Promise(resolve => {
     let settled = false;
     const done = () => { if (!settled) { settled = true; resolve(); } };
     setTimeout(done, ms);
@@ -310,6 +310,9 @@ function runWorker(action, performanceMode, account, useApi = false) {
       chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { if (!chrome.runtime.lastError) done(); });
     } catch (_) {}
   });
+  // The service worker times at most 20 s per request (background.js), so a longer sleep is
+  // taken in steps of up to 20 s.
+  const sleep = async (ms) => { do { const step = Math.min(ms, 20000); await sleepStep(step); ms -= step; } while (ms > 0); };
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
 
   // Sequential replacement for setInterval, paced by sleep() so it keeps running in a
