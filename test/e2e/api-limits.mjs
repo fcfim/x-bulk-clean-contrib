@@ -486,6 +486,7 @@ export async function testApiLimits() {
     const h = await harness([], { onSleep: () => { active = false; } });
     const error = await listError(h.api.pages('UserTweetsAndReplies', { isActive: () => active }));
     assert.equal(error?.result?.reason, 'cancelled'); assert.equal(error.result.kind, 'stopped'); assert.equal(h.calls.length, 0);
+    assert(h.clock.now - START < 1000, `the wait ends at the Stop, not after 8 s (${h.clock.now - START} ms)`);
   });
   await check('cache: fallback ids are never cached', async () => {
     const h = await harness([repliesPage]);
@@ -530,7 +531,14 @@ export async function testApiLimits() {
     const error = await listError(h.api.pages('UserTweetsAndReplies'));
     assert.deepEqual({ ...error?.result }, { kind: 'refused', message: 'HTTP 404', operation: 'UserTweetsAndReplies', status: 404, source: 'fallback' });
     const scanned = await scan(await harness([empty404]), { type: 'replies' });
-    assert.equal(scanned.issue, 'Scan interrupted after 0 items: X did not accept the request for UserTweetsAndReplies (HTTP 404, id from fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.');
+    assert.equal(scanned.issue, 'Scan interrupted after 0 items: X did not accept the request for UserTweetsAndReplies (HTTP 404, id source: fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.');
+    assert.equal(scanned.mode, 'api'); assert.equal(scanned.domStarted, false);
+  });
+  await check('errors: a list request that gets no answer from X says so, instead of saying X refused it', async () => {
+    const offline = () => { throw new TypeError('Failed to fetch'); };
+    const scanned = await scan(await harness(offline), { type: 'replies' });
+    assert.match(scanned.issue, /^Scan interrupted after 0 items: The request for UserTweetsAndReplies got no answer from X \(network error, id source: fallback\)/);
+    assert.doesNotMatch(scanned.issue, /did not accept/);
     assert.equal(scanned.mode, 'api'); assert.equal(scanned.domStarted, false);
   });
   await check('logs: an API scan logs its operation sources once, without secrets', async () => {

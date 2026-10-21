@@ -1813,7 +1813,7 @@ const SCENARIOS = [
       const sent = requests.filter(c => !c.fromPage);
       const waited = sent[0] && r.scan ? sent[0].at - r.scan.startedAt : null;
       return [
-        ['the scan ends naming UserTweetsAndReplies, HTTP 404 and the fallback id', r.scan?.issue === 'Scan interrupted after 0 items: X did not accept the request for UserTweetsAndReplies (HTTP 404, id from fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.', r.scan?.issue],
+        ['the scan ends naming UserTweetsAndReplies, HTTP 404 and the fallback id', r.scan?.issue === 'Scan interrupted after 0 items: X did not accept the request for UserTweetsAndReplies (HTTP 404, id source: fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.', r.scan?.issue],
         ['it waited about 8 s for the page, no longer', waited >= 7900 && waited <= 9500, { waited, seconds: r.seconds }],
         ['one request, with the fallback id; the page sent none', sent.length === 1 && sent[0].id === 'fallback' && sent.length === requests.length, requests],
         ['no click scan and no deletion', r.scan?.mode === 'api' && !r.scan.done && !r.scan.running && !state.calls.some(c => /^dom-/.test(c.op || '') || c.method === 'POST') && state.tweets.length === tweets, { mode: r.scan?.mode, done: r.scan?.done, tweets: state.tweets.length }],

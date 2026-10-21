@@ -392,11 +392,14 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
         finish(`Scan stopped after ${P.items.length} items: ${error.message || error}`, false);
         return;
       }
-      // A list request X did not accept: name the operation, the status and where its id came from.
+      // A list request that failed: name the operation, the HTTP status (or a network error) and where its id came from.
       const r = error.result;
       const status = r?.status ? `HTTP ${r.status}` : 'network error';
+      const detail = error.message && error.message !== status ? `: ${error.message}` : '';
       const refused = r?.operation && r.status != null
-        ? `X did not accept the request for ${r.operation} (${status}, id from ${r.source})${error.message && error.message !== status ? `: ${error.message}` : ''}`
+        ? (r.status
+          ? `X did not accept the request for ${r.operation} (${status}, id source: ${r.source})${detail}`
+          : `The request for ${r.operation} got no answer from X (${status}, id source: ${r.source})${detail}`)
         : null;
       return fallback(refused || error.message || 'API scan could not finish');
     }

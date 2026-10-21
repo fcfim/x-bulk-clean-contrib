@@ -10,7 +10,7 @@
 //   2. the operation definitions in the loaded main.js (parsed by the service worker),
 //   3. what 1 or 2 gave on an earlier run (chrome.storage xbcApiCache, each entry with its
 //      source). Entries are saved when found, before any request, so they are not proof that
-//      an id still works; a stored id that X answers with 404 is removed,
+//      an id still works; a stored list id that X answers with 404 is removed,
 //   4. the values of the build this was written against, never saved.
 // A list whose id comes from 3 or 4 first waits briefly for the page's own request (pageListOp).
 (() => {
