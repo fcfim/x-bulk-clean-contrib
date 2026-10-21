@@ -263,7 +263,7 @@ async function ensureProfilePage(action) {
 function runWorker(action, performanceMode, account, useApi = false) {
 
   const prior = window.__xCleaner;
-  if (prior?.interval) return;
+  if (prior?.interval || prior?.finishing > 0) return;
   if (prior) {
     if (prior.keepAlive) clearInterval(prior.keepAlive);
     if (prior.mediaObserver) prior.mediaObserver.disconnect();
@@ -293,7 +293,8 @@ function runWorker(action, performanceMode, account, useApi = false) {
     checkpointCount: 0,
     lastCheckpointAt: 0,
     checkpointing: null,
-    checkpointPending: false
+    checkpointPending: false,
+    finishing: 0
   };
 
   // Chrome throttles timers in hidden tabs (after ~5 min, to one wake-up per minute), which
@@ -702,16 +703,22 @@ function runWorker(action, performanceMode, account, useApi = false) {
     })();
   }
 
+  // Until the final record is written the job still counts as live (X.finishing), so a
+  // reconciliation cannot mark it interrupted, and its tab stays protected until the write lands.
   async function stopAll(reason) {
-    if (X.keepAlive) clearInterval(X.keepAlive);
-    X.interval = null;
-    X.keepAlive = null;
-    cleanUpPerformanceMode();
-    setJobRunning(false);
-    if (reason) X.issue = reason;
-    const historySave = persistJob(reason);
-    finishJobOverlay(reason);
-    await historySave;
+    X.finishing++;
+    try {
+      if (X.keepAlive) clearInterval(X.keepAlive);
+      X.interval = null;
+      X.keepAlive = null;
+      cleanUpPerformanceMode();
+      if (reason) X.issue = reason;
+      const historySave = persistJob(reason);
+      finishJobOverlay(reason);
+      await historySave;
+    } finally {
+      if (--X.finishing === 0) setJobRunning(false);
+    }
   }
   window.__xCleanerStop = () => stopAll('Stopped by user');
 
@@ -1361,7 +1368,7 @@ function readWorkerState() {
     jobId: X.jobId || null,
     action: X.action,
     stats: X.stats,
-    running: !!X.interval,
+    running: !!X.interval || X.finishing > 0,
     mode: X.mode || null,
     apiFallback: X.apiFallback || null,
     waitUntil: X.waitUntil || null,

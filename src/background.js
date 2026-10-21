@@ -26,7 +26,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status === 'loading' || info.status === 'complete') {
     const key = `jobTab_${tabId}`;
     if (!(await chrome.storage.session.get([key]))[key]) return;
-    const alive = await chrome.scripting.executeScript({ target: { tabId }, func: () => !!window.__xCleaner?.interval })
+    // Live as for the workers themselves: running, or still writing its final record.
+    const alive = await chrome.scripting.executeScript({ target: { tabId }, func: () => !!(window.__xCleaner?.interval || window.__xCleaner?.finishing > 0) })
       .then(([result]) => result?.result === true, () => false);
     if (alive) return;
     await chrome.storage.session.remove([key]);

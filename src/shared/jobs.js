@@ -5,7 +5,7 @@
 // Runs in each X tab; the popup passes its own readWorkerState, which returns the same fields.
 function readJobState() {
   const X = window.__xCleaner;
-  return X ? { jobId: X.jobId || null, running: !!X.interval } : null;
+  return X ? { jobId: X.jobId || null, running: !!X.interval || X.finishing > 0 } : null;
 }
 
 async function reconcileInterruptedJobs(probe = readJobState) {
@@ -47,6 +47,11 @@ async function reconcileInterruptedJobs(probe = readJobState) {
     if (!job || !stale.has(job.id) || job.status !== 'running') return job;
     changed++;
     const record = fresh[`job_${job.id}`];
+    // The worker finished after all: the entry takes its final record, without the backup.
+    if (record && record.status !== 'running') {
+      const { backup, ...summary } = record;
+      return summary;
+    }
     if (record?.status === 'running') updates[`job_${job.id}`] = interrupt(record);
     return interrupt(job);
   });
