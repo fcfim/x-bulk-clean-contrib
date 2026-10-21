@@ -1470,6 +1470,19 @@ const SCENARIOS = [
       ];
     }
   },
+  // "found" in click mode counts your own posts, not the reposts of others it skips (VER-824).
+  {
+    name: 'click mode found: reposts of others are skipped and not counted as found',
+    state: { own: 3, retweets: 2 },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['found counts your 3 posts only', r.worker?.stats.found === 3, r.worker?.stats],
+        ['your posts deleted, the reposts untouched', r.worker?.stats.deleted === 3 && state.tweets.length === 2 && state.tweets.every(t => t.retweetOf), state.tweets.map(t => t.id)]
+      ];
+    }
+  },
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 
