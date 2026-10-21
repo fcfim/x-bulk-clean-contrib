@@ -441,6 +441,7 @@ function readPreviewState(includeItems = false) {
     paused: !!P.paused,
     done: !!P.done,
     issue: P.issue,
+    waitUntil: P.waitUntil || null,
     count: P.items.length,
     selectedCount: P.items.filter(item => item.selected).length,
     items: includeItems ? P.items : undefined
@@ -926,7 +927,9 @@ async function startScan() {
   const stored = await chrome.storage.local.get(['activeAction', 'activePreviewSession']);
   if (stored.activeAction) { showError('A cleanup job is already running. Stop it before starting a preview scan.'); return; }
   if (stored.activePreviewSession) {
-    const existing = stored.activePreviewSession.tabId === activeTab?.id ? await executeInTab(readPreviewState, [false]) : { running: true };
+    // The session's tab may have reloaded, navigated or closed since, taking its scan with it.
+    const existing = await chrome.scripting.executeScript({ target: { tabId: stored.activePreviewSession.tabId }, func: readPreviewState, args: [false] })
+      .then(result => result?.[0]?.result, () => null);
     if (existing) { showError('Another Preview & Select session is already active. Reopen or end that session first.'); return; }
     await chrome.storage.local.remove(['activePreviewSession']);
   }
@@ -973,12 +976,12 @@ async function pollPreview() {
     }
     let state = await executeInTab(readPreviewState, [false]);
     if (generation !== pollGeneration) return;
-    if (!state) { stopPolling(); return; }
+    if (!state) { await previewLost(); return; }
     let refreshed = false;
     if ((state.paused || state.done || !state.running) && previewStateKey(state) !== previewSnapshot?.key) {
       const full = await executeInTab(readPreviewState, [true]);
       if (generation !== pollGeneration) return;
-      if (!full) { stopPolling(); return; }
+      if (!full) { await previewLost(); return; }
       // The scanner appends items. Existing local choices remain authoritative while
       // selection writes or this snapshot are in flight.
       const previous = new Map((previewSnapshot?.startedAt === full.startedAt ? previewItems : []).map(item => [item.id, item]));
@@ -993,7 +996,11 @@ async function pollPreview() {
     $('scanCount').textContent = `${state.count || 0}`;
     $('scanCard').classList.toggle('paused', !!state.paused);
     $('scanCard').classList.toggle('done', !state.running);
-    $('scanState').textContent = state.done ? 'Scan complete' : state.paused ? 'Scan paused' : state.running ? `Scanning ${typeLabel(state.type)}` : state.issue || 'Scan stopped';
+    // An API scan waiting out X's rate limit says so, with the time it resumes.
+    const waiting = state.running && !state.paused && state.waitUntil > Date.now();
+    $('scanState').textContent = state.done ? 'Scan complete' : state.paused ? 'Scan paused' : waiting
+      ? `X rate limit · resuming at ${new Date(state.waitUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+      : state.running ? `Scanning ${typeLabel(state.type)}` : state.issue || 'Scan stopped';
     $('pauseScan').textContent = state.done ? 'Scan complete' : state.paused ? 'Resume scan' : 'Pause & review';
     $('pauseScan').disabled = !!state.done || (!state.running && !state.paused);
     $('stopScan').textContent = state.running ? 'Stop scan' : 'New scan';
@@ -1039,15 +1046,44 @@ async function togglePause() {
   await pollPreview();
 }
 
+// Back to the setup, with this tab's session ended and the panel's copy of the scan dropped.
+async function leavePreview() {
+  stopPolling();
+  // A session another tab has started since is not this panel's to end.
+  const { activePreviewSession } = await chrome.storage.local.get(['activePreviewSession']);
+  if (!activePreviewSession || activePreviewSession.tabId === activeTab?.id) await chrome.storage.local.remove(['activePreviewSession']);
+  previewItems = []; shownItems = PAGE_SIZE; previewSnapshot = null;
+  $('setupSection').style.display = 'block'; $('scanCard').style.display = 'none'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
+}
+
+// The X tab no longer holds the scan the panel was following (it reloaded, left the page, or the
+// scan was ended elsewhere): say so and go back to the setup instead of a panel that no longer moves.
+async function previewLost() {
+  await leavePreview();
+  showError('The scan was lost: the X tab no longer holds it (it reloaded, left the page or the scan was ended). Start a new scan.');
+}
+
+async function resetPreview() {
+  $('newScanDialog').close();
+  stopPolling();
+  // The tab may no longer hold the scan, or be gone.
+  await executeInTab(controlPreviewScanner, ['reset']).catch(() => null);
+  await leavePreview();
+}
+
 async function stopScan() {
   if (cleanupRunning) { await executeInTab(() => window.__xCleanerStop?.()); return; }
-  const state = await executeInTab(readPreviewState, [false]);
-  if (state && !state.running) {
-    stopPolling();
-    await executeInTab(controlPreviewScanner, ['reset']);
-    await chrome.storage.local.remove(['activePreviewSession']);
-    previewItems = []; shownItems = PAGE_SIZE; previewSnapshot = null;
-    $('setupSection').style.display = 'block'; $('scanCard').style.display = 'none'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
+  const state = await executeInTab(readPreviewState, [false]).catch(() => null);
+  // The scan the panel was following is gone from the tab.
+  if (!state && pollTimer) { await previewLost(); return; }
+  if (!state?.running) {
+    // "New scan" does not throw away a review on screen without asking.
+    if (previewItems.length && $('reviewSection').style.display === 'block') {
+      $('newScanCount').textContent = `${previewItems.length} ${previewItems.length === 1 ? 'item' : 'items'}`;
+      $('newScanDialog').showModal();
+      return;
+    }
+    await resetPreview();
     return;
   }
   await executeInTab(controlPreviewScanner, ['stop']);
@@ -1161,16 +1197,29 @@ async function beginSelectedDelete() {
   if (!currentAccount || currentAccount.username.toLowerCase() !== activeAccount.username.toLowerCase()) {
     showError('The active X account changed after scanning. Start a new scan for the current account.'); return;
   }
-  await executeInTab(controlPreviewScanner, ['stop']);
-  await chrome.storage.local.remove(['activePreviewSession']);
-  await ensurePreviewPage(selectedType()); activeTab = await findActiveXTab();
+  // The panel stops following the scan first: the page load below takes the scan away on purpose.
+  stopPolling();
   const action = selectedType() === 'replies' ? 'deleteReplies' : selectedType() === 'reposts' ? 'unrepost' : selectedType() === 'unfollow' ? 'bulkUnfollow' : 'delete';
-  const startedAt = Date.now();
-  await chrome.storage.local.set({ activeAction: action, activeTabId: activeTab.id, startTime: startedAt, actionStats: {} });
-  const useApi = $('previewApi').checked;
-  if (useApi) await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['worker/xapi.js'] });
-  const result = await executeInTab(runSelectedDelete, [selectedType(), selected, activeAccount, $('previewPerformance').checked, useApi]);
-  if (!result?.ok) { await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']); showError(result?.error || 'Could not start selected deletion.'); return; }
+  let result;
+  try {
+    await executeInTab(controlPreviewScanner, ['stop']);
+    await chrome.storage.local.remove(['activePreviewSession']);
+    await ensurePreviewPage(selectedType()); activeTab = await findActiveXTab();
+    const startedAt = Date.now();
+    await chrome.storage.local.set({ activeAction: action, activeTabId: activeTab.id, startTime: startedAt, actionStats: {} });
+    const useApi = $('previewApi').checked;
+    if (useApi) await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['worker/xapi.js'] });
+    result = await executeInTab(runSelectedDelete, [selectedType(), selected, activeAccount, $('previewPerformance').checked, useApi]);
+  } catch (error) {
+    result = { ok: false, error: `Could not start selected deletion: ${error?.message || error}` };
+  }
+  if (!result?.ok) {
+    await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']);
+    showError(result?.error || 'Could not start selected deletion.');
+    // The scan was stopped above: show it so, and let "New scan" start over from the review.
+    $('scanCard').classList.remove('paused'); $('scanCard').classList.add('done'); $('scanState').textContent = 'Scan stopped'; $('pauseScan').style.display = 'none'; $('stopScan').textContent = 'New scan'; $('stopScan').disabled = false;
+    return;
+  }
   cleanupRunning = true; $('reviewSection').style.display='none'; $('stickyBar').style.display='none'; $('scanCard').style.display='block'; $('scanCard').classList.remove('paused','done'); $('scanState').textContent=action==='bulkUnfollow'?'Unfollowing selected':action==='unrepost'?'Removing selected':'Deleting selected'; $('scanCount').textContent='0'; $('pauseScan').style.display='none'; $('stopScan').textContent=action==='bulkUnfollow'?'Stop unfollowing':action==='unrepost'?'Stop removal':'Stop deletion'; $('stopScan').disabled=false; startPolling();
 }
 
@@ -1202,6 +1251,13 @@ async function initialize() {
       if (state.replyScope) document.querySelector(`input[name="replyScope"][value="${state.replyScope}"]`).checked=true;
       updateSetupOptions();
       $('setupSection').style.display='none'; $('scanCard').style.display='block'; startPolling(); if(state.paused||state.done||!state.running)renderReview();
+    } else {
+      // This tab's scan was lost while the panel was closed: end its session and say why.
+      const { activePreviewSession } = await chrome.storage.local.get(['activePreviewSession']);
+      if (activePreviewSession?.tabId === activeTab.id) {
+        await chrome.storage.local.remove(['activePreviewSession']);
+        showError('The last scan was lost: the X tab no longer holds it (it reloaded, left the page or the scan was ended). Start a new scan.');
+      }
     }
   }
 }
@@ -1211,6 +1267,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('selectAll').addEventListener('click',()=>setFilteredSelection('all')); $('selectNone').addEventListener('click',()=>setFilteredSelection('none')); $('invertSelection').addEventListener('click',()=>setFilteredSelection('invert'));
   ['resultSearch','dateFrom','dateTo'].forEach(id=>$(id).addEventListener('input',()=>{shownItems=PAGE_SIZE;renderReview()}));
   $('loadMore').addEventListener('click',()=>{shownItems+=PAGE_SIZE;renderReview()}); $('deleteSelected').addEventListener('click',openDeleteDialog); $('cancelDelete').addEventListener('click',()=>$('deleteDialog').close()); $('confirmDelete').addEventListener('click',beginSelectedDelete);
+  $('cancelNewScan').addEventListener('click',()=>$('newScanDialog').close()); $('confirmNewScan').addEventListener('click',resetPreview);
   $('openHistory').addEventListener('click',()=>chrome.runtime.openOptionsPage());
   $('previewApi').addEventListener('change',()=>chrome.storage.local.set({ apiMode: $('previewApi').checked }));
   document.querySelectorAll('input[name="previewType"],input[name="replyScope"]').forEach(input => input.addEventListener('change', updateSetupOptions));

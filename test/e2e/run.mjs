@@ -26,12 +26,12 @@ async function testPreviewPolling() {
   document.getElementById = id => { if (!nodes.has(id)) nodes.set(id, new Node()); return nodes.get(id); };
   document.createElement = tag => new Node(tag);
   document.createTextNode = text => Object.assign(new Node('text'), { textContent: text });
-  const timers = new Map(); let timerId = 0, fullReads = 0, holdFull = null, holdWrite = null, dispatch = null, stops = 0;
+  const timers = new Map(); let timerId = 0, fullReads = 0, holdFull = null, holdWrite = null, dispatch = null, dispatchResult = { ok: true }, stops = 0;
   const makeItems = n => Array.from({ length: n }, (_, i) => ({ id: `synthetic-${i}`, type: 'tweet', classification: 'tweets', text: `post ${i}`, date: '2024-01-01', selected: true }));
   const window = { __xbcPreview: { startedAt: 1, type: 'tweets', items: makeItems(2000), interval: {}, paused: true, done: false } };
   const context = vm.createContext({ document, window, console, setInterval: fn => { timers.set(++timerId, fn); return timerId; }, clearInterval: id => timers.delete(id),
     chrome: { storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } }, scripting: { executeScript: async ({ func, args = [] }) => {
-      if (func.name === 'runSelectedDelete') { dispatch = args; return [{ result: { ok: true } }]; }
+      if (func.name === 'runSelectedDelete') { dispatch = args; if (dispatchResult instanceof Error) throw dispatchResult; return [{ result: dispatchResult }]; }
       if (func.name === 'updatePreviewSelection' && holdWrite) await holdWrite;
       const result = JSON.parse(JSON.stringify(func(...args) ?? null));
       if (func.name === 'readPreviewState' && args[0]) { fullReads++; if (holdFull) await holdFull; }
@@ -103,7 +103,9 @@ async function testPreviewPolling() {
   await run('stopScan()');
   check('Stop scan refreshes once and stops polling', () => assert.equal(timers.size, 0));
   await run('stopScan()');
-  check('New scan resets the review and its snapshot', () => { assert.equal(run('previewItems.length'), 0); assert.equal(run('previewSnapshot'), null); });
+  check('New scan with a review on screen asks first and keeps the list (VER-816)', () => { assert.equal(document.getElementById('newScanDialog').open, true); assert.ok(run('previewItems.length') > 0); });
+  await run('resetPreview()');
+  check('New scan resets the review and its snapshot', () => { assert.equal(run('previewItems.length'), 0); assert.equal(run('previewSnapshot'), null); assert.equal(document.getElementById('newScanDialog').open, false); });
 
   holdFull = new Promise(resolve => { releaseFull = resolve; });
   window.__xbcPreview = { startedAt: 3, type: 'tweets', items: makeItems(2), interval: {}, paused: true };
@@ -131,6 +133,35 @@ async function testPreviewPolling() {
   check('cleanup progress still updates', () => assert.equal(document.getElementById('scanCount').textContent, '1'));
   await run('stopScan()'); await run('pollPreview()');
   check('Stop deletion still responds and final history state stops polling', () => { assert.equal(stops, 1); assert.equal(timers.size, 0); assert.equal(run('cleanupRunning'), false); });
+  // A lost scan ends only this tab's session, not one another tab has started since (VER-816).
+  const sessionStore = run('chrome.storage.local');
+  let removed = null;
+  sessionStore.remove = async keys => { removed = keys; };
+  sessionStore.get = async () => ({ activePreviewSession: { tabId: 99 } });
+  await run('previewLost()');
+  check("a lost scan leaves the session another tab started", () => { assert.equal(removed, null); assert.equal(document.getElementById('setupSection').style.display, 'block'); });
+  sessionStore.get = async () => ({ activePreviewSession: { tabId: 42 } });
+  await run('previewLost()');
+  check("a lost scan ends its own tab's session", () => assert.equal(removed?.[0], 'activePreviewSession'));
+  // "Stop scan" on a scan the tab no longer holds says it was lost, instead of asking to clear the list.
+  window.__xbcPreview = { startedAt: 9, type: 'tweets', items: makeItems(1), interval: {}, paused: true, done: false };
+  run('startPolling()'); await settle();
+  delete window.__xbcPreview;
+  run('showError("")'); document.getElementById('setupSection').style.display = 'none';
+  await run('stopScan()'); await settle();
+  check('Stop scan on a scan the tab no longer holds says it was lost', () => { assert.match(document.getElementById('errorMessage').textContent, /scan was lost/); assert.equal(document.getElementById('setupSection').style.display, 'block'); assert.equal(document.getElementById('newScanDialog').open, false); assert.equal(timers.size, 0); });
+  // A deletion that fails to start shows the stopped scan and offers "New scan".
+  run('previewItems = [{ id: "synthetic-refused", selected: true, classification: "tweets" }]');
+  dispatchResult = { ok: false, error: 'synthetic refusal' };
+  await run('beginSelectedDelete()'); await settle();
+  check('a deletion that fails to start shows the stopped scan and New scan', () => { assert.equal(document.getElementById('errorMessage').textContent, 'synthetic refusal'); assert.equal(document.getElementById('scanState').textContent, 'Scan stopped'); assert.equal(document.getElementById('stopScan').textContent, 'New scan'); assert.equal(timers.size, 0); assert.equal(run('cleanupRunning'), false); });
+  // An error thrown while starting is reported the same way, and leaves no activeAction behind.
+  run('previewItems = [{ id: "synthetic-thrown", selected: true, classification: "tweets" }]');
+  removed = null;
+  dispatchResult = new Error('synthetic throw');
+  await run('beginSelectedDelete()'); await settle();
+  check('an error thrown while starting a deletion is reported, with the stopped scan and no activeAction', () => { assert.equal(document.getElementById('errorMessage').textContent, 'Could not start selected deletion: synthetic throw'); assert.equal(document.getElementById('scanState').textContent, 'Scan stopped'); assert.equal(document.getElementById('stopScan').textContent, 'New scan'); assert.ok(removed?.includes('activeAction')); assert.equal(run('cleanupRunning'), false); });
+  dispatchResult = { ok: true };
   console.log(`${checks.length}/${checks.length} synthetic polling checks passed (not browser e2e)`);
 }
 
@@ -1482,6 +1513,209 @@ const SCENARIOS = [
         ['mode is dom', r.worker?.mode === 'dom', r.worker],
         ['found counts your 3 posts only', r.worker?.stats.found === 3, r.worker?.stats],
         ['your posts deleted, the reposts untouched', r.worker?.stats.deleted === 3 && state.tweets.length === 2 && state.tweets.every(t => t.retweetOf), state.tweets.map(t => t.id)]
+      ];
+    }
+  },
+  // The Preview panel after the incident of 21/10 (VER-816): a scan the X tab lost is reported and
+  // ends its session, a rate-limit wait is shown, "New scan" asks before clearing a review, and an
+  // API scan is not stopped by moving to another page inside X.
+  {
+    name: 'preview lost: a reload during the scan brings the panel back to the setup, with the reason',
+    state: { own: 12 },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      await waitFor(async () => { const P = await readPreview(env); return P?.running && P.ids.length > 0; }, { timeout: 30000, label: 'scan under way' });
+      await xPage(env).reload();
+      const shown = await panel.waitForFunction(() => document.getElementById('setupSection').style.display === 'block' && /scan was lost/.test(document.getElementById('errorMessage').textContent), null, { timeout: 15000 }).then(() => true, () => false);
+      const ui = await panel.evaluate(() => ({ setup: document.getElementById('setupSection').style.display, card: document.getElementById('scanCard').style.display, error: document.getElementById('errorMessage').textContent, state: document.getElementById('scanState').textContent }));
+      const session = (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null;
+      await panel.evaluate(() => document.getElementById('startScan').click());
+      const restarted = await waitFor(async () => { const P = await readPreview(env); return P?.running && P; }, { timeout: 20000, label: 'new scan' }).catch(() => null);
+      await panel.close();
+      return [
+        ['the panel says the scan was lost and shows the setup', shown, ui],
+        ['the session is ended', session === null, session],
+        ['a new scan starts', !!restarted, restarted]
+      ];
+    }
+  },
+  {
+    name: 'preview lost: reopening the panel after the scan was lost says so and ends the session',
+    state: { own: 12 },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      await waitFor(async () => { const P = await readPreview(env); return P?.running && P.ids.length > 0; }, { timeout: 30000, label: 'scan under way' });
+      await panel.close();
+      await xPage(env).reload();
+      const again = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      const said = await again.waitForFunction(() => /last scan was lost/.test(document.getElementById('errorMessage').textContent), null, { timeout: 10000 }).then(() => true, () => false);
+      const error = await again.evaluate(() => document.getElementById('errorMessage').textContent);
+      const session = (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null;
+      await again.close();
+      return [
+        ['the panel says the last scan was lost', said, error],
+        ['the session is ended', session === null, session]
+      ];
+    }
+  },
+  {
+    name: 'preview lost: a session left by a tab without its scan does not block a new scan',
+    state: { own: 3 },
+    async run(env) {
+      await env.worker.evaluate(() => chrome.storage.local.set({ activePreviewSession: { tabId: 987654321, type: 'tweets', startedAt: Date.now() } }));
+      const panel = await startDomScan(env, 'tweets');
+      const started = await waitFor(async () => { const P = await readPreview(env); return P?.running && P; }, { timeout: 20000, label: 'scan to start' }).catch(() => null);
+      const error = await panel.evaluate(() => document.getElementById('errorMessage').textContent);
+      await panel.close();
+      return [
+        ['the scan started', !!started, error],
+        ['no other-session error', !/Another Preview/.test(error), error]
+      ];
+    }
+  },
+  {
+    name: 'preview lost: a scan held by another tab still blocks a new one, and stops blocking once that tab reloads',
+    state: { own: 12 },
+    async run(env) {
+      const xTabs = () => env.worker.evaluate(async () => (await chrome.tabs.query({ url: ['https://x.com/*'] })).map(t => t.id));
+      const readIn = (tabId) => env.worker.evaluate(async (tabId) => {
+        const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: () => { const P = window.__xbcPreview; return P && { running: !!P.interval, done: !!P.done, n: P.items.length }; } });
+        return r?.result;
+      }, tabId);
+      const panelA = await startDomScan(env, 'tweets');
+      await waitFor(async () => { const P = await readPreview(env); return P && P.ids.length > 0; }, { timeout: 30000, label: 'scan in tab A' });
+      const [tabA] = await xTabs();
+      await (await env.context.newPage()).goto('https://x.com/home');
+      const [, tabB] = await xTabs();
+      // A second panel whose active tab is tab B.
+      const panelB = await env.context.newPage();
+      await panelB.addInitScript(() => {
+        const query = chrome.tabs.query.bind(chrome.tabs);
+        chrome.tabs.query = async (info) => {
+          if (info?.active && info?.currentWindow) return (await query({ url: ['https://x.com/*', 'https://twitter.com/*'] })).slice(-1);
+          return query(info);
+        };
+        window.close = () => {};
+      });
+      await panelB.goto(`chrome-extension://${env.extensionId}/sidepanel/sidepanel.html`);
+      await panelB.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
+      await panelB.evaluate(() => { const box = document.getElementById('previewApi'); if (box.checked) box.click(); document.getElementById('startScan').click(); });
+      const blocked = await panelB.waitForFunction(() => /Another Preview/.test(document.getElementById('errorMessage').textContent), null, { timeout: 10000 }).then(() => true, () => false);
+      const afterBlock = { session: (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null, a: await readIn(tabA), b: await readIn(tabB) };
+      await panelA.close();
+      await xPage(env).reload();
+      await panelB.evaluate(() => document.getElementById('startScan').click());
+      const startedB = await waitFor(async () => { const P = await readIn(tabB); return P && P; }, { timeout: 20000, label: 'scan in tab B' }).catch(() => null);
+      const afterReload = { error: await panelB.evaluate(() => document.getElementById('errorMessage').textContent), session: (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null, b: startedB };
+      await panelB.close();
+      return [
+        ["a live scan in tab A blocks tab B and keeps A's session", blocked && afterBlock.session?.tabId === tabA && !!afterBlock.a && !afterBlock.b, { blocked, afterBlock, tabA, tabB }],
+        ['after tab A reloads, tab B starts and owns the session', !!startedB && afterReload.session?.tabId === tabB && !/Another Preview/.test(afterReload.error), { afterReload, tabA, tabB }]
+      ];
+    }
+  },
+  {
+    name: 'preview lost: deleting from a paused review after moving inside X reports no lost scan',
+    state: { own: 9, pageSize: 3 },
+    async run(env, state) {
+      await xPage(env).goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.evaluate(() => { const box = document.getElementById('previewApi'); if (!box.checked) box.click(); });
+      await panel.locator('#startScan').click();
+      await waitFor(async () => { const P = await readPreview(env); return P?.running && P.ids.length > 0 && P; }, { timeout: 20000, label: 'first API page' });
+      await panel.locator('#pauseScan').click();
+      await panel.waitForFunction(() => document.getElementById('reviewSection').style.display === 'block' && !document.getElementById('deleteSelected').disabled, null, { timeout: 10000 });
+      // Record every message the panel shows from here on.
+      await panel.evaluate(() => { window.__seen = []; new MutationObserver(() => window.__seen.push(document.getElementById('errorMessage').textContent)).observe(document.getElementById('errorMessage'), { childList: true, characterData: true, subtree: true }); });
+      // The deletion then reloads the profile page, which takes the paused scan away on purpose.
+      await xPage(env).evaluate(() => history.pushState({}, '', '/explore'));
+      const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
+      await panel.locator('#deleteSelected').click();
+      await panel.waitForFunction(() => document.getElementById('deleteDialog')?.open, null, { timeout: 10000 });
+      await panel.locator('#confirmDelete').click();
+      const job = await waitFor(async () => { const h = (await storage(env.worker, ['jobHistory'])).jobHistory || []; return h.length > before && h[0]?.status !== 'running' ? h[0] : null; }, { timeout: 120000, label: 'selected job to finish' }).catch(() => null);
+      await panel.waitForFunction(() => document.getElementById('stopScan').textContent === 'New scan', null, { timeout: 10000 }).catch(() => {});
+      const ui = await panel.evaluate(() => ({ setup: document.getElementById('setupSection').style.display, card: document.getElementById('scanCard').style.display, error: document.getElementById('errorMessage').textContent, state: document.getElementById('scanState').textContent, seen: window.__seen }));
+      await panel.locator('#stopScan').click();
+      await panel.waitForFunction(() => document.getElementById('setupSection').style.display === 'block', null, { timeout: 5000 }).catch(() => {});
+      const afterNew = await panel.evaluate(() => ({ setup: document.getElementById('setupSection').style.display, card: document.getElementById('scanCard').style.display, error: document.getElementById('errorMessage').textContent, dialog: !!document.getElementById('newScanDialog')?.open }));
+      await panel.close();
+      return [
+        ['job finished', job?.status === 'completed', job && { status: job.status, statusText: job.statusText, total: job.total }],
+        ['no "scan was lost" while or after deleting', !/scan was lost/.test(ui.error) && !(ui.seen || []).some(t => /scan was lost/.test(t)), ui],
+        ['the setup is not shown with the job card', !(ui.setup === 'block' && ui.card === 'block'), ui],
+        ['New scan after the job goes back to the setup, with no "scan was lost"', afterNew.setup === 'block' && !/scan was lost/.test(afterNew.error) && !afterNew.dialog, afterNew]
+      ];
+    }
+  },
+  {
+    name: 'preview wait: an API scan waiting out a rate limit says when it resumes',
+    state: { own: 3 },
+    async run(env, state) {
+      // Prime the profile first: its own discovery GET must not consume the worker fixture.
+      await xPage(env).goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
+      state.misbehave.responses.UserTweets = [{ code: 88, resetSeconds: 8 }];
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.locator('#startScan').click();
+      const shown = await panel.waitForFunction(() => /X rate limit · resuming at \d/.test(document.getElementById('scanState').textContent), null, { timeout: 8000 })
+        .then(() => true, () => false);
+      const during = await panel.evaluate(() => document.getElementById('scanState').textContent);
+      await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent), null, { timeout: 60000 });
+      const scan = await readPreview(env);
+      await panel.close();
+      return [
+        ['the wait and its end time are shown', shown, during],
+        ['the scan resumed and finished by API', scan?.mode === 'api' && scan.done && scan.ids.length === 3, scan]
+      ];
+    }
+  },
+  {
+    name: 'preview new scan: a review on screen is cleared only after you confirm',
+    state: { own: 3 },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent) && document.getElementById('reviewSection').style.display === 'block', null, { timeout: 60000 });
+      await panel.locator('#stopScan').click();
+      const asked = await panel.waitForFunction(() => document.getElementById('newScanDialog')?.open, null, { timeout: 5000 }).then(() => true, () => false);
+      const shownAfterAsk = await panel.evaluate(() => ({ review: document.getElementById('reviewSection').style.display, items: previewItems.length }));
+      let afterCancel = null, afterConfirm = null;
+      if (asked) {
+        await panel.locator('#cancelNewScan').click();
+        afterCancel = { review: await panel.evaluate(() => document.getElementById('reviewSection').style.display), scan: !!(await readPreview(env)) };
+        await panel.locator('#stopScan').click();
+        await panel.locator('#confirmNewScan').click();
+        await panel.waitForFunction(() => document.getElementById('setupSection').style.display === 'block', null, { timeout: 5000 });
+        afterConfirm = { setup: true, scan: await readPreview(env), session: (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null };
+      }
+      await panel.close();
+      return [
+        ['New scan asks first and keeps the list', asked && shownAfterAsk.review === 'block' && shownAfterAsk.items === 3, { asked, shownAfterAsk }],
+        ['Keep the list leaves the review and the scan', afterCancel?.review === 'block' && afterCancel.scan, afterCancel],
+        ['Clear the list resets the scan and ends the session', afterConfirm?.setup && afterConfirm.scan === null && afterConfirm.session === null, afterConfirm]
+      ];
+    }
+  },
+  {
+    name: 'preview api: moving to another page inside X does not stop an API scan',
+    state: { own: 9, pageSize: 3 },
+    async run(env, state) {
+      await xPage(env).goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.locator('#startScan').click();
+      const during = await waitFor(async () => { const P = await readPreview(env); return P?.running && P.ids.length > 0 && P; }, { timeout: 20000, label: 'first API page' });
+      await xPage(env).evaluate(() => history.pushState({}, '', '/explore'));
+      await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent), null, { timeout: 60000 });
+      const scan = await readPreview(env);
+      await panel.close();
+      return [
+        ['moved while the API scan was running', during.mode === 'api' && during.ids.length < 9, during],
+        ['the scan finished with every post', scan?.mode === 'api' && scan.done && scan.ids.length === 9, scan]
       ];
     }
   },
