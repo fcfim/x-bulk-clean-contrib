@@ -6,7 +6,7 @@ First release of Postscrub.
 
 ### Added
 
-- API mode, on by default: lists and acts through the same requests X's own site sends, so jobs are faster and keep running in a background tab. Request formats are discovered at runtime from the page and X's current web bundle. Falls back to clicking through the page when X refuses the API.
+- API mode, on by default: lists and acts through the same requests X's own site sends, so jobs are faster and keep running in a background tab. Request formats are discovered at runtime from the page and X's current web bundle. When X refuses the API, the job or scan stops and says why; you start it again to retry the API, or turn API mode off to do it by clicking.
 - Preview & Select scans through the API identify replies exactly, and selected items are acted on directly by id.
 - Automatic handling of X's limits: waits out rate limits until X's reset time and slows down afterwards; stops at once on account locks, restricted sessions, suspensions, expired sessions, daily limits, the follow limit and anything X flags as automated.
 - End-to-end tests that load the extension in Chromium against a simulated x.com.
@@ -26,3 +26,4 @@ First release of Postscrub.
 - The "found" count of Delete posts in click mode counts only your own posts, not the reposts it skips.
 - The Preview panel says when its scan was lost (the X tab reloaded or left the page) and goes back to the setup, shows when an API scan is waiting out X's rate limit and when it resumes, and asks before "New scan" clears a review on screen.
 - Pauses longer than 20 seconds, such as a pace slowed down after X's limits, now last their full length.
+- API scans and jobs no longer request a list with a saved or built-in query id before X's page has had a chance to ask for it: they wait up to 8 seconds for the page's own request and use its id. Only ids taken from the page or X's web bundle are saved, a saved id X answers with 404 is dropped, and a refused list request names the operation, the HTTP status and where its id came from. This addresses "Find & delete replies" ending at once with HTTP 404 in API mode; the cause on the real X is not confirmed yet.
