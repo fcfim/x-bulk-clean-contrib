@@ -295,7 +295,9 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
       } else if (!added && atBottom()) P.emptyCycles++;
       else P.emptyCycles = 0;
       if (P.emptyCycles >= 6) {
-        finish('Scan complete', true);
+        // Without X's main column there was nothing to scan, which is not the end of the list.
+        if (scopeRoot()) finish('Scan complete', true);
+        else finish("Scan stopped: X's main column was not found", false);
         return;
       }
       window.scrollBy(0, Math.max(520, window.innerHeight * .78));
@@ -610,6 +612,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     const text = (toast?.textContent || '').trim();
     if (/rate.?limit|too many requests|please wait a few moments|muitas solicitações|aguarde alguns instantes/i.test(text)) return 'Rate limited by X — wait a few moments before starting another job';
     if (/try again|something went wrong|unable|locked|restrict|exceeded|tente novamente|algo deu errado/i.test(text)) return text.slice(0, 200);
+    if (document.querySelector('[data-testid="LoginForm"]') || document.querySelector('a[data-testid="loginButton"]') || document.querySelector('[data-testid="login"]')) return 'Login required';
     return null;
   };
   const stopIfIssue = async (waitMs = 0) => {
@@ -750,7 +753,10 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       }
       let handled=0;
       for(const {article:initial,cell,id,control:initialControl} of candidates){
-        if(!X.interval||await leftPage())break;const snap=selected.get(id);
+        if(!X.interval||await leftPage())break;
+        // A login form or an error from X stops the job before the next item, not after the cycle.
+        const issueNow=detectIssue();if(issueNow){await stop(issueNow);break}
+        const snap=selected.get(id);
         let control=initialControl;
         if(type!=='unfollow'){const article=liveArticle(initial,id);control=article?.querySelector(type==='reposts'?'[data-testid="unretweet"]':'[data-testid="caret"]');}
         else if(!cell.isConnected)control=null;
@@ -776,14 +782,17 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
         }
         handled++;if(handled>=3)break;
       }
+      if(!X.interval)return; // stopped during the cycle: its reason stands
       const resultVerb=type==='unfollow'?'unfollowed':type==='reposts'?'removed':'deleted';
       if(X.successCount>=selected.size){stop(`Finished — ${X.successCount} selected items ${resultVerb}`);return}
       // A hidden tab is not rendered: X draws no more items until it is visible, so neither count
       // an empty cycle as the end nor scroll blind past items it has yet to draw.
       const blind=hidden()&&!scopeRoot()?.querySelector('article[data-testid="tweet"],[data-testid="UserCell"]');
       if(!hidden()){if(!candidates.length&&atBottom())X.emptyCycles++;else X.emptyCycles=0}
-      if(X.emptyCycles>=6){stop(`Finished — ${X.successCount} ${resultVerb}, ${Math.max(0,selected.size-X.successCount)} not found`);return}
-      if(candidates.length<=handled&&!blind){window.scrollBy(0,Math.max(520,window.innerHeight*.75));window.dispatchEvent(new Event('scroll'))}
+      // Without X's main column there was nothing to look at, which is not the end of the list.
+      if(X.emptyCycles>=6){stop(scopeRoot()?`Finished — ${X.successCount} ${resultVerb}, ${Math.max(0,selected.size-X.successCount)} not found`:`X's main column was not found — job stopped after ${X.successCount} ${resultVerb}`);return}
+      // A job that stopped, or a page that changed, gets no more scrolling.
+      if(X.interval&&onPage()&&candidates.length<=handled&&!blind){window.scrollBy(0,Math.max(520,window.innerHeight*.75));window.dispatchEvent(new Event('scroll'))}
     }finally{X.busy=false}
   };
   // Sequential loop paced by sleep() instead of setInterval, so it keeps running in a background tab.
