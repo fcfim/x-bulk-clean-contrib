@@ -1313,6 +1313,18 @@ const SCENARIOS = [
     }
   },
   {
+    name: 'preview stop: selected deletion keeps going on the same page with capitals, a trailing slash, query and hash',
+    state: { own: 4 },
+    setup: (state) => { state.dom = { renameAfter: 2 }; },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false });
+      return [
+        ['job finished, not stopped', r.job.status === 'completed' && !/page changed/i.test(r.job.statusText), r.job.statusText],
+        ['all 4 deleted', state.tweets.length === 0, state.tweets.length]
+      ];
+    }
+  },
+  {
     name: "preview stop: selected deletion stops at X's login form",
     state: { own: 6 },
     setup: (state) => { state.dom = { loginAfter: 2 }; },
