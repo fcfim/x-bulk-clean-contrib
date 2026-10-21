@@ -1040,32 +1040,37 @@ async function togglePause() {
   await pollPreview();
 }
 
-// Back to the setup, with the session ended and the panel's copy of the scan dropped.
+// Back to the setup, with this tab's session ended and the panel's copy of the scan dropped.
 async function leavePreview() {
   stopPolling();
-  await chrome.storage.local.remove(['activePreviewSession']);
+  // A session another tab has started since is not this panel's to end.
+  const { activePreviewSession } = await chrome.storage.local.get(['activePreviewSession']);
+  if (!activePreviewSession || activePreviewSession.tabId === activeTab?.id) await chrome.storage.local.remove(['activePreviewSession']);
   previewItems = []; shownItems = PAGE_SIZE; previewSnapshot = null;
   $('setupSection').style.display = 'block'; $('scanCard').style.display = 'none'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
 }
 
-// The X tab reloaded or left the page and took the scan with it: say so and go back to the setup
-// instead of leaving a panel that no longer moves.
+// The X tab no longer holds the scan the panel was following (it reloaded, left the page, or the
+// scan was ended elsewhere): say so and go back to the setup instead of a panel that no longer moves.
 async function previewLost() {
   await leavePreview();
-  showError('The scan was lost: the X tab reloaded or left the page. Start a new scan.');
+  showError('The scan was lost: the X tab no longer holds it (it reloaded, left the page or the scan was ended). Start a new scan.');
 }
 
 async function resetPreview() {
   $('newScanDialog').close();
   stopPolling();
-  await executeInTab(controlPreviewScanner, ['reset']);
+  // The tab may no longer hold the scan, or be gone.
+  await executeInTab(controlPreviewScanner, ['reset']).catch(() => null);
   await leavePreview();
 }
 
 async function stopScan() {
   if (cleanupRunning) { await executeInTab(() => window.__xCleanerStop?.()); return; }
-  const state = await executeInTab(readPreviewState, [false]);
-  if (state && !state.running) {
+  const state = await executeInTab(readPreviewState, [false]).catch(() => null);
+  // The scan the panel was following is gone from the tab.
+  if (!state && pollTimer) { await previewLost(); return; }
+  if (!state?.running) {
     // "New scan" does not throw away a review on screen without asking.
     if (previewItems.length && $('reviewSection').style.display === 'block') {
       $('newScanCount').textContent = `${previewItems.length} ${previewItems.length === 1 ? 'item' : 'items'}`;
@@ -1186,6 +1191,8 @@ async function beginSelectedDelete() {
   if (!currentAccount || currentAccount.username.toLowerCase() !== activeAccount.username.toLowerCase()) {
     showError('The active X account changed after scanning. Start a new scan for the current account.'); return;
   }
+  // The panel stops following the scan first: the page load below takes the scan away on purpose.
+  stopPolling();
   await executeInTab(controlPreviewScanner, ['stop']);
   await chrome.storage.local.remove(['activePreviewSession']);
   await ensurePreviewPage(selectedType()); activeTab = await findActiveXTab();
@@ -1232,7 +1239,7 @@ async function initialize() {
       const { activePreviewSession } = await chrome.storage.local.get(['activePreviewSession']);
       if (activePreviewSession?.tabId === activeTab.id) {
         await chrome.storage.local.remove(['activePreviewSession']);
-        showError('The last scan was lost: the X tab reloaded or left the page. Start a new scan.');
+        showError('The last scan was lost: the X tab no longer holds it (it reloaded, left the page or the scan was ended). Start a new scan.');
       }
     }
   }

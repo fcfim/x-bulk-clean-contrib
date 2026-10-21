@@ -133,6 +133,16 @@ async function testPreviewPolling() {
   check('cleanup progress still updates', () => assert.equal(document.getElementById('scanCount').textContent, '1'));
   await run('stopScan()'); await run('pollPreview()');
   check('Stop deletion still responds and final history state stops polling', () => { assert.equal(stops, 1); assert.equal(timers.size, 0); assert.equal(run('cleanupRunning'), false); });
+  // A lost scan ends only this tab's session, not one another tab has started since (VER-816).
+  const sessionStore = run('chrome.storage.local');
+  let removed = null;
+  sessionStore.remove = async keys => { removed = keys; };
+  sessionStore.get = async () => ({ activePreviewSession: { tabId: 99 } });
+  await run('previewLost()');
+  check("a lost scan leaves the session another tab started", () => { assert.equal(removed, null); assert.equal(document.getElementById('setupSection').style.display, 'block'); });
+  sessionStore.get = async () => ({ activePreviewSession: { tabId: 42 } });
+  await run('previewLost()');
+  check("a lost scan ends its own tab's session", () => assert.equal(removed?.[0], 'activePreviewSession'));
   console.log(`${checks.length}/${checks.length} synthetic polling checks passed (not browser e2e)`);
 }
 
@@ -1541,6 +1551,83 @@ const SCENARIOS = [
       return [
         ['the scan started', !!started, error],
         ['no other-session error', !/Another Preview/.test(error), error]
+      ];
+    }
+  },
+  {
+    name: 'preview lost: a scan held by another tab still blocks a new one, and stops blocking once that tab reloads',
+    state: { own: 12 },
+    async run(env) {
+      const xTabs = () => env.worker.evaluate(async () => (await chrome.tabs.query({ url: ['https://x.com/*'] })).map(t => t.id));
+      const readIn = (tabId) => env.worker.evaluate(async (tabId) => {
+        const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: () => { const P = window.__xbcPreview; return P && { running: !!P.interval, done: !!P.done, n: P.items.length }; } });
+        return r?.result;
+      }, tabId);
+      const panelA = await startDomScan(env, 'tweets');
+      await waitFor(async () => { const P = await readPreview(env); return P && P.ids.length > 0; }, { timeout: 30000, label: 'scan in tab A' });
+      const [tabA] = await xTabs();
+      await (await env.context.newPage()).goto('https://x.com/home');
+      const [, tabB] = await xTabs();
+      // A second panel whose active tab is tab B.
+      const panelB = await env.context.newPage();
+      await panelB.addInitScript(() => {
+        const query = chrome.tabs.query.bind(chrome.tabs);
+        chrome.tabs.query = async (info) => {
+          if (info?.active && info?.currentWindow) return (await query({ url: ['https://x.com/*', 'https://twitter.com/*'] })).slice(-1);
+          return query(info);
+        };
+        window.close = () => {};
+      });
+      await panelB.goto(`chrome-extension://${env.extensionId}/sidepanel/sidepanel.html`);
+      await panelB.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
+      await panelB.evaluate(() => { const box = document.getElementById('previewApi'); if (box.checked) box.click(); document.getElementById('startScan').click(); });
+      const blocked = await panelB.waitForFunction(() => /Another Preview/.test(document.getElementById('errorMessage').textContent), null, { timeout: 10000 }).then(() => true, () => false);
+      const afterBlock = { session: (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null, a: await readIn(tabA), b: await readIn(tabB) };
+      await panelA.close();
+      await xPage(env).reload();
+      await panelB.evaluate(() => document.getElementById('startScan').click());
+      const startedB = await waitFor(async () => { const P = await readIn(tabB); return P && P; }, { timeout: 20000, label: 'scan in tab B' }).catch(() => null);
+      const afterReload = { error: await panelB.evaluate(() => document.getElementById('errorMessage').textContent), session: (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null, b: startedB };
+      await panelB.close();
+      return [
+        ["a live scan in tab A blocks tab B and keeps A's session", blocked && afterBlock.session?.tabId === tabA && !!afterBlock.a && !afterBlock.b, { blocked, afterBlock, tabA, tabB }],
+        ['after tab A reloads, tab B starts and owns the session', !!startedB && afterReload.session?.tabId === tabB && !/Another Preview/.test(afterReload.error), { afterReload, tabA, tabB }]
+      ];
+    }
+  },
+  {
+    name: 'preview lost: deleting from a paused review after moving inside X reports no lost scan',
+    state: { own: 9, pageSize: 3 },
+    async run(env, state) {
+      await xPage(env).goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.evaluate(() => { const box = document.getElementById('previewApi'); if (!box.checked) box.click(); });
+      await panel.locator('#startScan').click();
+      await waitFor(async () => { const P = await readPreview(env); return P?.running && P.ids.length > 0 && P; }, { timeout: 20000, label: 'first API page' });
+      await panel.locator('#pauseScan').click();
+      await panel.waitForFunction(() => document.getElementById('reviewSection').style.display === 'block' && !document.getElementById('deleteSelected').disabled, null, { timeout: 10000 });
+      // Record every message the panel shows from here on.
+      await panel.evaluate(() => { window.__seen = []; new MutationObserver(() => window.__seen.push(document.getElementById('errorMessage').textContent)).observe(document.getElementById('errorMessage'), { childList: true, characterData: true, subtree: true }); });
+      // The deletion then reloads the profile page, which takes the paused scan away on purpose.
+      await xPage(env).evaluate(() => history.pushState({}, '', '/explore'));
+      const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
+      await panel.locator('#deleteSelected').click();
+      await panel.waitForFunction(() => document.getElementById('deleteDialog')?.open, null, { timeout: 10000 });
+      await panel.locator('#confirmDelete').click();
+      const job = await waitFor(async () => { const h = (await storage(env.worker, ['jobHistory'])).jobHistory || []; return h.length > before && h[0]?.status !== 'running' ? h[0] : null; }, { timeout: 120000, label: 'selected job to finish' }).catch(() => null);
+      await panel.waitForFunction(() => document.getElementById('stopScan').textContent === 'New scan', null, { timeout: 10000 }).catch(() => {});
+      const ui = await panel.evaluate(() => ({ setup: document.getElementById('setupSection').style.display, card: document.getElementById('scanCard').style.display, error: document.getElementById('errorMessage').textContent, state: document.getElementById('scanState').textContent, seen: window.__seen }));
+      await panel.locator('#stopScan').click();
+      await panel.waitForFunction(() => document.getElementById('setupSection').style.display === 'block', null, { timeout: 5000 }).catch(() => {});
+      const afterNew = await panel.evaluate(() => ({ setup: document.getElementById('setupSection').style.display, card: document.getElementById('scanCard').style.display, error: document.getElementById('errorMessage').textContent, dialog: !!document.getElementById('newScanDialog')?.open }));
+      await panel.close();
+      return [
+        ['job finished', job?.status === 'completed', job && { status: job.status, statusText: job.statusText, total: job.total }],
+        ['no "scan was lost" while or after deleting', !/scan was lost/.test(ui.error) && !(ui.seen || []).some(t => /scan was lost/.test(t)), ui],
+        ['the setup is not shown with the job card', !(ui.setup === 'block' && ui.card === 'block'), ui],
+        ['New scan after the job goes back to the setup, with no "scan was lost"', afterNew.setup === 'block' && !/scan was lost/.test(afterNew.error) && !afterNew.dialog, afterNew]
       ];
     }
   },
