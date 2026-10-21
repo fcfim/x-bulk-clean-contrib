@@ -168,11 +168,21 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   const inColumn = selector => Array.from(scopeRoot()?.querySelectorAll(selector) || []);
   // X is a single-page app: startDomScan records the page, and the scan stops on any other.
   const routeKey = () => location.pathname.replace(/\/+$/, '').toLowerCase();
+  // Whose posts are whose: X's profile link names the signed-in account, and the account detected
+  // for the scan covers a page drawn without that link. With neither, or with the two naming
+  // different accounts, a click scan of posts or replies stops before listing (accountIssue).
   const ownHandle = () => {
-    const link = document.querySelector('[data-testid="AppTabBar_Profile_Link"]') || document.querySelector('a[aria-label="Profile"]');
+    const link = document.querySelector('[data-testid="AppTabBar_Profile_Link"]');
     return link?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
   };
-  const me = ownHandle();
+  const pageHandle = ownHandle();
+  const accountHandle = account?.username?.toLowerCase() || null;
+  const me = pageHandle || accountHandle;
+  const accountIssue = !me
+    ? 'Could not tell which account is signed in — scan stopped'
+    : pageHandle && accountHandle && pageHandle !== accountHandle
+      ? `This tab is signed in to @${pageHandle}, not @${accountHandle} — scan stopped`
+      : null;
   const tweetId = article => article.querySelector('a[href*="/status/"]')?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1] || null;
   const authorHandle = article => article.querySelector('[data-testid="User-Name"] a[role="link"][href^="/"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
   const userHandle = cell => {
@@ -182,7 +192,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     }
     return null;
   };
-  const isMine = article => !me || authorHandle(article) === me;
+  const isMine = article => !!me && authorHandle(article) === me;
   const hasConnector = cell => {
     if (!cell) return false;
     const divs = cell.querySelectorAll('div');
@@ -297,6 +307,10 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   const startDomScan = () => {
     P.mode = 'dom';
     P.route = routeKey();
+    if ((type === 'tweets' || type === 'replies') && accountIssue) {
+      finish(accountIssue, false);
+      return;
+    }
     window.scrollTo({ top: 0, behavior: 'auto' });
     const token = P.interval = { loop: true };
     (async () => {
@@ -496,8 +510,18 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     await stop('The page changed — job stopped');
     return true;
   };
+  // Whose posts are whose: X's profile link names the signed-in account, and the account confirmed
+  // for the job covers a page drawn without that link. With neither, or with the two naming
+  // different accounts, deleting posts or replies by clicking stops before acting (accountIssue).
   const ownHandle = () => document.querySelector('[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
-  const me = ownHandle();
+  const pageHandle = ownHandle();
+  const accountHandle = account?.username?.toLowerCase() || null;
+  const me = pageHandle || accountHandle;
+  const accountIssue = !me
+    ? 'Could not tell which account is signed in — job stopped'
+    : pageHandle && accountHandle && pageHandle !== accountHandle
+      ? `This tab is signed in to @${pageHandle}, not @${accountHandle} — job stopped`
+      : null;
   const tweetId = article => article.querySelector('a[href*="/status/"]')?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1] || null;
   const authorHandle = article => article.querySelector('[data-testid="User-Name"] a[role="link"][href^="/"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
   const userHandle = cell => {
@@ -717,7 +741,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
           const control=article.querySelector('[data-testid="unretweet"]');
           if(control)candidates.push({article,id,control});
         }else{
-          if(me&&authorHandle(article)!==me)continue;
+          if(!me||authorHandle(article)!==me)continue;
           const selectedItem=selected.get(id);
           if(type==='replies' && !['orphan','standalone'].includes(selectedItem?.classification) && !isReply(article))continue;
           if(type==='tweets' && isReply(article))continue;
@@ -764,7 +788,9 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   };
   // Sequential loop paced by sleep() instead of setInterval, so it keeps running in a background tab.
   const startDomLoop=()=>{
-    X.mode='dom';X.route=routeKey();window.scrollTo({top:0,behavior:'auto'});
+    X.mode='dom';X.route=routeKey();
+    if(type!=='reposts'&&type!=='unfollow'&&accountIssue){stop(accountIssue);return}
+    window.scrollTo({top:0,behavior:'auto'});
     const token=X.interval={loop:true};
     (async()=>{
       while(X.interval===token){

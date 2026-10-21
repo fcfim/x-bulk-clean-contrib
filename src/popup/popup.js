@@ -489,12 +489,21 @@ function runWorker(action, performanceMode, account, useApi = false) {
     X.mediaObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
 
+  // Whose posts are whose in click mode: X's profile link names the signed-in account, and the
+  // account confirmed for this job covers a page drawn without that link. With neither, or with
+  // the two naming different accounts, deleting by clicking stops before acting (accountIssue).
   function ownHandle() {
-    const link = document.querySelector('[data-testid="AppTabBar_Profile_Link"]') ||
-                 document.querySelector('a[aria-label="Profile"]');
-    return link?.getAttribute('href')?.replace(/^\//, '').toLowerCase() || null;
+    const link = document.querySelector('[data-testid="AppTabBar_Profile_Link"]');
+    return link?.getAttribute('href')?.replace(/^\//, '').split('/')[0].toLowerCase() || null;
   }
-  const me = ownHandle();
+  const pageHandle = ownHandle();
+  const accountHandle = account?.username?.toLowerCase() || null;
+  const me = pageHandle || accountHandle;
+  const accountIssue = !me
+    ? 'Could not tell which account is signed in — job stopped'
+    : pageHandle && accountHandle && pageHandle !== accountHandle
+      ? `This tab is signed in to @${pageHandle}, not @${accountHandle} — job stopped`
+      : null;
 
   // X draws tweets and UserCells outside the list being cleaned too ("Who to follow" in the
   // sidebar), so click mode only looks inside the main column. No column, no candidates.
@@ -522,8 +531,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
   }
 
   function isMine(article) {
-    if (!me) return true;
-    return authorHandle(article) === me;
+    return !!me && authorHandle(article) === me;
   }
 
   // A thread connector is a thin, tall, visible vertical line in a tweet's avatar
@@ -966,6 +974,10 @@ function runWorker(action, performanceMode, account, useApi = false) {
   function startDomLoop() {
     X.mode = 'dom';
     X.route = routeKey();
+    if ((action === 'delete' || action === 'deleteReplies') && accountIssue) {
+      stopAll(accountIssue);
+      return;
+    }
     if (action === 'delete' || action === 'unrepost') {
       X.stats = action === 'delete'
         ? { deleted: 0, found: 0 }

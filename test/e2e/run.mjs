@@ -1000,6 +1000,86 @@ const SCENARIOS = [
       }
     ];
   }),
+  // Whose posts are whose in click mode (VER-815): without X's profile link the confirmed account
+  // decides, and a tab signed in to another account than the one confirmed stops before any click.
+  {
+    name: 'click mode identity: without a profile link no menu opens on posts of others',
+    state: { own: 3, retweets: 2 },
+    setup: (state) => { state.dom = { noProfileLink: true, deleteMenu: { label: 'Delete', red: true, confirm: 'Delete' } }; },
+    async run(env, state) {
+      const own = state.tweets.filter(t => !t.retweetOf).map(t => t.id);
+      const others = state.tweets.filter(t => t.retweetOf).map(t => t.retweetOf.id);
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      const opened = state.calls.filter(c => c.op === 'menu-open').map(c => c.id);
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['no menu opened on a post of someone else', !opened.some(id => others.includes(id)), opened],
+        ['your posts deleted, the reposts untouched', own.every(id => !state.tweets.some(t => t.id === id)) && state.tweets.filter(t => t.retweetOf).length === others.length, state.tweets.map(t => t.id)],
+        ['history: your posts', r.job.status === 'completed' && r.job.total === own.length, r.job]
+      ];
+    }
+  },
+  {
+    name: 'preview identity: without a profile link the scan lists only your own posts',
+    state: { own: 3, retweets: 2 },
+    setup: (state) => { state.dom = { noProfileLink: true }; },
+    async run(env, state) {
+      const own = state.tweets.filter(t => !t.retweetOf).map(t => t.id);
+      const r = await previewAndAct(env, 'tweets', { apiMode: false });
+      const listed = (r.scan?.items || []).map(i => i.id).sort();
+      return [
+        ['scan and deletion ran by clicking', r.scan?.mode === 'dom' && r.worker?.mode === 'dom', { scan: r.scan?.mode, worker: r.worker }],
+        ['scan listed only your own posts', listed.join() === own.slice().sort().join(), listed],
+        ['your posts deleted, the reposts untouched', own.every(id => !state.tweets.some(t => t.id === id)) && state.tweets.filter(t => t.retweetOf).length === 2, state.tweets.map(t => t.id)],
+        ['history: your posts', r.job.total === own.length, r.job]
+      ];
+    }
+  },
+  {
+    name: 'click mode identity: a tab signed in to another account stops before any click',
+    state: { own: 3 },
+    setup: (state) => { state.dom = { switchedAccount: 'other', deleteMenu: { label: 'Delete', red: true, confirm: 'Delete' } }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['job stopped and says why', r.job.status === 'interrupted' && /signed in to @other, not @me/.test(r.job.statusText), r.job.statusText],
+        ['no click at all', !state.calls.some(c => c.op === 'menu-open') && domActions(state).length === 0 && state.tweets.length === 3, state.calls.filter(c => c.method === 'DOM')],
+        ['history: nothing deleted', r.job.total === 0, r.job]
+      ];
+    }
+  },
+  {
+    name: 'preview identity: a scan in a tab signed in to another account stops and lists nothing',
+    state: { own: 3 },
+    setup: (state) => { state.dom = { switchedAccount: 'other' }; },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      const scan = await waitFor(async () => { const P = await readPreview(env); return P && !P.running && P; }, { timeout: 20000, label: 'scan to stop' });
+      const label = await panel.waitForFunction(() => /signed in to @other/.test(document.getElementById('scanState').textContent), null, { timeout: 5000 })
+        .then(() => 'signed in to @other', () => panel.evaluate(() => document.getElementById('scanState').textContent));
+      await panel.close();
+      return [
+        ['scan stopped and says why', !scan.done && /signed in to @other, not @me/.test(scan.issue || ''), scan],
+        ['nothing listed', scan.ids.length === 0, scan.ids],
+        ['the panel says why', /signed in to @other/.test(label), label]
+      ];
+    }
+  },
+  {
+    // The panel reads @me on /home before deleting; back on the profile page the tab is @other.
+    name: 'preview identity: selected deletion in a tab switched to another account stops before any click',
+    state: { own: 3 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false, beforeAct: async () => { state.dom = { switchedAccount: 'other' }; await xPage(env).goto('https://x.com/home'); } });
+      return [
+        ['scan listed your 3 posts', r.scan?.mode === 'dom' && r.scan.items.length === 3, r.scan],
+        ['job stopped and says why', r.job.status === 'interrupted' && /signed in to @other, not @me/.test(r.job.statusText), r.job.statusText],
+        ['no click at all', domActions(state).length === 0 && state.tweets.length === 3, state.calls.filter(c => c.method === 'DOM')],
+        ['history: nothing deleted', r.job.total === 0, r.job]
+      ];
+    }
+  },
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 
