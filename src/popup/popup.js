@@ -849,8 +849,8 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   // === API mode ===
   // Lists and acts through X's own web API (worker/xapi.js, injected before this worker) instead
-  // of clicking, so the job needs neither scrolling nor a rendered tab. If X refuses the API
-  // before anything succeeded, the job falls back to clicking.
+  // of clicking, so the job needs neither scrolling nor a rendered tab. When X refuses the API,
+  // the job stops and says why; it never switches to clicking on its own.
   const LIST_OP = {
     delete: 'UserTweets', unrepost: 'UserTweets', unlike: 'Likes',
     followVerified: 'BlueVerifiedFollowers', followAll: 'Followers', bulkUnfollow: 'Following'
@@ -911,7 +911,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
       const cooldown = await domCooldown();
       if (!active()) return;
       if (cooldown) return stopAll(cooldown);
-      return stopAll(`API job interrupted after ${X.successCount} items: ${reason}. Try again with API, or turn off API mode and start a new job; review and confirm again.`);
+      return stopAll(`API job interrupted after ${X.successCount} items: ${reason}. Start a new job to try the API again, or turn off API mode to run it by clicking; review and confirm again.`);
     };
     X.mode = 'api';
     const ready = await api.init(account);

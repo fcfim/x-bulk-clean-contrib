@@ -594,7 +594,13 @@
       }, { isActive, onWait, okWhen: json => !!json?.data }, job);
       if (status === 404 && source === 'stored') await forgetStored(name, op.queryId);
       if (result.kind === 'stopped') throw paginationError('cancelled', 'API pagination cancelled', 'stopped');
-      if (result.kind !== 'ok') { const error = new Error(result.message || result.kind); error.result = result; throw error; }
+      if (result.kind !== 'ok') {
+        const error = new Error(result.message || result.kind);
+        // What X refused, without secrets: the operation, the HTTP status (null when no request
+        // was sent) and where its query id came from.
+        error.result = { ...result, operation: name, status, source };
+        throw error;
+      }
       if (!parsed?.recognized) throw paginationError('invalid_timeline', 'X returned an unrecognized or malformed timeline');
       const fresh = {
         tweets: parsed.tweets.filter(t => !seen.has(`t${t.id}`) && seen.add(`t${t.id}`)),

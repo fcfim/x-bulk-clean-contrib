@@ -55,7 +55,7 @@ export async function harness(responses, { store = {}, clock = { now: START }, a
 
 export async function scan(h, { useApi = true, type = 'tweets', whileRunning } = {}) {
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
-  const globals = { window, location: { pathname: '/synthetic_me' }, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {} }, chrome: { runtime: h.runtime, storage: h.storage },
+  const globals = { window, location: { pathname: '/synthetic_me' }, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {}, info() {} }, chrome: { runtime: h.runtime, storage: h.storage },
     document: { cookie: h.document.cookie, hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } };
   const definitions = vm.createContext({ ...globals });
   vm.runInContext(panelSource, definitions);

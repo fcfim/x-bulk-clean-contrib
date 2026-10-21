@@ -339,8 +339,8 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   };
 
   // API scan: lists the account's items through X's web API (worker/xapi.js), which also tells
-  // replies apart exactly instead of guessing from the thread line. Falls back to scrolling the
-  // page when X refuses the API before the first page.
+  // replies apart exactly instead of guessing from the thread line. When X refuses the API, the
+  // scan stops and says why; it never switches to scrolling the page on its own.
   const LIST_OP = { tweets: 'UserTweets', reposts: 'UserTweets', replies: 'UserTweetsAndReplies', unfollow: 'Following' };
   const tweetItem = (t, itemType, classification) => ({ id: t.id, type: itemType, classification, text: t.text, date: t.date, author: t.author, url: t.url, hasMedia: t.hasMedia, selected: true });
   const toItems = (page, myId) => {
@@ -370,12 +370,13 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
       const cooldown = await domCooldown([LIST_OP[type]]);
       if (!active()) return;
       if (cooldown) return finish(`Scan stopped: ${cooldown}`, false);
-      finish(`Scan interrupted after ${P.items.length} items: ${reason}. Try again with API, or turn off API mode and start a new scan.`, false);
+      finish(`Scan interrupted after ${P.items.length} items: ${reason}. Start a new scan to try the API again, or turn off API mode to scan by clicking.`, false);
     };
     P.mode = 'api';
     const ready = await api.init(account);
     if (!active()) return;
     if (!ready.ok || !api.canList(LIST_OP[type])) return fallback(ready.reason || `no ${LIST_OP[type]} operation`);
+    console.info('[Postscrub] API mode, operation sources:', ready.sources);
 
     try {
       for await (const page of api.pages(LIST_OP[type], { isActive: active, onWait: until => { P.waitUntil = until; } })) {
@@ -391,7 +392,13 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
         finish(`Scan stopped after ${P.items.length} items: ${error.message || error}`, false);
         return;
       }
-      return fallback(error.message || 'API scan could not finish');
+      // A list request X did not accept: name the operation, the status and where its id came from.
+      const r = error.result;
+      const status = r?.status ? `HTTP ${r.status}` : 'network error';
+      const refused = r?.operation && r.status != null
+        ? `X did not accept the request for ${r.operation} (${status}, id from ${r.source})${error.message && error.message !== status ? `: ${error.message}` : ''}`
+        : null;
+      return fallback(refused || error.message || 'API scan could not finish');
     }
     if (active()) {
       if (!P.items.length) return fallback('No matching items returned by API (0 items)');
@@ -845,8 +852,8 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     })();
   };
   // API mode: acts on the selected ids directly through X's web API (worker/xapi.js), so nothing
-  // has to be found on the page again. Falls back to clicking when X refuses the API before the
-  // first success.
+  // has to be found on the page again. When X refuses the API, the job stops and says why; it
+  // never switches to clicking on its own.
   const runApi=async api=>{
     const token=X.interval={api:true};
     const active=()=>X.interval===token;
@@ -856,7 +863,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       const cooldown=await domCooldown();
       if(!active())return;
       if(cooldown)return stop(cooldown);
-      return stop(`API job interrupted after ${X.successCount} items: ${reason}. Try again with API, or turn off API mode and start a new job; review and confirm again.`);
+      return stop(`API job interrupted after ${X.successCount} items: ${reason}. Start a new job to try the API again, or turn off API mode to run it by clicking; review and confirm again.`);
     };
     X.mode='api';
     const ready=await api.init(account);

@@ -412,7 +412,7 @@ const SCENARIOS = [
       return [
         ['job interrupted with zero recorded actions', r.job.status === 'interrupted' && r.job.total === 0 && !/^Finished/.test(r.worker.issue), r.job],
         ['no automatic deletion or click fallback', r.worker.mode === 'api' && !r.worker.apiFallback && !state.calls.some(c => c.op === 'DeleteTweet' || c.op === 'dom-delete') && state.tweets.length === 2, r.worker],
-        ['explicit new choice offered', /turn off API.*new job/.test(r.worker.issue), r.worker.issue]
+        ['explicit new choice offered', /Start a new job to try the API again, or turn off API mode/.test(r.worker.issue), r.worker.issue]
       ];
     }
   })),
@@ -822,7 +822,7 @@ const SCENARIOS = [
       const manual = await quickClean(env, 'delete', { apiMode: false });
       return [
         ['refusal interrupts without automatic DOM', r.worker?.mode === 'api' && !r.worker.apiFallback && r.job.status === 'interrupted' && r.job.total === 0, r],
-        ['choice mentions API off and new job', /turn off API.*new job/.test(r.worker.issue), r.worker.issue],
+        ['choice mentions API off and new job', /Start a new job to try the API again, or turn off API mode/.test(r.worker.issue), r.worker.issue],
         ['all posts untouched before explicit new choice', beforeChoice.remaining === 5 && beforeChoice.dom === 0, beforeChoice],
         ['new confirmed click job deletes all 5', manual.worker.mode === 'dom' && state.tweets.length === 0 && state.calls.filter(c => c.op === 'dom-delete').length === 5, manual],
         ['new history has 5 records', manual.job.total === 5, manual.job]
@@ -840,7 +840,7 @@ const SCENARIOS = [
         ['reason mentions the signed session', /signed session/.test(r.worker?.issue || ''), r.worker?.issue],
         ['no repost removed through the API', state.tweets.filter(t => t.retweetOf).length === 3, state.tweets.length],
         ['the refused DeleteRetweet was tried once, then no more', state.calls.filter(c => c.op === 'DeleteRetweet').length === 1],
-        ['manual choice requires a new confirmed job', /turn off API.*new job/.test(r.worker.issue) && !state.calls.some(c => c.op === 'dom-delete'), r.worker.issue]
+        ['manual choice requires a new confirmed job', /Start a new job to try the API again, or turn off API mode/.test(r.worker.issue) && !state.calls.some(c => c.op === 'dom-delete'), r.worker.issue]
       ];
     }
   },
