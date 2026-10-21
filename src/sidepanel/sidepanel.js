@@ -133,7 +133,7 @@ async function ensurePreviewPage(type) {
 }
 
 function startPreviewScanner(type, account, performanceMode, replyScope = 'fast', useApi = false) {
-  if (window.__xCleaner?.interval) return { ok: false, error: 'A cleanup job is already running.' };
+  if (window.__xCleaner?.interval || window.__xCleaner?.finishing > 0) return { ok: false, error: 'A cleanup job is already running.' };
   const previous = window.__xbcPreview;
   if (previous) previous.interval = null;
   if (previous?.style) previous.style.remove();
@@ -462,7 +462,7 @@ function readCleanupState() {
   return {
     action: X.action,
     stats: X.stats,
-    running: !!X.interval,
+    running: !!X.interval || X.finishing > 0,
     mode: X.mode || null,
     apiFallback: X.apiFallback || null,
     issue: X.issue,
@@ -472,7 +472,7 @@ function readCleanupState() {
 }
 
 function runSelectedDelete(type, selectedItems, account, performanceMode, useApi = false) {
-  if (window.__xCleaner?.interval) return { ok: false, error: 'Another cleanup is already running.' };
+  if (window.__xCleaner?.interval || window.__xCleaner?.finishing > 0) return { ok: false, error: 'Another cleanup is already running.' };
   if (window.__xbcPreview) window.__xbcPreview.interval = null;
   window.__xbcPreview?.style?.remove();
   const action = type === 'replies' ? 'deleteReplies' : type === 'reposts' ? 'unrepost' : type === 'unfollow' ? 'bulkUnfollow' : 'delete';
@@ -486,7 +486,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     backup: { tweets: [], replies: [], unliked: [], unreposted: [], follows: [], unfollows: [] },
     processed: new Set(), interval: null, keepAlive: null, busy: false, issue: null,
     emptyCycles: 0, successCount: 0, startedAt: Date.now(), historySaved: false, historyPersisted: false,
-    checkpointCount: 0, lastCheckpointAt: 0, checkpointing: null, checkpointPending: false,
+    checkpointCount: 0, lastCheckpointAt: 0, checkpointing: null, checkpointPending: false, finishing: 0,
     jobId: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     overlayHost: null, overlayTimer: null, performanceStyle: null
   };
@@ -693,12 +693,18 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     if (running && navigator.locks) navigator.locks.request(`xbc-job-${X.jobId}`, () => new Promise(release => { X.releaseLock = release; })).catch(() => {});
     else { X.releaseLock?.(); X.releaseLock = null; }
   };
+  // Until the final record is written the job still counts as live (X.finishing), so a
+  // reconciliation cannot mark it interrupted, and its tab stays protected until the write lands.
   const stop = async reason => {
-    setJobRunning(false);
-    if (X.keepAlive) clearInterval(X.keepAlive); if (X.overlayTimer) clearInterval(X.overlayTimer);
-    X.interval=null;X.keepAlive=null;X.issue=reason;X.performanceStyle?.remove();updateOverlay();
-    const shadow=X.overlayHost?.shadowRoot;if(shadow){shadow.querySelector('.k').textContent=reason;const button=shadow.getElementById('stop');if(/rate.?limit/i.test(reason||'')){button.textContent='Dismiss';button.disabled=false}else{button.disabled=true;setTimeout(()=>X.overlayHost?.remove(),2200)}}
-    await persist(reason);
+    X.finishing++;
+    try {
+      if (X.keepAlive) clearInterval(X.keepAlive); if (X.overlayTimer) clearInterval(X.overlayTimer);
+      X.interval=null;X.keepAlive=null;X.issue=reason;X.performanceStyle?.remove();updateOverlay();
+      const shadow=X.overlayHost?.shadowRoot;if(shadow){shadow.querySelector('.k').textContent=reason;const button=shadow.getElementById('stop');if(/rate.?limit/i.test(reason||'')){button.textContent='Dismiss';button.disabled=false}else{button.disabled=true;setTimeout(()=>X.overlayHost?.remove(),2200)}}
+      await persist(reason);
+    } finally {
+      if (--X.finishing === 0) setJobRunning(false);
+    }
   };
   window.__xCleanerStop=()=>stop('Stopped by user');
   if(performanceMode){const style=document.createElement('style');style.textContent='article[data-testid="tweet"] [data-testid="tweetPhoto"],article[data-testid="tweet"] [data-testid="videoPlayer"],article[data-testid="tweet"] video{display:none!important}';(document.head||document.documentElement).appendChild(style);X.performanceStyle=style}

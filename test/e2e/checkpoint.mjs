@@ -103,6 +103,75 @@ function reloadScenario(name, start, page) {
   };
 }
 
+// A reconciliation while Stop writes the final record (VER-819): the worker's final write is held in
+// the tab, a history page or the popup reconciles meanwhile with its own write held (each with its
+// own liveness probe), and the final write is released first. The job must stay live while
+// finishing, so nothing overwrites its final record.
+function finishingScenario(name, start, { page = 'history/history.html', probe = null } = {}) {
+  return {
+    name: `checkpoint: ${name}`,
+    state: { own: 15 },
+    async run(env, state) {
+      const release = holdMutations(state, 10);
+      const opener = await start(env);
+      const cp = await heldCheckpoint(env, state, 10);
+      await opener.close();
+      // Opened while the job runs, so its own reconciliation on load finds it live.
+      const view = await openExtensionPage(env.context, env.extensionId, page);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      await view.evaluate(id => {
+        const area = chrome.storage.local, set = area.set.bind(area);
+        window.__held = [];
+        area.set = (items, ...rest) => Object.keys(items || {}).includes(`job_${id}`)
+          ? new Promise(resolve => window.__held.push(() => resolve(set(items, ...rest))))
+          : set(items, ...rest);
+      }, cp.entry.id);
+      // The worker runs in the tab's isolated world, as executeScript does: hold its final write, then Stop.
+      const inTab = which => env.worker.evaluate(async which => {
+        const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+        const funcs = {
+          holdAndStop: () => {
+            const area = chrome.storage.local, set = area.set.bind(area);
+            window.__xbcHeld = [];
+            area.set = (items, ...rest) => Object.entries(items || {}).some(([key, value]) => key.startsWith('job_') && value?.status && value.status !== 'running')
+              ? new Promise(resolve => window.__xbcHeld.push(() => resolve(set(items, ...rest))))
+              : set(items, ...rest);
+            window.__xCleanerStop();
+          },
+          heldCount: () => window.__xbcHeld?.length || 0,
+          resume: () => { window.__xbcHeld.splice(0).forEach(resume => resume()); }
+        };
+        const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: funcs[which] });
+        return result?.result;
+      }, which);
+      await inTab('holdAndStop');
+      const held = await waitFor(async () => (await inTab('heldCount')) > 0, { timeout: 10000, label: 'final write held' }).catch(() => false);
+      const during = await jobTab(env);
+      await view.evaluate(probe => { window.__reconciled = null; reconcileInterruptedJobs(probe ? window[probe] : undefined).then(n => { window.__reconciled = n; }); }, probe);
+      const reconciliation = await waitFor(() => view.evaluate(() => (window.__held.length ? 'held a write' : window.__reconciled === null ? null : `changed ${window.__reconciled}`)),
+        { timeout: 10000, label: 'reconciliation to finish or write' }).catch(() => 'no answer');
+      await inTab('resume');
+      await waitFor(async () => (await storage(env.worker, [`job_${cp.entry.id}`]))[`job_${cp.entry.id}`]?.status === 'stopped',
+        { timeout: 10000, label: 'final record written' }).catch(() => null);
+      await view.evaluate(() => { window.__held.splice(0).forEach(resume => resume()); });
+      release();
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const all = await history(env);
+      const job = all.find(j => j.id === cp.entry.id);
+      const record = (await storage(env.worker, [`job_${cp.entry.id}`]))[`job_${cp.entry.id}`];
+      const after = await jobTab(env);
+      await view.close();
+      return [
+        ['a checkpoint was saved, then the final write was held after Stop', cp.entry.status === 'running' && held === true, { cp: cp.entry.status, held }],
+        ['the tab stays protected while the final record is written', during.registered && during.autoDiscardable === false, during],
+        ['a reconciliation meanwhile leaves the finishing job alone', reconciliation === 'changed 0', reconciliation],
+        ['the final record stands with the full backup', job?.status === 'stopped' && record?.status === 'stopped' && record.backup.tweets.length === job.total && job.total >= cp.entry.total && all.filter(j => j.id === cp.entry.id).length === 1, { job: job && [job.status, job.total], record: record && [record.status, record.backup.tweets.length] }],
+        ['the tab is released once the record is written', after.autoDiscardable === true && !after.registered, after]
+      ];
+    }
+  };
+}
+
 export function checkpointScenarios() {
   return [
     reloadScenario('reloading the tab mid Quick Clean leaves one interrupted job', env => startQuickClean(env, 'delete'), 'popup/popup.html'),
@@ -193,6 +262,31 @@ export function checkpointScenarios() {
         return [
           ['closing another tab keeps the job keys and still clears its preview session', afterPreview.activeAction === 'delete' && afterPreview.activeTabId === ids.job && afterPreview.startTime && afterPreview.actionStats && !afterPreview.activePreviewSession, afterPreview],
           ['closing the job tab clears activeAction, activeTabId, startTime and actionStats', Object.keys(afterJob).length === 0, afterJob]
+        ];
+      }
+    },
+    finishingScenario('a reconciliation during Stop in Quick Clean never overwrites the final record', env => startQuickClean(env, 'delete')),
+    finishingScenario('a reconciliation during Stop in selected deletion never overwrites the final record', startSelectedDelete),
+    finishingScenario('a reconciliation from the popup during Stop never overwrites the final record', env => startQuickClean(env, 'delete'), { page: 'popup/popup.html', probe: 'readWorkerState' }),
+    {
+      name: 'checkpoint: an entry left running takes the final record that landed after it',
+      state: { own: 0 },
+      async run(env) {
+        const at = Date.now() - 60000;
+        const counts = { tweets: 2, replies: 0, unliked: 0, unreposted: 0, follows: 0, unfollows: 0 };
+        const entry = { id: 'done-job', action: 'delete', account: { username: ME.screen }, startedAt: at - 20000, checkpointAt: at - 10000, durationMs: 10000, status: 'running', statusText: 'Running', total: 1, counts: { ...counts, tweets: 1 } };
+        const { checkpointAt, ...rest } = entry;
+        const final = { ...rest, completedAt: at, durationMs: 20000, status: 'completed', statusText: 'Finished — 2 deleted via API', total: 2, counts };
+        const rows = [0, 1].map(i => ({ id: `8${i}`, url: `/me/status/8${i}`, action: 'deleted' }));
+        await env.worker.evaluate(({ entry, final, rows }) => chrome.storage.local.set({ jobHistory: [entry], 'job_done-job': { ...final, backup: { tweets: rows, replies: [], unliked: [], unreposted: [], follows: [], unfollows: [] } } }), { entry, final, rows });
+        const view = await openExtensionPage(env.context, env.extensionId, 'history/history.html');
+        const job = await waitFor(async () => (await history(env)).find(j => j.id === 'done-job' && j.status !== 'running'),
+          { timeout: 20000, label: 'entry reconciled' }).catch(() => null);
+        const record = (await storage(env.worker, ['job_done-job']))['job_done-job'];
+        await view.close();
+        return [
+          ['the entry takes the final record, without the backup', job?.status === 'completed' && job.total === 2 && job.completedAt === at && Object.keys(counts).every(key => job.counts?.[key] === counts[key]) && !('backup' in job) && !('checkpointAt' in job), job],
+          ['the final record is untouched', record?.status === 'completed' && record.backup.tweets.length === 2, record && record.status]
         ];
       }
     }
