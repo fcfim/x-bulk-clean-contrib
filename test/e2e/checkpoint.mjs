@@ -104,9 +104,10 @@ function reloadScenario(name, start, page) {
 }
 
 // A reconciliation while Stop writes the final record (VER-819): the worker's final write is held in
-// the tab, a history page reconciles meanwhile with its own write held, and the final write is
-// released first. The job must stay live while finishing, so nothing overwrites its final record.
-function finishingScenario(name, start) {
+// the tab, a history page or the popup reconciles meanwhile with its own write held (each with its
+// own liveness probe), and the final write is released first. The job must stay live while
+// finishing, so nothing overwrites its final record.
+function finishingScenario(name, start, { page = 'history/history.html', probe = null } = {}) {
   return {
     name: `checkpoint: ${name}`,
     state: { own: 15 },
@@ -116,7 +117,7 @@ function finishingScenario(name, start) {
       const cp = await heldCheckpoint(env, state, 10);
       await opener.close();
       // Opened while the job runs, so its own reconciliation on load finds it live.
-      const view = await openExtensionPage(env.context, env.extensionId, 'history/history.html');
+      const view = await openExtensionPage(env.context, env.extensionId, page);
       await new Promise(resolve => setTimeout(resolve, 1000));
       await view.evaluate(id => {
         const area = chrome.storage.local, set = area.set.bind(area);
@@ -146,7 +147,7 @@ function finishingScenario(name, start) {
       await inTab('holdAndStop');
       const held = await waitFor(async () => (await inTab('heldCount')) > 0, { timeout: 10000, label: 'final write held' }).catch(() => false);
       const during = await jobTab(env);
-      await view.evaluate(() => { window.__reconciled = null; reconcileInterruptedJobs().then(n => { window.__reconciled = n; }); });
+      await view.evaluate(probe => { window.__reconciled = null; reconcileInterruptedJobs(probe ? window[probe] : undefined).then(n => { window.__reconciled = n; }); }, probe);
       const reconciliation = await waitFor(() => view.evaluate(() => (window.__held.length ? 'held a write' : window.__reconciled === null ? null : `changed ${window.__reconciled}`)),
         { timeout: 10000, label: 'reconciliation to finish or write' }).catch(() => 'no answer');
       await inTab('resume');
@@ -266,6 +267,7 @@ export function checkpointScenarios() {
     },
     finishingScenario('a reconciliation during Stop in Quick Clean never overwrites the final record', env => startQuickClean(env, 'delete')),
     finishingScenario('a reconciliation during Stop in selected deletion never overwrites the final record', startSelectedDelete),
+    finishingScenario('a reconciliation from the popup during Stop never overwrites the final record', env => startQuickClean(env, 'delete'), { page: 'popup/popup.html', probe: 'readWorkerState' }),
     {
       name: 'checkpoint: an entry left running takes the final record that landed after it',
       state: { own: 0 },
