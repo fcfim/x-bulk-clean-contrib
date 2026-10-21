@@ -103,7 +103,9 @@ async function testPreviewPolling() {
   await run('stopScan()');
   check('Stop scan refreshes once and stops polling', () => assert.equal(timers.size, 0));
   await run('stopScan()');
-  check('New scan resets the review and its snapshot', () => { assert.equal(run('previewItems.length'), 0); assert.equal(run('previewSnapshot'), null); });
+  check('New scan with a review on screen asks first and keeps the list (VER-816)', () => { assert.equal(document.getElementById('newScanDialog').open, true); assert.ok(run('previewItems.length') > 0); });
+  await run('resetPreview()');
+  check('New scan resets the review and its snapshot', () => { assert.equal(run('previewItems.length'), 0); assert.equal(run('previewSnapshot'), null); assert.equal(document.getElementById('newScanDialog').open, false); });
 
   holdFull = new Promise(resolve => { releaseFull = resolve; });
   window.__xbcPreview = { startedAt: 3, type: 'tweets', items: makeItems(2), interval: {}, paused: true };
@@ -1482,6 +1484,132 @@ const SCENARIOS = [
         ['mode is dom', r.worker?.mode === 'dom', r.worker],
         ['found counts your 3 posts only', r.worker?.stats.found === 3, r.worker?.stats],
         ['your posts deleted, the reposts untouched', r.worker?.stats.deleted === 3 && state.tweets.length === 2 && state.tweets.every(t => t.retweetOf), state.tweets.map(t => t.id)]
+      ];
+    }
+  },
+  // The Preview panel after the incident of 21/10 (VER-816): a scan the X tab lost is reported and
+  // ends its session, a rate-limit wait is shown, "New scan" asks before clearing a review, and an
+  // API scan is not stopped by moving to another page inside X.
+  {
+    name: 'preview lost: a reload during the scan brings the panel back to the setup, with the reason',
+    state: { own: 12 },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      await waitFor(async () => { const P = await readPreview(env); return P?.running && P.ids.length > 0; }, { timeout: 30000, label: 'scan under way' });
+      await xPage(env).reload();
+      const shown = await panel.waitForFunction(() => document.getElementById('setupSection').style.display === 'block' && /scan was lost/.test(document.getElementById('errorMessage').textContent), null, { timeout: 15000 }).then(() => true, () => false);
+      const ui = await panel.evaluate(() => ({ setup: document.getElementById('setupSection').style.display, card: document.getElementById('scanCard').style.display, error: document.getElementById('errorMessage').textContent, state: document.getElementById('scanState').textContent }));
+      const session = (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null;
+      await panel.evaluate(() => document.getElementById('startScan').click());
+      const restarted = await waitFor(async () => { const P = await readPreview(env); return P?.running && P; }, { timeout: 20000, label: 'new scan' }).catch(() => null);
+      await panel.close();
+      return [
+        ['the panel says the scan was lost and shows the setup', shown, ui],
+        ['the session is ended', session === null, session],
+        ['a new scan starts', !!restarted, restarted]
+      ];
+    }
+  },
+  {
+    name: 'preview lost: reopening the panel after the scan was lost says so and ends the session',
+    state: { own: 12 },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      await waitFor(async () => { const P = await readPreview(env); return P?.running && P.ids.length > 0; }, { timeout: 30000, label: 'scan under way' });
+      await panel.close();
+      await xPage(env).reload();
+      const again = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      const said = await again.waitForFunction(() => /last scan was lost/.test(document.getElementById('errorMessage').textContent), null, { timeout: 10000 }).then(() => true, () => false);
+      const error = await again.evaluate(() => document.getElementById('errorMessage').textContent);
+      const session = (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null;
+      await again.close();
+      return [
+        ['the panel says the last scan was lost', said, error],
+        ['the session is ended', session === null, session]
+      ];
+    }
+  },
+  {
+    name: 'preview lost: a session left by a tab without its scan does not block a new scan',
+    state: { own: 3 },
+    async run(env) {
+      await env.worker.evaluate(() => chrome.storage.local.set({ activePreviewSession: { tabId: 987654321, type: 'tweets', startedAt: Date.now() } }));
+      const panel = await startDomScan(env, 'tweets');
+      const started = await waitFor(async () => { const P = await readPreview(env); return P?.running && P; }, { timeout: 20000, label: 'scan to start' }).catch(() => null);
+      const error = await panel.evaluate(() => document.getElementById('errorMessage').textContent);
+      await panel.close();
+      return [
+        ['the scan started', !!started, error],
+        ['no other-session error', !/Another Preview/.test(error), error]
+      ];
+    }
+  },
+  {
+    name: 'preview wait: an API scan waiting out a rate limit says when it resumes',
+    state: { own: 3 },
+    async run(env, state) {
+      // Prime the profile first: its own discovery GET must not consume the worker fixture.
+      await xPage(env).goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
+      state.misbehave.responses.UserTweets = [{ code: 88, resetSeconds: 8 }];
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.locator('#startScan').click();
+      const shown = await panel.waitForFunction(() => /X rate limit · resuming at \d/.test(document.getElementById('scanState').textContent), null, { timeout: 8000 })
+        .then(() => true, () => false);
+      const during = await panel.evaluate(() => document.getElementById('scanState').textContent);
+      await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent), null, { timeout: 60000 });
+      const scan = await readPreview(env);
+      await panel.close();
+      return [
+        ['the wait and its end time are shown', shown, during],
+        ['the scan resumed and finished by API', scan?.mode === 'api' && scan.done && scan.ids.length === 3, scan]
+      ];
+    }
+  },
+  {
+    name: 'preview new scan: a review on screen is cleared only after you confirm',
+    state: { own: 3 },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent) && document.getElementById('reviewSection').style.display === 'block', null, { timeout: 60000 });
+      await panel.locator('#stopScan').click();
+      const asked = await panel.waitForFunction(() => document.getElementById('newScanDialog')?.open, null, { timeout: 5000 }).then(() => true, () => false);
+      const shownAfterAsk = await panel.evaluate(() => ({ review: document.getElementById('reviewSection').style.display, items: previewItems.length }));
+      let afterCancel = null, afterConfirm = null;
+      if (asked) {
+        await panel.locator('#cancelNewScan').click();
+        afterCancel = { review: await panel.evaluate(() => document.getElementById('reviewSection').style.display), scan: !!(await readPreview(env)) };
+        await panel.locator('#stopScan').click();
+        await panel.locator('#confirmNewScan').click();
+        await panel.waitForFunction(() => document.getElementById('setupSection').style.display === 'block', null, { timeout: 5000 });
+        afterConfirm = { setup: true, scan: await readPreview(env), session: (await storage(env.worker, ['activePreviewSession'])).activePreviewSession || null };
+      }
+      await panel.close();
+      return [
+        ['New scan asks first and keeps the list', asked && shownAfterAsk.review === 'block' && shownAfterAsk.items === 3, { asked, shownAfterAsk }],
+        ['Keep the list leaves the review and the scan', afterCancel?.review === 'block' && afterCancel.scan, afterCancel],
+        ['Clear the list resets the scan and ends the session', afterConfirm?.setup && afterConfirm.scan === null && afterConfirm.session === null, afterConfirm]
+      ];
+    }
+  },
+  {
+    name: 'preview api: moving to another page inside X does not stop an API scan',
+    state: { own: 9, pageSize: 3 },
+    async run(env, state) {
+      await xPage(env).goto(`https://x.com/${ME.screen}`);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweets'), { label: 'profile discovery GET' });
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await panel.waitForFunction(() => !document.getElementById('startScan').disabled);
+      await panel.locator('#startScan').click();
+      const during = await waitFor(async () => { const P = await readPreview(env); return P?.running && P.ids.length > 0 && P; }, { timeout: 20000, label: 'first API page' });
+      await xPage(env).evaluate(() => history.pushState({}, '', '/explore'));
+      await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent), null, { timeout: 60000 });
+      const scan = await readPreview(env);
+      await panel.close();
+      return [
+        ['moved while the API scan was running', during.mode === 'api' && during.ids.length < 9, during],
+        ['the scan finished with every post', scan?.mode === 'api' && scan.done && scan.ids.length === 9, scan]
       ];
     }
   },
