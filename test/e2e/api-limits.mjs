@@ -67,7 +67,7 @@ export async function scan(h, { useApi = true, type = 'tweets', whileRunning } =
     await Promise.resolve();
     if (!window.__xbcPreview?.interval || (!useApi && window.__xbcPreview.interval.loop)) break;
   }
-  await whileRunning?.(window.__xbcPreview);
+  if (whileRunning) await whileRunning(window.__xbcPreview);
   const result = { ...window.__xbcPreview, domStarted: !!window.__xbcPreview.interval?.loop };
   if (window.__xbcPreview.interval) window.__xbcPreviewStop();
   return result;
@@ -96,7 +96,7 @@ export async function deletion(h, selected = false, { useApi = true, action = 'd
   }
   const x = window.__xCleaner;
   assert(x.historyPersisted || x.apiFallback || (!useApi && x.interval?.loop), 'worker settled or entered DOM');
-  await whileRunning?.(x);
+  if (whileRunning) await whileRunning(x);
   const result = { domStarted: !!x.interval?.loop, mode: x.mode, apiFallback: x.apiFallback || null, issue: x.issue, historyPersisted: x.historyPersisted, successCount: x.successCount };
   if (x.interval) await window.__xCleanerStop();
   return result;

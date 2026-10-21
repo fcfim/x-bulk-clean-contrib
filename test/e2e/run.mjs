@@ -276,7 +276,7 @@ async function failSteps(env, worker, count) {
 async function readFault(env) {
   return env.worker.evaluate(async () => {
     const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
-    const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => window.__xbcFault && { ...window.__xbcFault, busy: !!window.__xCleaner?.busy } });
+    const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => window.__xbcFault && { ...window.__xbcFault, busy: !!(window.__xCleaner?.busy || window.__xbcPreview?.busy) } });
     return r?.result;
   });
 }
@@ -1420,6 +1420,41 @@ const SCENARIOS = [
         ['scan stopped unfinished, with the error', !scan.done && /3 errors in a row: synthetic step failure/.test(scan.issue || ''), scan],
         ['the panel says why', /errors in a row/.test(label), label],
         ['stopped at the third failure', fault?.thrown === 3 && fault.left === 0, fault]
+      ];
+    }
+  },
+  {
+    name: 'preview loop: failing steps with a good step between them leave the scan running',
+    state: { own: 12 },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      const first = await failSteps(env, '__xbcPreview', 2);
+      await waitFor(async () => { const f = await readFault(env); return f && f.left === 0 && f.passed > first.passed && !f.busy; }, { timeout: 30000, label: 'a good step' });
+      await failSteps(env, '__xbcPreview', 2);
+      const scan = await waitFor(async () => { const P = await readPreview(env); return P && !P.running && P; }, { timeout: 60000, label: 'scan to end' });
+      const fault = await readFault(env);
+      await panel.close();
+      return [
+        ['scan complete', scan.done && scan.ids.length === 12, scan],
+        ['four failures, never three in a row', fault?.thrown === 4, fault]
+      ];
+    }
+  },
+  {
+    name: 'preview loop: failing steps with a good step between them leave selected deletion running',
+    state: { own: 8 },
+    async run(env, state) {
+      const job = previewAndAct(env, 'tweets', { apiMode: false });
+      const first = await failSteps(env, '__xCleaner', 2);
+      // Arm the next two only after a good step has run to its end.
+      await waitFor(async () => { const f = await readFault(env); return f && f.left === 0 && f.passed > first.passed && !f.busy; }, { timeout: 60000, label: 'a good step' });
+      await failSteps(env, '__xCleaner', 2);
+      const r = await job;
+      const fault = await readFault(env);
+      return [
+        ['job finished', r.job.status === 'completed', r.job.statusText],
+        ['all 8 deleted', state.tweets.length === 0, state.tweets.length],
+        ['four failures, never three in a row', fault?.thrown === 4, fault]
       ];
     }
   },
