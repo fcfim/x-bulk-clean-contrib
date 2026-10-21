@@ -23,7 +23,6 @@ const ACTION_PATHS = {
   delete: '',
   unlike: '/likes',
   unrepost: '',
-  deleteReplies: '/with_replies',
   followVerified: '/verified_followers',
   followAll: '/followers',
   bulkUnfollow: '/following'
@@ -48,13 +47,6 @@ const ACTION_CONFIRMATIONS = {
     description: 'Every repost on your profile will be undone. A record of each one is saved locally.',
     button: 'Remove reposts',
     icon: 'icon-repeat'
-  },
-  deleteReplies: {
-    title: 'Find replies safely',
-    description: 'Opens Preview & Select to identify normal and orphan replies before you choose what to delete.',
-    button: 'Open safe scan',
-    icon: 'icon-message-x',
-    danger: true
   },
   followVerified: {
     title: 'Follow verified followers?',
@@ -352,7 +344,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
     if (action === 'delete') return `${s.deleted || 0} deleted · ${s.found || 0} found`;
     if (action === 'unlike') return `${s.unlikes || 0} unliked · ${s.foundLikes || 0} found`;
     if (action === 'unrepost') return `${s.unreposts || 0} removed · ${s.foundReposts || 0} found`;
-    if (action === 'deleteReplies') return `${s.repliesDeleted || 0} deleted · ${s.repliesFound || 0} found`;
     if (action === 'followVerified' || action === 'followAll') return `${s.follows || 0} followed · ${s.foundFollowers || 0} found`;
     if (action === 'bulkUnfollow') return `${s.unfollows || 0} unfollowed · ${s.foundFollowing || 0} found`;
     return `${X.successCount || 0} completed`;
@@ -377,7 +368,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
       delete: 'Deleting all posts',
       unlike: 'Clearing all likes',
       unrepost: 'Removing all reposts',
-      deleteReplies: 'Deleting all replies',
       followVerified: 'Following verified accounts',
       followAll: 'Following all followers',
       bulkUnfollow: 'Bulk unfollowing'
@@ -545,43 +535,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   function isMine(article) {
     return !!me && authorHandle(article) === me;
-  }
-
-  // A thread connector is a thin, tall, visible vertical line in a tweet's avatar
-  // column. On /with_replies the PARENT tweet carries a downward connector to the reply
-  // beneath it. Detected by shape (X's class names are obfuscated and rotate).
-  function cellHasConnector(cell) {
-    if (!cell) return false;
-    const divs = cell.querySelectorAll('div');
-    const max = Math.min(divs.length, 160);
-    for (let i = 0; i < max; i++) {
-      const el = divs[i];
-      const w = el.offsetWidth, h = el.offsetHeight;
-      if (w >= 1 && w <= 3 && h >= 18) {
-        const bg = getComputedStyle(el).backgroundColor;
-        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return true;
-      }
-    }
-    return false;
-  }
-
-  // Robust reply detection (verified against live x.com on 2026-06-14):
-  //  1. Standalone replies carry a "Replying to @x" label.
-  //  2. Threaded replies have NO label and look like posts — but the parent tweet sits in
-  //     the previous cell with a downward connector line. So: an owned tweet whose nearest
-  //     preceding article-cell has a connector is a reply. Original posts stand alone with
-  //     no connected parent above, so they're correctly excluded (never deleted by mistake).
-  function isReply(article) {
-    if (/Replying to|Em resposta a|En respuesta a|En réponse à|Antwort an/i.test((article.textContent || '').slice(0, 300))) return true;
-    const cell = article.closest('[data-testid="cellInnerDiv"]');
-    if (!cell) return false;
-    let prev = cell.previousElementSibling;
-    for (let hops = 0; prev && hops < 4; hops++, prev = prev.previousElementSibling) {
-      if (prev.querySelector && prev.querySelector('article[data-testid="tweet"]')) {
-        return cellHasConnector(prev);
-      }
-    }
-    return false;
   }
 
   function tweetSnap(article) {
@@ -899,26 +852,25 @@ function runWorker(action, performanceMode, account, useApi = false) {
   // of clicking, so the job needs neither scrolling nor a rendered tab. If X refuses the API
   // before anything succeeded, the job falls back to clicking.
   const LIST_OP = {
-    delete: 'UserTweets', unrepost: 'UserTweets', deleteReplies: 'UserTweetsAndReplies', unlike: 'Likes',
+    delete: 'UserTweets', unrepost: 'UserTweets', unlike: 'Likes',
     followVerified: 'BlueVerifiedFollowers', followAll: 'Followers', bulkUnfollow: 'Following'
   };
   const PACE_KEY = {
-    delete: 'delete', deleteReplies: 'delete', unrepost: 'unrepost', unlike: 'unlike',
+    delete: 'delete', unrepost: 'unrepost', unlike: 'unlike',
     followVerified: 'follow', followAll: 'follow', bulkUnfollow: 'unfollow'
   };
   const FOUND_KEY = {
-    delete: 'found', unrepost: 'foundReposts', deleteReplies: 'repliesFound', unlike: 'foundLikes',
+    delete: 'found', unrepost: 'foundReposts', unlike: 'foundLikes',
     followVerified: 'foundFollowers', followAll: 'foundFollowers', bulkUnfollow: 'foundFollowing'
   };
   const DONE_VERB = {
-    delete: 'deleted', unrepost: 'removed', deleteReplies: 'deleted', unlike: 'unliked',
+    delete: 'deleted', unrepost: 'removed', unlike: 'unliked',
     followVerified: 'followed', followAll: 'followed', bulkUnfollow: 'unfollowed'
   };
 
   function apiItems(page, isMe, myId) {
     const tweets = page.tweets || [], users = page.users || [];
     if (action === 'delete') return tweets.filter(t => isMe(t) && !t.retweetOf).map(t => ({ key: t.id, tweet: t }));
-    if (action === 'deleteReplies') return tweets.filter(t => isMe(t) && !t.retweetOf && t.replyTo).map(t => ({ key: t.id, tweet: t }));
     if (action === 'unrepost') return tweets.filter(t => isMe(t) && t.retweetOf).map(t => ({ key: t.retweetOf.id, tweet: t.retweetOf }));
     if (action === 'unlike') return tweets.map(t => ({ key: t.id, tweet: t }));
     if (action === 'followVerified' || action === 'followAll') {
@@ -929,7 +881,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
   }
 
   function apiAct(api, item, options) {
-    if (action === 'delete' || action === 'deleteReplies') return api.deleteTweet(item.tweet.id, options);
+    if (action === 'delete') return api.deleteTweet(item.tweet.id, options);
     if (action === 'unrepost') return api.deleteRetweet(item.tweet.id, options);
     if (action === 'unlike') return api.unfavorite(item.tweet.id, options);
     if (action === 'bulkUnfollow') return api.unfollow(item.user, options);
@@ -942,7 +894,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
     const tweetRow = t && { id: t.id, date: t.date, text: t.text, author: t.author, url: t.url };
     const userRow = u && { username: u.username, displayName: u.displayName, profileUrl: `/${u.username}` };
     if (action === 'delete') { X.stats.deleted++; X.backup.tweets.push({ ...tweetRow, action: 'deleted', actionAt: at }); }
-    else if (action === 'deleteReplies') { X.stats.repliesDeleted++; X.backup.replies.push({ ...tweetRow, action: 'deleted_reply', actionAt: at }); }
     else if (action === 'unrepost') { X.stats.unreposts++; X.backup.unreposted.push({ ...tweetRow, action: 'unreposted', actionAt: at }); }
     else if (action === 'unlike') { X.stats.unlikes++; X.backup.unliked.push({ ...tweetRow, action: 'unliked', actionAt: at }); }
     else if (action === 'bulkUnfollow') { X.stats.unfollows++; X.backup.unfollows.push({ ...userRow, action: 'unfollowed', actionAt: at }); }
@@ -1020,7 +971,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
   function startDomLoop() {
     X.mode = 'dom';
     X.route = routeKey();
-    if ((action === 'delete' || action === 'deleteReplies') && accountIssue) {
+    if (action === 'delete' && accountIssue) {
       stopAll(accountIssue);
       return;
     }
@@ -1175,68 +1126,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
       }, 2000);
     }
 
-    else if (action === 'deleteReplies') {
-      X.stats = { repliesDeleted: 0, repliesFound: 0 };
-      runLoop(async () => {
-        if (X.busy || !X.interval) return;
-        if (await leftPage()) return;
-        const issue = detectIssue();
-        if (issue) { stopAll(issue); return; }
-        X.busy = true;
-        try {
-          const articles = inColumn('article[data-testid="tweet"]');
-          const candidates = [];
-          for (const a of articles) {
-            const id = tweetId(a);
-            if (!id || X.processed.has(id)) continue;
-            if (!isMine(a)) { X.processed.add(id); continue; }
-            if (!isReply(a)) continue;
-            const caret = a.querySelector('[data-testid="caret"]');
-            if (caret) candidates.push({ article: a, caret, id });
-          }
-          X.stats.repliesFound = X.processed.size + candidates.length;
-
-          let processedThisCycle = 0;
-          const maxPerCycle = hidden() ? 1 : 3;
-          for (const { article: initial, id } of candidates) {
-            if (!X.interval || await leftPage()) break;
-            const article = liveArticle(initial, id);
-            const caret = article?.querySelector('[data-testid="caret"]');
-            if (!caret) continue; // virtualized away; picked up again next cycle
-            const snap = tweetSnap(article);
-            caret.click();
-            await sleep(hidden() ? 900 : 600);
-
-            const opened = await clickDeleteInMenu();
-            if (!opened) noteFailure(id);
-            if (opened) {
-              await sleep(hidden() ? 900 : 600);
-              if (!await clickConfirm('confirmationSheetConfirm')) noteFailure(id);
-              else {
-                X.processed.add(id);
-                X.stats.repliesDeleted++;
-                X.backup.replies.push({ ...snap, action: 'deleted_reply', actionAt: new Date().toISOString() });
-                await bumpAndCheckCap();
-                if (!X.interval) break;
-              }
-              await sleep(hidden() ? 1200 : 800);
-            }
-
-            processedThisCycle++;
-            if (processedThisCycle >= maxPerCycle) break;
-          }
-
-          noteEmpty(candidates.length);
-          // Only advance once every visible candidate this cycle was handled — otherwise a
-          // fast scroll would virtualize away unprocessed items before we reach them.
-          advance(candidates.length, processedThisCycle);
-          await sleep(hidden() ? 1800 : 1200);
-        } finally {
-          X.busy = false;
-        }
-      }, 3000);
-    }
-
     else if (action === 'followVerified' || action === 'followAll') {
       X.stats = { follows: 0, foundFollowers: 0 };
       runLoop(async () => {
@@ -1374,13 +1263,13 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   X.stats = {
     delete: { deleted: 0, found: 0 }, unrepost: { unreposts: 0, foundReposts: 0 },
-    deleteReplies: { repliesDeleted: 0, repliesFound: 0 }, unlike: { unlikes: 0, foundLikes: 0 },
+    unlike: { unlikes: 0, foundLikes: 0 },
     followVerified: { follows: 0, foundFollowers: 0 }, followAll: { follows: 0, foundFollowers: 0 },
     bulkUnfollow: { unfollows: 0, foundFollowing: 0 }
   }[action] || {};
   // Kept inside this serialized worker: DOM mode may run without xapi injected.
   async function domCooldown() {
-    const operation = { delete: 'DeleteTweet', deleteReplies: 'DeleteTweet', unrepost: 'DeleteRetweet', unlike: 'UnfavoriteTweet', bulkUnfollow: 'friendships/destroy', followAll: 'friendships/create', followVerified: 'friendships/create' }[action];
+    const operation = { delete: 'DeleteTweet', unrepost: 'DeleteRetweet', unlike: 'UnfavoriteTweet', bulkUnfollow: 'friendships/destroy', followAll: 'friendships/create', followVerified: 'friendships/create' }[action];
     const operations = [LIST_OP[action], operation];
     const raw = (document.cookie || '').match(/(?:^|;\s*)twid=([^;]*)/)?.[1] || '';
     const accountId = decodeURIComponent(raw).match(/u=(\d+)/)?.[1];

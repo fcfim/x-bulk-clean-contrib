@@ -212,7 +212,7 @@ export async function testApiLimits() {
     const p = await scan(h); assert.equal(!!p.apiFallback, false); assert.equal(p.domStarted, false); assert.match(p.issue, active ? /suspended/ : /turn off API/); assert.equal(h.calls.length, 0);
   });
   const quickActions = {
-    delete: ['UserTweets', 'DeleteTweet'], deleteReplies: ['UserTweetsAndReplies', 'DeleteTweet'], unrepost: ['UserTweets', 'DeleteRetweet'],
+    delete: ['UserTweets', 'DeleteTweet'], unrepost: ['UserTweets', 'DeleteRetweet'],
     unlike: ['Likes', 'UnfavoriteTweet'], bulkUnfollow: ['Following', 'friendships/destroy'], followAll: ['Followers', 'friendships/create'], followVerified: ['BlueVerifiedFollowers', 'friendships/create']
   };
   for (const [action, operations] of Object.entries(quickActions)) for (const operation of operations) await check(`API off Quick Clean ${action} checks ${operation}`, async () => {
