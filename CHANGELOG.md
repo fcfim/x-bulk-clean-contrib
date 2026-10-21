@@ -17,3 +17,4 @@ First release of Postscrub.
 - Posts are no longer skipped after one missed click: elements are looked up again after X re-renders, and a post is retried up to three times.
 - Jobs no longer stall or end early in a background tab: sleeps are timed by the service worker, the tab is kept from being discarded, and a hidden tab's empty cycles no longer count as the end of a list.
 - Reply detection and X's error toasts are recognized in Portuguese, Spanish, French and German.
+- CSV backups open correctly in spreadsheets: they start with a byte order mark, so Excel shows accents, and a cell that starts with =, +, -, @, a tab or a carriage return gets a leading ' so it is shown as text instead of evaluated. The download link is no longer revoked right after the click.

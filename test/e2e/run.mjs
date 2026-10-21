@@ -1080,6 +1080,89 @@ const SCENARIOS = [
       ];
     }
   },
+  // CSV backups (VER-630): a byte order mark for Excel, cells that a spreadsheet would evaluate
+  // kept as text, and the download URL still valid after the click. All three download paths.
+  ...(() => {
+    const at = Date.UTC(2024, 0, 2, 12);
+    const job = {
+      id: 'csv-job', action: 'delete', account: { username: ME.screen }, startedAt: at - 60000, completedAt: at, durationMs: 60000,
+      status: 'completed', statusText: 'Finished', total: 6, counts: { tweets: 1, replies: 1, unliked: 1, unreposted: 2, follows: 1, unfollows: 0 }
+    };
+    const backup = {
+      tweets: [{ date: '2024-01-01T00:00:00.000Z', text: '=HYPERLINK("http://example.com","x")', author: 'me', url: 'https://x.com/me/status/1', action: 'deleted', actionAt: '2024-01-02T12:00:00.000Z' }],
+      replies: [{ date: '2024-01-01T00:00:00.000Z', text: '@fulano obrigado pela atenção', author: 'me', url: 'https://x.com/me/status/2', action: 'deleted_reply', actionAt: '2024-01-02T12:00:00.000Z' }],
+      unliked: [{ date: '2024-01-01T00:00:00.000Z', text: '+1 and -2\tminus', author: 'other', url: 'https://x.com/other/status/3', action: 'unliked', actionAt: '2024-01-02T12:00:00.000Z' }],
+      unreposted: [{ date: '2024-01-01T00:00:00.000Z', text: '\tstarts with a tab', author: 'other', url: 'https://x.com/other/status/4', action: 'unreposted', actionAt: '2024-01-02T12:00:00.000Z' },
+        { date: '2024-01-01T00:00:00.000Z', text: '\rstarts with a carriage return', author: 'other', url: 'https://x.com/other/status/5', action: 'unreposted', actionAt: '2024-01-02T12:00:00.000Z' }],
+      follows: [{ username: 'fulano', displayName: '-dash name', profileUrl: 'https://x.com/fulano', action: 'followed', actionAt: '2024-01-02T12:00:00.000Z' }],
+      unfollows: []
+    };
+    const seed = env => env.worker.evaluate(({ job, backup }) => chrome.storage.local.set({ jobHistory: [job], 'job_csv-job': { ...job, backup } }), { job, backup });
+    // Clicks, saves the download, and reports whether the page revoked its URL within a second.
+    const download = async (page, click) => {
+      await page.evaluate(() => {
+        window.__revoked = 0;
+        const revoke = URL.revokeObjectURL.bind(URL);
+        URL.revokeObjectURL = url => { window.__revoked++; revoke(url); };
+      });
+      const [file] = await Promise.all([page.waitForEvent('download', { timeout: 10000 }), click()]);
+      const bytes = fs.readFileSync(await file.path());
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return { bytes, revokedEarly: await page.evaluate(() => window.__revoked > 0) };
+    };
+    const checks = ({ bytes, revokedEarly }) => {
+      const text = bytes.toString('utf8');
+      return [
+        ['the file starts with one UTF-8 byte order mark', bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf && !text.slice(1).includes('\ufeff'), [...bytes.subarray(0, 6)]],
+        ['a formula is kept as text', text.includes(`"'=HYPERLINK(""http://example.com"",""x"")"`), text],
+        ['cells starting with @, +, - are kept as text, accents intact', text.includes("'@fulano obrigado pela atenção") && text.includes("'+1 and -2\tminus") && text.includes("'-dash name"), text],
+        ['cells starting with a tab or a carriage return are kept as text', text.includes("'\tstarts with a tab") && text.includes(`"'\rstarts with a carriage return"`), text],
+        ['ordinary cells are unchanged', text.includes(',https://x.com/me/status/1,') && !text.includes("'me") && !text.includes("'https"), text],
+        ['the download URL is not revoked right after the click', !revokedEarly, revokedEarly]
+      ];
+    };
+    return [
+      {
+        name: 'csv: history "Download all CSV" keeps formulas as text and has a BOM',
+        state: { own: 0 },
+        async run(env) {
+          await seed(env);
+          const page = await openExtensionPage(env.context, env.extensionId, 'history/history.html');
+          await page.waitForFunction(() => !document.getElementById('downloadAll').disabled, null, { timeout: 10000 });
+          const result = await download(page, () => page.click('#downloadAll'));
+          await page.close();
+          return checks(result);
+        }
+      },
+      {
+        name: 'csv: a history job download keeps formulas as text and has a BOM',
+        state: { own: 0 },
+        async run(env) {
+          await seed(env);
+          const page = await openExtensionPage(env.context, env.extensionId, 'history/history.html');
+          await page.click('details.job summary', { timeout: 10000 });
+          const button = page.locator('details.job button', { hasText: 'Download CSV' });
+          await button.waitFor({ timeout: 10000 });
+          const result = await download(page, () => button.click());
+          await page.close();
+          return checks(result);
+        }
+      },
+      {
+        name: 'csv: a popup job download keeps formulas as text and has a BOM',
+        state: { own: 0 },
+        async run(env) {
+          await seed(env);
+          const page = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
+          const button = page.locator('.history-icon-button.download').first();
+          await button.waitFor({ timeout: 10000 });
+          const result = await download(page, () => button.click());
+          await page.close();
+          return checks(result);
+        }
+      }
+    ];
+  })(),
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 
