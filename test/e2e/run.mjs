@@ -1163,6 +1163,42 @@ const SCENARIOS = [
       }
     ];
   })(),
+  // Click mode counts an action only once X shows it took effect (VER-821): with X refusing in
+  // silence, nothing is counted or backed up and each item is tried three times, then left.
+  {
+    name: 'click mode confirm: unliking by clicking counts each like once',
+    state: { likes: 3 },
+    setup: (state) => { state.dom = { likes: true }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'unlike', { apiMode: false });
+      const unlikes = state.calls.filter(c => c.op === 'dom-unlike');
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['each like removed once', unlikes.length === 3 && new Set(unlikes.map(c => c.id)).size === 3 && state.likes.length === 0, unlikes],
+        ['history: 3 unliked with backup', r.job.counts.unliked === 3 && r.record.backup.unliked.length === 3, r.job.counts]
+      ];
+    }
+  },
+  ...[
+    { action: 'unlike', state: { likes: 3 }, dom: { likes: true, reject: { unlike: true } }, ids: state => state.likes.map(l => l.id), count: 'unliked' },
+    { action: 'followAll', state: { followers: 3 }, dom: { users: true, reject: { follow: true } }, ids: state => state.followers.map(u => u.screen), count: 'follows' },
+    { action: 'bulkUnfollow', state: { following: 3 }, dom: { users: true, reject: { unfollow: true } }, ids: state => state.following.map(u => u.screen), count: 'unfollows' }
+  ].map(({ action, state: initial, dom, ids, count }) => ({
+    name: `click mode confirm: ${action} that X refuses counts nothing and is tried three times`,
+    state: initial,
+    setup: (state) => { state.dom = dom; },
+    async run(env, state) {
+      const items = ids(state);
+      const r = await quickClean(env, action, { apiMode: false });
+      const refused = state.calls.filter(c => /-rejected$/.test(c.op));
+      const tries = items.map(id => refused.filter(c => c.id === id).length);
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['nothing counted or backed up', r.job.total === 0 && r.job.counts[count] === 0 && Object.values(r.record.backup).every(rows => rows.length === 0), { counts: r.job.counts, total: r.job.total }],
+        ['each item tried three times, then left', tries.every(n => n === 3), tries]
+      ];
+    }
+  })),
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 

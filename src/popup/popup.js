@@ -819,6 +819,24 @@ function runWorker(action, performanceMode, account, useApi = false) {
     if (n >= 3) X.processed.add(id);
   }
 
+  // An action only counts once X shows it took effect: the button it was taken with is gone or
+  // has turned into its opposite. X re-renders the list, so each check looks the item up again.
+  const handleOf = cell => cell.querySelector('a[role="link"][href^="/"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0]?.toLowerCase() || null;
+  const userButtons = key => inColumn('[data-testid="UserCell"]')
+    .filter(cell => `u:${handleOf(cell)}` === key)
+    .flatMap(cell => Array.from(cell.querySelectorAll('button')).map(b => b.getAttribute('data-testid') || ''));
+  async function confirmedBy(check, attempts = 10) {
+    for (let i = 0; i < attempts; i++) {
+      await sleep(200);
+      if (!onPage()) return false;
+      if (check()) return true;
+    }
+    return false;
+  }
+  const unliked = id => confirmedBy(() => !inColumn('[data-testid="unlike"]').some(b => { const a = b.closest('article'); return a && tweetId(a) === id; }));
+  const followed = key => confirmedBy(() => userButtons(key).some(testid => /-(unfollow|cancel)$/.test(testid)));
+  const unfollowed = key => confirmedBy(() => !userButtons(key).some(testid => testid.endsWith('-unfollow')));
+
   function atBottom() {
     return (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 240);
   }
@@ -1082,7 +1100,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
             const article = btn.closest('article');
             if (!article) continue;
             const id = tweetId(article);
-            if (id && X.processed.has(id)) continue;
+            if (!id || X.processed.has(id)) continue;
             candidates.push({ btn, article, id });
           }
           X.stats.foundLikes = X.processed.size + candidates.length;
@@ -1091,13 +1109,17 @@ function runWorker(action, performanceMode, account, useApi = false) {
           const maxPerCycle = hidden() ? 3 : 5;
           for (const { btn, article, id } of candidates) {
             if (!X.interval || await leftPage()) break;
-            if (id) X.processed.add(id);
             const snap = tweetSnap(article);
             btn.click();
-            X.stats.unlikes++;
-            X.backup.unliked.push({ ...snap, action: 'unliked', actionAt: new Date().toISOString() });
-            await bumpAndCheckCap();
-            if (!X.interval) break;
+            if (await unliked(id)) {
+              X.processed.add(id);
+              X.stats.unlikes++;
+              X.backup.unliked.push({ ...snap, action: 'unliked', actionAt: new Date().toISOString() });
+              await bumpAndCheckCap();
+              if (!X.interval) break;
+            } else {
+              noteFailure(id);
+            }
             await sleep(hidden() ? 800 : 500);
 
             processedThisCycle++;
@@ -1210,18 +1232,22 @@ function runWorker(action, performanceMode, account, useApi = false) {
           const maxPerCycle = hidden() ? 2 : 4;
           for (const { cell, button, key } of candidates) {
             if (!X.interval || await leftPage()) break;
-            X.processed.add(key);
             const user = userSnap(cell);
             button.click();
             if (await stopIfIssue(900)) break;
-            X.stats.follows++;
-            X.backup.follows.push({
-              ...user,
-              action: action === 'followVerified' ? 'followed_verified' : 'followed_all',
-              actionAt: new Date().toISOString()
-            });
-            await bumpAndCheckCap();
-            if (!X.interval) break;
+            if (await followed(key)) {
+              X.processed.add(key);
+              X.stats.follows++;
+              X.backup.follows.push({
+                ...user,
+                action: action === 'followVerified' ? 'followed_verified' : 'followed_all',
+                actionAt: new Date().toISOString()
+              });
+              await bumpAndCheckCap();
+              if (!X.interval) break;
+            } else {
+              noteFailure(key);
+            }
             await sleep(hidden() ? 1400 : 950);
 
             processedThisCycle++;
@@ -1270,17 +1296,19 @@ function runWorker(action, performanceMode, account, useApi = false) {
           const maxPerCycle = hidden() ? 2 : 3;
           for (const { cell, button, key } of candidates) {
             if (!X.interval || await leftPage()) break;
-            X.processed.add(key);
             const user = userSnap(cell);
             button.click();
             await sleep(hidden() ? 700 : 500);
             const confirmed = await clickConfirm('confirmationSheetConfirm');
             if (await stopIfIssue(confirmed ? 900 : 0)) break;
-            if (confirmed) {
+            if (confirmed && await unfollowed(key)) {
+              X.processed.add(key);
               X.stats.unfollows++;
               X.backup.unfollows.push({ ...user, action: 'unfollowed', actionAt: new Date().toISOString() });
               await bumpAndCheckCap();
               if (!X.interval) break;
+            } else {
+              noteFailure(key);
             }
             await sleep(hidden() ? 1200 : 800);
 
