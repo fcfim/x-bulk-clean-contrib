@@ -159,7 +159,8 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     let settled = false;
     const done = () => { if (!settled) { settled = true; resolve(); } };
     setTimeout(done, ms);
-    try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); }); } catch (_) {}
+    // An error reply comes at once (the extension context went away): the local timer covers it.
+    try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { if (!chrome.runtime.lastError) done(); }); } catch (_) {}
   });
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
   // X draws tweets and UserCells outside the list being scanned too ("Who to follow" in the
@@ -315,9 +316,20 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     }
     window.scrollTo({ top: 0, behavior: 'auto' });
     const token = P.interval = { loop: true };
+    // A step that throws is logged, and three in a row stop the scan, unfinished, with the error.
     (async () => {
+      let failures = 0;
       while (P.interval === token) {
-        try { scanTick(); } catch (_) {}
+        try {
+          scanTick();
+          failures = 0;
+        } catch (error) {
+          console.warn('[Postscrub] scan step failed:', error);
+          if (++failures >= 3 && P.interval === token) {
+            finish(`Scan stopped after ${failures} errors in a row: ${String(error?.message || error).slice(0, 200)}`, false);
+            break;
+          }
+        }
         await sleep(1500);
       }
     })();
@@ -497,7 +509,8 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     let settled = false;
     const done = () => { if (!settled) { settled = true; resolve(); } };
     setTimeout(done, ms);
-    try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { void chrome.runtime.lastError; done(); }); } catch (_) {}
+    // An error reply comes at once (the extension context went away): the local timer covers it.
+    try { chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { if (!chrome.runtime.lastError) done(); }); } catch (_) {}
   });
   const hidden = () => document.hidden || document.visibilityState === 'hidden';
   // X draws tweets and UserCells outside the list being cleaned too ("Who to follow" in the
@@ -801,10 +814,16 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     if(type!=='reposts'&&type!=='unfollow'&&accountIssue){stop(accountIssue);return}
     window.scrollTo({top:0,behavior:'auto'});
     const token=X.interval={loop:true};
+    // A step that throws is logged, and three in a row stop the job with the error as its reason.
     (async()=>{
+      let failures=0;
       while(X.interval===token){
         const started=Date.now();
-        try{await tick()}catch(_){}
+        try{await tick();failures=0}
+        catch(error){
+          console.warn('[Postscrub] selected-deletion step failed:',error);
+          if(++failures>=3&&X.interval===token){await stop(`Job stopped after ${failures} errors in a row: ${String(error?.message||error).slice(0,200)}`);break}
+        }
         if(X.interval!==token)break;
         await sleep(Math.max(250,2600-(Date.now()-started)));
       }

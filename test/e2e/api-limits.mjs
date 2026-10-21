@@ -53,7 +53,7 @@ export async function harness(responses, { store = {}, clock = { now: START }, a
   return { api, calls, sleeps, store, clock, schedule, Date: ClockDate, runtime, storage: context.chrome.storage, document: context.document };
 }
 
-export async function scan(h, { useApi = true, type = 'tweets' } = {}) {
+export async function scan(h, { useApi = true, type = 'tweets', whileRunning } = {}) {
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
   const globals = { window, location: { pathname: '/synthetic_me' }, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {} }, chrome: { runtime: h.runtime, storage: h.storage },
     document: { cookie: h.document.cookie, hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } };
@@ -67,13 +67,14 @@ export async function scan(h, { useApi = true, type = 'tweets' } = {}) {
     await Promise.resolve();
     if (!window.__xbcPreview?.interval || (!useApi && window.__xbcPreview.interval.loop)) break;
   }
+  await whileRunning?.(window.__xbcPreview);
   const result = { ...window.__xbcPreview, domStarted: !!window.__xbcPreview.interval?.loop };
   if (window.__xbcPreview.interval) window.__xbcPreviewStop();
   return result;
 }
 
 // Execute the complete real workers; synthetic DOM nodes only support rendering overlays.
-export async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets' } = {}) {
+export async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets', whileRunning } = {}) {
   const node = () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, remove() {}, appendChild() {}, setAttribute() {},
     querySelector: () => node(), getElementById: () => node(), attachShadow: () => node() });
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
@@ -95,6 +96,7 @@ export async function deletion(h, selected = false, { useApi = true, action = 'd
   }
   const x = window.__xCleaner;
   assert(x.historyPersisted || x.apiFallback || (!useApi && x.interval?.loop), 'worker settled or entered DOM');
+  await whileRunning?.(x);
   const result = { domStarted: !!x.interval?.loop, mode: x.mode, apiFallback: x.apiFallback || null, issue: x.issue, historyPersisted: x.historyPersisted, successCount: x.successCount };
   if (x.interval) await window.__xCleanerStop();
   return result;
@@ -151,6 +153,39 @@ export async function testApiLimits() {
       assert.equal(result.domStarted, false); assert.match(result.issue, /cooldown/i); assert.equal(h.calls.length, 0);
     });
   }
+  // A sleep the service worker answers with an error (the extension context went away) waits for
+  // the page timer instead of resolving at once, so the click loops cannot spin (VER-823).
+  const loopFlows = [
+    { name: 'Quick Clean', run: (h, whileRunning) => deletion(h, false, { useApi: false, whileRunning }) },
+    { name: 'selected delete', run: (h, whileRunning) => deletion(h, true, { useApi: false, whileRunning }) },
+    { name: 'preview scan', run: (h, whileRunning) => scan(h, { useApi: false, whileRunning }) }
+  ];
+  for (const flow of loopFlows) await check(`API off ${flow.name} sleep waits for its timer when the service worker answers with an error`, async () => {
+    const h = await harness([]);
+    const send = h.runtime.sendMessage, timer = h.schedule, held = [];
+    let failing = false, asked = 0;
+    h.runtime.sendMessage = (message, callback) => {
+      if (!failing || message.type !== 'xbc:sleep') return send(message, callback);
+      asked++;
+      h.runtime.lastError = { message: 'synthetic: extension context invalidated' };
+      try { callback?.(); } finally { delete h.runtime.lastError; }
+    };
+    h.schedule = (fn, ms = 0) => failing ? (held.push({ fn, ms }), 1) : timer(fn, ms);
+    await flow.run(h, async worker => {
+      const settle = async () => { for (let i = 0; i < 2000; i++) await Promise.resolve(); };
+      failing = true;
+      await settle();
+      assert.equal(asked, 1, `one sleep asked and still pending, not ${asked}`);
+      assert.ok(worker.interval, 'job still running while its sleep waits');
+      const pending = held.filter(t => t.ms >= 250);
+      assert.equal(pending.length, 1, 'the sleep waits on one page timer');
+      held.splice(held.indexOf(pending[0]), 1)[0].fn();
+      await settle();
+      assert.equal(asked, 2, 'the page timer, not the error reply, moved the loop on');
+      failing = false;
+      for (const t of held.splice(0)) t.fn();
+    });
+  });
   for (const selected of [false, true]) for (const active of [false, true]) await check(`API unavailable ${selected ? 'selected' : 'quick'} delete ${active ? 'stops on known cooldown' : 'offers a new explicit job without automatic DOM'}`, async () => {
     const store = active ? { 'xbcApiCooldown:42:DeleteTweet:claim:unavailable': { until: START + 3600000, blocked: true } } : {};
     const h = await harness([], { store }); h.api.init = async () => ({ ok: false, reason: 'synthetic unavailable' });
