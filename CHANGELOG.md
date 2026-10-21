@@ -18,7 +18,7 @@ First release of Postscrub.
 - Jobs no longer stall or end early in a background tab: sleeps are timed by the service worker, the tab is kept from being discarded, and a hidden tab's empty cycles no longer count as the end of a list.
 - Reply detection and X's error toasts are recognized in Portuguese, Spanish, French and German.
 - CSV backups open correctly in spreadsheets: they start with a byte order mark, so Excel shows accents, and a cell that starts with =, +, -, @, a tab or a carriage return gets a leading ' so it is shown as text instead of evaluated. The download link is no longer revoked right after the click.
-- In click mode, your posts are told apart by the account you confirmed when X's profile link is missing, and a job stops before any click when the tab is signed in to another account.
+- In click mode, your posts are told apart by the account you confirmed when X's profile link is missing, and deleting or scanning posts and replies stops before any click when the tab is signed in to another account.
 - A job that is stopping keeps its tab and its final record until that record is saved. Opening the popup or the history page meanwhile no longer turns it into an interrupted job with a partial backup.
 - In click mode, unlikes, follows and unfollows are counted, and backed up, only once X shows them done. An action X refuses without a word is retried, not reported.
 - Click mode stops with a reason when X's main column is missing, no longer scrolls a page a stray click moved to, and selected deletion stops at X's login form.
