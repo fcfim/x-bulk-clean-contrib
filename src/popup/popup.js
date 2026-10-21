@@ -821,12 +821,15 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   // An action only counts once X shows it took effect: the button it was taken with is gone or
   // has turned into its opposite. X re-renders the list, so each check looks the item up again.
+  // An item X has not shown done when the wait ends stays pending, and is recorded if X shows it
+  // done later, when the list is read again.
+  const pending = new Map();
   const handleOf = cell => cell.querySelector('a[role="link"][href^="/"]')?.getAttribute('href')?.replace(/^\//, '').split('/')[0]?.toLowerCase() || null;
   const userButtons = key => inColumn('[data-testid="UserCell"]')
     .filter(cell => `u:${handleOf(cell)}` === key)
     .flatMap(cell => Array.from(cell.querySelectorAll('button')).map(b => b.getAttribute('data-testid') || ''));
-  async function confirmedBy(check, attempts = 10) {
-    for (let i = 0; i < attempts; i++) {
+  async function confirmedBy(check, tries = 20) {
+    for (let i = 0; i < tries; i++) {
       await sleep(200);
       if (!onPage()) return false;
       if (check()) return true;
@@ -836,6 +839,15 @@ function runWorker(action, performanceMode, account, useApi = false) {
   const unliked = id => confirmedBy(() => !inColumn('[data-testid="unlike"]').some(b => { const a = b.closest('article'); return a && tweetId(a) === id; }));
   const followed = key => confirmedBy(() => userButtons(key).some(testid => /-(unfollow|cancel)$/.test(testid)));
   const unfollowed = key => confirmedBy(() => !userButtons(key).some(testid => testid.endsWith('-unfollow')));
+  const buttonIds = cell => Array.from(cell.querySelectorAll('button')).map(b => b.getAttribute('data-testid') || '');
+  function recordDone(key, row) {
+    X.processed.add(key);
+    pending.delete(key);
+    const actionAt = new Date().toISOString();
+    if (action === 'unlike') { X.stats.unlikes++; X.backup.unliked.push({ ...row, action: 'unliked', actionAt }); }
+    else if (action === 'bulkUnfollow') { X.stats.unfollows++; X.backup.unfollows.push({ ...row, action: 'unfollowed', actionAt }); }
+    else { X.stats.follows++; X.backup.follows.push({ ...row, action: action === 'followVerified' ? 'followed_verified' : 'followed_all', actionAt }); }
+  }
 
   function atBottom() {
     return (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 240);
@@ -1094,6 +1106,14 @@ function runWorker(action, performanceMode, account, useApi = false) {
         if (issue) { stopAll(issue); return; }
         X.busy = true;
         try {
+          // A like X removed after the wait: the post now shows a like button instead.
+          for (const [id, snap] of pending) {
+            const article = inColumn('article[data-testid="tweet"]').find(a => tweetId(a) === id);
+            if (article?.querySelector('[data-testid="like"]') && !article.querySelector('[data-testid="unlike"]')) {
+              recordDone(id, snap);
+              await bumpAndCheckCap();
+            }
+          }
           const buttons = inColumn('[data-testid="unlike"]');
           const candidates = [];
           for (const btn of buttons) {
@@ -1112,12 +1132,11 @@ function runWorker(action, performanceMode, account, useApi = false) {
             const snap = tweetSnap(article);
             btn.click();
             if (await unliked(id)) {
-              X.processed.add(id);
-              X.stats.unlikes++;
-              X.backup.unliked.push({ ...snap, action: 'unliked', actionAt: new Date().toISOString() });
+              recordDone(id, snap);
               await bumpAndCheckCap();
               if (!X.interval) break;
             } else {
+              pending.set(id, snap);
               noteFailure(id);
             }
             await sleep(hidden() ? 800 : 500);
@@ -1215,6 +1234,12 @@ function runWorker(action, performanceMode, account, useApi = false) {
             const username = link?.getAttribute('href')?.replace(/^\//, '').split('/')[0];
             if (!username) continue;
             const key = `u:${username.toLowerCase()}`;
+            // A follow X showed after the wait: the cell now says Following or Pending.
+            if (pending.has(key) && buttonIds(cell).some(testid => /-(unfollow|cancel)$/.test(testid))) {
+              recordDone(key, pending.get(key));
+              await bumpAndCheckCap();
+              continue;
+            }
             if (X.processed.has(key)) continue;
             const followBtn = Array.from(cell.querySelectorAll('button')).find(b => {
               const testid = b.getAttribute('data-testid') || '';
@@ -1236,16 +1261,11 @@ function runWorker(action, performanceMode, account, useApi = false) {
             button.click();
             if (await stopIfIssue(900)) break;
             if (await followed(key)) {
-              X.processed.add(key);
-              X.stats.follows++;
-              X.backup.follows.push({
-                ...user,
-                action: action === 'followVerified' ? 'followed_verified' : 'followed_all',
-                actionAt: new Date().toISOString()
-              });
+              recordDone(key, user);
               await bumpAndCheckCap();
               if (!X.interval) break;
             } else {
+              pending.set(key, user);
               noteFailure(key);
             }
             await sleep(hidden() ? 1400 : 950);
@@ -1281,6 +1301,12 @@ function runWorker(action, performanceMode, account, useApi = false) {
             const username = link?.getAttribute('href')?.replace(/^\//, '').split('/')[0];
             if (!username) continue;
             const key = `u:${username.toLowerCase()}`;
+            // An unfollow X showed after the wait: the cell now offers Follow again.
+            if (pending.has(key) && !buttonIds(cell).some(testid => testid.endsWith('-unfollow')) && buttonIds(cell).some(testid => testid.endsWith('-follow'))) {
+              recordDone(key, pending.get(key));
+              await bumpAndCheckCap();
+              continue;
+            }
             if (X.processed.has(key)) continue;
             const unfollowBtn = Array.from(cell.querySelectorAll('button')).find(b => {
               const testid = b.getAttribute('data-testid') || '';
@@ -1302,12 +1328,11 @@ function runWorker(action, performanceMode, account, useApi = false) {
             const confirmed = await clickConfirm('confirmationSheetConfirm');
             if (await stopIfIssue(confirmed ? 900 : 0)) break;
             if (confirmed && await unfollowed(key)) {
-              X.processed.add(key);
-              X.stats.unfollows++;
-              X.backup.unfollows.push({ ...user, action: 'unfollowed', actionAt: new Date().toISOString() });
+              recordDone(key, user);
               await bumpAndCheckCap();
               if (!X.interval) break;
             } else {
+              if (confirmed) pending.set(key, user);
               noteFailure(key);
             }
             await sleep(hidden() ? 1200 : 800);

@@ -1179,6 +1179,37 @@ const SCENARIOS = [
       ];
     }
   },
+  {
+    name: 'click mode confirm: bulk unfollow by clicking counts each account once',
+    state: { following: 3 },
+    setup: (state) => { state.dom = { users: true }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'bulkUnfollow', { apiMode: false });
+      const unfollows = state.calls.filter(c => c.op === 'dom-unfollow');
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['each account unfollowed once', unfollows.length === 3 && new Set(unfollows.map(c => c.id)).size === 3 && state.following.length === 0, unfollows],
+        ['history: 3 unfollows with backup', r.job.counts.unfollows === 3 && r.record.backup.unfollows.length === 3, r.job.counts]
+      ];
+    }
+  },
+  // X slower than before: a follow shown 3.5 s later now counts within the wait (about 4 s, plus
+  // the toast check), and one shown after the wait ended but before the list is read again (7 s)
+  // is recorded then, without a second click.
+  ...[{ ms: 3500, followers: 3 }, { ms: 7000, followers: 1 }].map(({ ms, followers }) => ({
+    name: `click mode confirm: a follow X shows after ${ms} ms is counted once, without a second click`,
+    state: { followers },
+    setup: (state) => { state.dom = { users: true, slow: { follow: ms } }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'followAll', { apiMode: false });
+      const follows = state.calls.filter(c => c.op === 'dom-follow');
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['each account followed once', follows.length === followers && new Set(follows.map(c => c.id)).size === followers && state.followers.every(u => u.following), follows],
+        ['history: every follow counted once, with backup', r.job.counts.follows === followers && r.record.backup.follows.length === followers, r.job.counts]
+      ];
+    }
+  })),
   ...[
     { action: 'unlike', state: { likes: 3 }, dom: { likes: true, reject: { unlike: true } }, ids: state => state.likes.map(l => l.id), count: 'unliked' },
     { action: 'followAll', state: { followers: 3 }, dom: { users: true, reject: { follow: true } }, ids: state => state.followers.map(u => u.screen), count: 'follows' },

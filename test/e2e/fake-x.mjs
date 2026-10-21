@@ -331,6 +331,7 @@ render();
 //  likes:           draw the Likes tab as posts with an unlike button in the main column
 //  reject:          { unlike, follow, unfollow }: X refuses that action without a word and the
 //                   list stays as it was; recorded as dom-<action>-rejected
+//  slow:            { unlike, follow, unfollow }: milliseconds X takes to show that action done
 //  switchedAccount: on your profile pages the profile link names this other account, as if the
 //                   tab switched accounts after the extension read it elsewhere
 // Every action is recorded with the pathname it happened on and where its button was.
@@ -352,6 +353,7 @@ function domScript(dom) {
   };
   async function act(kind, user, where) {
     await realFetch('/__fake/' + kind + '?id=' + user.screen + '&where=' + where + '&path=' + encodeURIComponent(location.pathname));
+    if (dom.slow?.[kind]) await new Promise(resolve => setTimeout(resolve, dom.slow[kind]));
     if (where === 'sidebar') user.following = kind === 'follow';
     counted();
     if (where === 'sidebar') renderSidebar();
@@ -414,7 +416,12 @@ function domScript(dom) {
       const cell = document.createElement('div');
       cell.dataset.testid = 'cellInnerDiv';
       cell.innerHTML = '<article data-testid="tweet"><div data-testid="User-Name"><a role="link" href="/' + like.screen + '">' + like.screen + '</a> <a href="/' + like.screen + '/status/' + like.id + '">t</a></div><div data-testid="tweetText">' + like.text + '</div><button data-testid="unlike">Liked</button></article>';
-      cell.querySelector('[data-testid="unlike"]').onclick = async () => { await realFetch('/__fake/unlike?id=' + like.id); counted(); renderLikes(); };
+      cell.querySelector('[data-testid="unlike"]').onclick = async () => {
+        await realFetch('/__fake/unlike?id=' + like.id);
+        if (dom.slow?.unlike) await new Promise(resolve => setTimeout(resolve, dom.slow.unlike));
+        counted();
+        renderLikes();
+      };
       return cell;
     }));
   }
