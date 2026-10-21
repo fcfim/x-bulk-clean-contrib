@@ -943,6 +943,63 @@ const SCENARIOS = [
       ];
     }
   },
+  // Delete menus as X draws them in other languages (VER-814): the label list alone, the red first
+  // item alone, and neither, which must delete nothing. Both click-mode executors, with the list
+  // redrawn after every deletion.
+  ...[
+    { name: 'Portuguese "Excluir" found by its label alone', menu: { label: 'Excluir', red: false, confirm: 'Excluir' }, deletes: true },
+    { name: 'unknown red first item found by its color', menu: { label: 'Apagar post', red: true, confirm: 'Apagar' }, deletes: true },
+    { name: 'unknown label that is not red deletes nothing', menu: { label: 'Apagar post', red: false, confirm: 'Apagar' }, deletes: false }
+  ].flatMap(({ name, menu, deletes }) => {
+    const opened = (state, id) => state.calls.filter(c => c.op === 'menu-open' && c.id === id).length;
+    const checks = (state, own) => {
+      const deleted = state.calls.filter(c => c.op === 'dom-delete').map(c => c.id);
+      const common = [['no other menu item clicked', !state.calls.some(c => c.op === 'menu-other'), state.calls.filter(c => c.op === 'menu-other')]];
+      if (!deletes) return [
+        ...common,
+        ['nothing deleted', deleted.length === 0 && own.every(id => state.tweets.some(t => t.id === id)), deleted],
+        ['each post tried 3 times, then left', own.every(id => opened(state, id) === 3), own.map(id => opened(state, id))]
+      ];
+      return [
+        ...common,
+        ['each own post deleted once', deleted.length === own.length && new Set(deleted).size === own.length && own.every(id => deleted.includes(id)), deleted],
+        ['each menu opened once, none missed after a redraw', own.every(id => opened(state, id) === 1), own.map(id => opened(state, id))],
+        ['the list was redrawn after every deletion', state.calls.filter(c => c.op === 'menu-render').length === own.length, state.calls.filter(c => c.op === 'menu-render').length]
+      ];
+    };
+    const ownIds = state => state.tweets.filter(t => !t.retweetOf).map(t => t.id);
+    return [
+      {
+        name: `click mode menu: ${name}`,
+        state: { own: 5, retweets: 2 },
+        setup: (state) => { state.dom = { lang: 'pt', deleteMenu: menu }; },
+        async run(env, state) {
+          const own = ownIds(state);
+          const r = await quickClean(env, 'delete', { apiMode: false });
+          return [
+            ['mode is dom', r.worker?.mode === 'dom', r.worker],
+            ...checks(state, own),
+            ['reposts untouched', state.tweets.filter(t => t.retweetOf).length === 2, state.tweets.length],
+            ['history total', r.job.total === (deletes ? own.length : 0), r.job]
+          ];
+        }
+      },
+      {
+        name: `preview menu: ${name}`,
+        state: { own: 4 },
+        setup: (state) => { state.dom = { lang: 'pt', deleteMenu: menu }; },
+        async run(env, state) {
+          const own = ownIds(state);
+          const r = await previewAndAct(env, 'tweets', { apiMode: false });
+          return [
+            ['scan and deletion ran by clicking', r.scan?.mode === 'dom' && r.scan.items.length === own.length && r.worker?.mode === 'dom', { scan: r.scan, worker: r.worker }],
+            ...checks(state, own),
+            ['history total', r.job.total === (deletes ? own.length : 0), r.job]
+          ];
+        }
+      }
+    ];
+  }),
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 
