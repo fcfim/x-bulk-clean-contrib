@@ -26,12 +26,12 @@ async function testPreviewPolling() {
   document.getElementById = id => { if (!nodes.has(id)) nodes.set(id, new Node()); return nodes.get(id); };
   document.createElement = tag => new Node(tag);
   document.createTextNode = text => Object.assign(new Node('text'), { textContent: text });
-  const timers = new Map(); let timerId = 0, fullReads = 0, holdFull = null, holdWrite = null, dispatch = null, stops = 0;
+  const timers = new Map(); let timerId = 0, fullReads = 0, holdFull = null, holdWrite = null, dispatch = null, dispatchResult = { ok: true }, stops = 0;
   const makeItems = n => Array.from({ length: n }, (_, i) => ({ id: `synthetic-${i}`, type: 'tweet', classification: 'tweets', text: `post ${i}`, date: '2024-01-01', selected: true }));
   const window = { __xbcPreview: { startedAt: 1, type: 'tweets', items: makeItems(2000), interval: {}, paused: true, done: false } };
   const context = vm.createContext({ document, window, console, setInterval: fn => { timers.set(++timerId, fn); return timerId; }, clearInterval: id => timers.delete(id),
     chrome: { storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } }, scripting: { executeScript: async ({ func, args = [] }) => {
-      if (func.name === 'runSelectedDelete') { dispatch = args; return [{ result: { ok: true } }]; }
+      if (func.name === 'runSelectedDelete') { dispatch = args; return [{ result: dispatchResult }]; }
       if (func.name === 'updatePreviewSelection' && holdWrite) await holdWrite;
       const result = JSON.parse(JSON.stringify(func(...args) ?? null));
       if (func.name === 'readPreviewState' && args[0]) { fullReads++; if (holdFull) await holdFull; }
@@ -143,6 +143,18 @@ async function testPreviewPolling() {
   sessionStore.get = async () => ({ activePreviewSession: { tabId: 42 } });
   await run('previewLost()');
   check("a lost scan ends its own tab's session", () => assert.equal(removed?.[0], 'activePreviewSession'));
+  // "Stop scan" on a scan the tab no longer holds says it was lost, instead of asking to clear the list.
+  window.__xbcPreview = { startedAt: 9, type: 'tweets', items: makeItems(1), interval: {}, paused: true, done: false };
+  run('startPolling()'); await settle();
+  delete window.__xbcPreview;
+  await run('stopScan()'); await settle();
+  check('Stop scan on a scan the tab no longer holds says it was lost', () => { assert.match(document.getElementById('errorMessage').textContent, /scan was lost/); assert.equal(document.getElementById('setupSection').style.display, 'block'); assert.equal(document.getElementById('newScanDialog').open, false); assert.equal(timers.size, 0); });
+  // A deletion that fails to start shows the stopped scan and offers "New scan".
+  run('previewItems = [{ id: "synthetic-refused", selected: true, classification: "tweets" }]');
+  dispatchResult = { ok: false, error: 'synthetic refusal' };
+  await run('beginSelectedDelete()'); await settle();
+  check('a deletion that fails to start shows the stopped scan and New scan', () => { assert.equal(document.getElementById('errorMessage').textContent, 'synthetic refusal'); assert.equal(document.getElementById('scanState').textContent, 'Scan stopped'); assert.equal(document.getElementById('stopScan').textContent, 'New scan'); assert.equal(timers.size, 0); assert.equal(run('cleanupRunning'), false); });
+  dispatchResult = { ok: true };
   console.log(`${checks.length}/${checks.length} synthetic polling checks passed (not browser e2e)`);
 }
 

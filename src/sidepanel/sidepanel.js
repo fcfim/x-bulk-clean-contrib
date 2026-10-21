@@ -1195,14 +1195,25 @@ async function beginSelectedDelete() {
   stopPolling();
   await executeInTab(controlPreviewScanner, ['stop']);
   await chrome.storage.local.remove(['activePreviewSession']);
-  await ensurePreviewPage(selectedType()); activeTab = await findActiveXTab();
   const action = selectedType() === 'replies' ? 'deleteReplies' : selectedType() === 'reposts' ? 'unrepost' : selectedType() === 'unfollow' ? 'bulkUnfollow' : 'delete';
-  const startedAt = Date.now();
-  await chrome.storage.local.set({ activeAction: action, activeTabId: activeTab.id, startTime: startedAt, actionStats: {} });
-  const useApi = $('previewApi').checked;
-  if (useApi) await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['worker/xapi.js'] });
-  const result = await executeInTab(runSelectedDelete, [selectedType(), selected, activeAccount, $('previewPerformance').checked, useApi]);
-  if (!result?.ok) { await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']); showError(result?.error || 'Could not start selected deletion.'); return; }
+  let result;
+  try {
+    await ensurePreviewPage(selectedType()); activeTab = await findActiveXTab();
+    const startedAt = Date.now();
+    await chrome.storage.local.set({ activeAction: action, activeTabId: activeTab.id, startTime: startedAt, actionStats: {} });
+    const useApi = $('previewApi').checked;
+    if (useApi) await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['worker/xapi.js'] });
+    result = await executeInTab(runSelectedDelete, [selectedType(), selected, activeAccount, $('previewPerformance').checked, useApi]);
+  } catch (error) {
+    result = { ok: false, error: `Could not start selected deletion: ${error?.message || error}` };
+  }
+  if (!result?.ok) {
+    await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']);
+    showError(result?.error || 'Could not start selected deletion.');
+    // The scan was stopped above: show it so, and let "New scan" start over from the review.
+    $('scanCard').classList.remove('paused'); $('scanState').textContent = 'Scan stopped'; $('pauseScan').style.display = 'none'; $('stopScan').textContent = 'New scan'; $('stopScan').disabled = false;
+    return;
+  }
   cleanupRunning = true; $('reviewSection').style.display='none'; $('stickyBar').style.display='none'; $('scanCard').style.display='block'; $('scanCard').classList.remove('paused','done'); $('scanState').textContent=action==='bulkUnfollow'?'Unfollowing selected':action==='unrepost'?'Removing selected':'Deleting selected'; $('scanCount').textContent='0'; $('pauseScan').style.display='none'; $('stopScan').textContent=action==='bulkUnfollow'?'Stop unfollowing':action==='unrepost'?'Stop removal':'Stop deletion'; $('stopScan').disabled=false; startPolling();
 }
 
