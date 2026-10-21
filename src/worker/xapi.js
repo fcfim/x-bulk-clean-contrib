@@ -8,8 +8,11 @@
 // change with every X build, so they are discovered at runtime, freshest source first:
 //   1. what X itself requested on this page load (recorded by inject/capture.js),
 //   2. the operation definitions in the loaded main.js (parsed by the service worker),
-//   3. the last values that worked (chrome.storage),
-//   4. the values of the build this was written against.
+//   3. what 1 or 2 gave on an earlier run (chrome.storage xbcApiCache, each entry with its
+//      source). Entries are saved when found, before any request, so they are not proof that
+//      an id still works; a stored id that X answers with 404 is removed,
+//   4. the values of the build this was written against, never saved.
+// A list whose id comes from 3 or 4 first waits briefly for the page's own request (pageListOp).
 (() => {
   if (globalThis.__xbcApi) return;
 
@@ -198,10 +201,42 @@
     };
   }
 
+  // Cache entries saved with their source. Older versions also saved built-in ids, without a
+  // source; those are not trusted, so a built-in id is never reported as stored.
+  const trustedOps = (cache) => Object.fromEntries(Object.entries(cache?.ops || {})
+    .filter(([, op]) => op?.queryId && (op.source === 'page' || op.source === 'bundle')));
+
+  // Saves the named operations that came from the page or the bundle, with their source, and
+  // keeps the stored entries of every other operation. Best effort.
+  async function saveCache(names) {
+    try {
+      const cache = (await chrome.storage.local.get(['xbcApiCache'])).xbcApiCache;
+      const ops = trustedOps(cache);
+      for (const name of names) {
+        const source = state.sources[name];
+        if (state.ops[name] && (source === 'page' || source === 'bundle')) ops[name] = { ...state.ops[name], source };
+      }
+      await chrome.storage.local.set({ xbcApiCache: { bearer: state.bearer, ops, savedAt: Date.now() } });
+    } catch (_) {}
+  }
+
+  // A stored id that X answers with 404 belongs to an older build: removes it, unless another
+  // run has saved a different id since. Best effort.
+  async function forgetStored(name, queryId) {
+    try {
+      const cache = (await chrome.storage.local.get(['xbcApiCache'])).xbcApiCache;
+      if (cache?.ops?.[name]?.queryId !== queryId) return;
+      const ops = { ...cache.ops };
+      delete ops[name];
+      await chrome.storage.local.set({ xbcApiCache: { ...cache, ops } });
+    } catch (_) {}
+  }
+
   async function init(account) {
     const live = captured();
     const settings = await chrome.storage.local.get(['xbcApiCache', 'apiPace']);
-    const stored = settings.xbcApiCache || {};
+    const cache = settings.xbcApiCache || {};
+    const stored = { bearer: cache.bearer, ops: trustedOps(cache) };
     // Production never runs faster than click-like pacing. Tests control their clocks instead.
     const configuredPace = Number(settings.apiPace);
     const job = { paceFactor: Number.isFinite(configuredPace) ? Math.max(1, configuredPace) : 1, slowdown: 1, waited: 0, rateRetries: 0 };
@@ -228,9 +263,7 @@
     state.job = job;
     // A late response keeps its original job/account context, even after another init.
     try { await pruneCooldowns(); } catch (_) { /* Gates below fail closed on storage errors. */ }
-    try {
-      await chrome.storage.local.set({ xbcApiCache: { bearer: state.bearer, ops, savedAt: Date.now() } });
-    } catch (_) {}
+    await saveCache(Object.keys(ops));
     return {
       ok: state.ready,
       reason: state.ready ? null : !cookie('ct0') ? 'no CSRF cookie (ct0); is X signed in?' : 'could not read the signed-in account id (twid cookie)',
@@ -257,6 +290,7 @@
         const resolved = resolveOp(name, live, state.bundle, state.stored);
         state.ops[name] = resolved.op;
         state.sources[name] = resolved.source;
+        await saveCache([name]);
         return;
       }
       if (Date.now() >= until) return;
@@ -542,6 +576,7 @@
     const job = state.job;
     await pageListOp(name, isActive);
     const op = graphql(name);
+    const source = state.sources[name];
     const base = { ...(LIST_DEFAULT_VARIABLES[name] || {}), ...(op.variables || {}) };
     base.userId = job.me.id;
     delete base.cursor;
@@ -549,13 +584,15 @@
     let cursor = null, emptyStreak = 0;
     for (let page = 0; page < 2000; page++) {
       const variables = cursor ? { ...base, cursor } : base;
-      let parsed = null;
+      let parsed = null, status = null;
       const result = await perform(name, async () => {
         const nonEmpty = o => o && Object.keys(o).length ? o : undefined;
         const r = await call('GET', `/i/api/graphql/${op.queryId}/${name}`, { params: { variables, features: nonEmpty(op.features), fieldToggles: nonEmpty(op.fieldToggles) } });
         parsed = r.json ? parsePage(r.json) : null;
+        status = r.status;
         return r;
       }, { isActive, onWait, okWhen: json => !!json?.data }, job);
+      if (status === 404 && source === 'stored') await forgetStored(name, op.queryId);
       if (result.kind === 'stopped') throw paginationError('cancelled', 'API pagination cancelled', 'stopped');
       if (result.kind !== 'ok') { const error = new Error(result.message || result.kind); error.result = result; throw error; }
       if (!parsed?.recognized) throw paginationError('invalid_timeline', 'X returned an unrecognized or malformed timeline');
