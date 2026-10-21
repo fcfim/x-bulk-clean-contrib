@@ -418,11 +418,13 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   if (api) startApiScan(api).catch(error => { if (P.interval) finish(`Scan stopped: ${error?.message || error}`, false); });
   else {
     const token = P.interval = { cooldown: true };
+    // Only a failed cooldown read is reported as one; an error starting the scan says what it was.
     domCooldown([LIST_OP[type]]).then(reason => {
       if (P.interval !== token) return;
       if (reason) return finish(`Scan stopped: ${reason}`, false);
-      startDomScan();
-    }).catch(() => { if (P.interval === token) finish('Scan stopped: could not check X cooldown for the signed-in account. Reload X before trying again.', false); });
+      try { startDomScan(); }
+      catch (error) { if (P.interval) finish(`Scan stopped: ${error?.message || error}`, false); }
+    }, () => { if (P.interval === token) finish('Scan stopped: could not check X cooldown for the signed-in account. Reload X before trying again.', false); });
   }
   return { ok: true };
 }
@@ -897,11 +899,13 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   if(api)runApi(api).catch(error=>{if(X.interval)stop(`Error: ${error?.message||error}`)});
   else {
     const token=X.interval={cooldown:true};
+    // Only a failed cooldown read is reported as one; an error starting the loop says what it was.
     domCooldown().then(reason=>{
       if(X.interval!==token)return;
       if(reason)return stop(reason);
-      startDomLoop();
-    }).catch(()=>{if(X.interval===token)stop('Could not check X cooldown for the signed-in account. Reload X before trying again.')});
+      try{startDomLoop()}
+      catch(error){if(X.interval)stop(`Error: ${error?.message||error}`)}
+    },()=>{if(X.interval===token)stop('Could not check X cooldown for the signed-in account. Reload X before trying again.')});
   }
   return {ok:true};
 }

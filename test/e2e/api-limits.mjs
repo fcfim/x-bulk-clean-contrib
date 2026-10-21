@@ -186,6 +186,21 @@ export async function testApiLimits() {
       for (const t of held.splice(0)) t.fn();
     });
   });
+  // An error while starting the click loop is reported as itself, not as a failed cooldown read (VER-823).
+  for (const flow of loopFlows) await check(`API off ${flow.name} reports an error starting the loop as itself, not as a cooldown failure`, async () => {
+    let armed = false, h;
+    h = await harness([], { onGet: async keys => {
+      const worker = h.workerWindow?.__xCleaner || h.workerWindow?.__xbcPreview;
+      if (keys == null && !armed && worker) {
+        armed = true;
+        Object.defineProperty(worker, 'mode', { configurable: true, get: () => undefined, set() { throw new Error('synthetic start failure'); } });
+      }
+    } });
+    const result = await flow.run(h);
+    assert.ok(armed, 'the start was made to fail');
+    assert.match(result.issue || '', /synthetic start failure/);
+    assert.doesNotMatch(result.issue || '', /cooldown/i);
+  });
   for (const selected of [false, true]) for (const active of [false, true]) await check(`API unavailable ${selected ? 'selected' : 'quick'} delete ${active ? 'stops on known cooldown' : 'offers a new explicit job without automatic DOM'}`, async () => {
     const store = active ? { 'xbcApiCooldown:42:DeleteTweet:claim:unavailable': { until: START + 3600000, blocked: true } } : {};
     const h = await harness([], { store }); h.api.init = async () => ({ ok: false, reason: 'synthetic unavailable' });

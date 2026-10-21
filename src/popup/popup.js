@@ -1410,11 +1410,13 @@ function runWorker(action, performanceMode, account, useApi = false) {
     runApiJob(api).catch(error => { if (X.interval) stopAll(`Error: ${error?.message || error}`); });
   } else {
     const token = X.interval = { cooldown: true };
+    // Only a failed cooldown read is reported as one; an error starting the loop says what it was.
     domCooldown().then(reason => {
       if (X.interval !== token) return;
       if (reason) return stopAll(reason);
-      startDomLoop();
-    }).catch(() => { if (X.interval === token) stopAll('Could not check X cooldown for the signed-in account. Reload X before trying again.'); });
+      try { startDomLoop(); }
+      catch (error) { if (X.interval) stopAll(`Error: ${error?.message || error}`); }
+    }, () => { if (X.interval === token) stopAll('Could not check X cooldown for the signed-in account. Reload X before trying again.'); });
   }
 }
 
