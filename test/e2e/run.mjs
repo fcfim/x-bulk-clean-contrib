@@ -1066,6 +1066,20 @@ const SCENARIOS = [
       ];
     }
   },
+  {
+    // The panel reads @me on /home before deleting; back on the profile page the tab is @other.
+    name: 'preview identity: selected deletion in a tab switched to another account stops before any click',
+    state: { own: 3 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false, beforeAct: async () => { state.dom = { switchedAccount: 'other' }; await xPage(env).goto('https://x.com/home'); } });
+      return [
+        ['scan listed your 3 posts', r.scan?.mode === 'dom' && r.scan.items.length === 3, r.scan],
+        ['job stopped and says why', r.job.status === 'interrupted' && /signed in to @other, not @me/.test(r.job.statusText), r.job.statusText],
+        ['no click at all', domActions(state).length === 0 && state.tweets.length === 3, state.calls.filter(c => c.method === 'DOM')],
+        ['history: nothing deleted', r.job.total === 0, r.job]
+      ];
+    }
+  },
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 
