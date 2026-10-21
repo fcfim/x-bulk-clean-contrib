@@ -31,7 +31,7 @@ async function testPreviewPolling() {
   const window = { __xbcPreview: { startedAt: 1, type: 'tweets', items: makeItems(2000), interval: {}, paused: true, done: false } };
   const context = vm.createContext({ document, window, console, setInterval: fn => { timers.set(++timerId, fn); return timerId; }, clearInterval: id => timers.delete(id),
     chrome: { storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } }, scripting: { executeScript: async ({ func, args = [] }) => {
-      if (func.name === 'runSelectedDelete') { dispatch = args; return [{ result: dispatchResult }]; }
+      if (func.name === 'runSelectedDelete') { dispatch = args; if (dispatchResult instanceof Error) throw dispatchResult; return [{ result: dispatchResult }]; }
       if (func.name === 'updatePreviewSelection' && holdWrite) await holdWrite;
       const result = JSON.parse(JSON.stringify(func(...args) ?? null));
       if (func.name === 'readPreviewState' && args[0]) { fullReads++; if (holdFull) await holdFull; }
@@ -147,6 +147,7 @@ async function testPreviewPolling() {
   window.__xbcPreview = { startedAt: 9, type: 'tweets', items: makeItems(1), interval: {}, paused: true, done: false };
   run('startPolling()'); await settle();
   delete window.__xbcPreview;
+  run('showError("")'); document.getElementById('setupSection').style.display = 'none';
   await run('stopScan()'); await settle();
   check('Stop scan on a scan the tab no longer holds says it was lost', () => { assert.match(document.getElementById('errorMessage').textContent, /scan was lost/); assert.equal(document.getElementById('setupSection').style.display, 'block'); assert.equal(document.getElementById('newScanDialog').open, false); assert.equal(timers.size, 0); });
   // A deletion that fails to start shows the stopped scan and offers "New scan".
@@ -154,6 +155,12 @@ async function testPreviewPolling() {
   dispatchResult = { ok: false, error: 'synthetic refusal' };
   await run('beginSelectedDelete()'); await settle();
   check('a deletion that fails to start shows the stopped scan and New scan', () => { assert.equal(document.getElementById('errorMessage').textContent, 'synthetic refusal'); assert.equal(document.getElementById('scanState').textContent, 'Scan stopped'); assert.equal(document.getElementById('stopScan').textContent, 'New scan'); assert.equal(timers.size, 0); assert.equal(run('cleanupRunning'), false); });
+  // An error thrown while starting is reported the same way, and leaves no activeAction behind.
+  run('previewItems = [{ id: "synthetic-thrown", selected: true, classification: "tweets" }]');
+  removed = null;
+  dispatchResult = new Error('synthetic throw');
+  await run('beginSelectedDelete()'); await settle();
+  check('an error thrown while starting a deletion is reported, with the stopped scan and no activeAction', () => { assert.equal(document.getElementById('errorMessage').textContent, 'Could not start selected deletion: synthetic throw'); assert.equal(document.getElementById('scanState').textContent, 'Scan stopped'); assert.equal(document.getElementById('stopScan').textContent, 'New scan'); assert.ok(removed?.includes('activeAction')); assert.equal(run('cleanupRunning'), false); });
   dispatchResult = { ok: true };
   console.log(`${checks.length}/${checks.length} synthetic polling checks passed (not browser e2e)`);
 }
