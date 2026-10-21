@@ -2,7 +2,6 @@
 let currentAction = null;
 let startTime = null;
 let actionStats = {};
-let pollHandle = null;
 let pendingAction = null;
 let isStarting = false;
 let clearHistoryTimer = null;
@@ -80,7 +79,6 @@ const ACTION_CONFIRMATIONS = {
 
 const X_URL = /^https:\/\/(twitter\.com|x\.com)\//;
 const $ = (id) => document.getElementById(id);
-const todayKey = () => new Date().toISOString().split('T')[0];
 
 // === Tab helpers ===
 
@@ -265,7 +263,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
   const prior = window.__xCleaner;
   if (prior?.interval || prior?.finishing > 0) return;
   if (prior) {
-    if (prior.keepAlive) clearInterval(prior.keepAlive);
     if (prior.mediaObserver) prior.mediaObserver.disconnect();
     if (prior.overlayTimer) clearInterval(prior.overlayTimer);
   }
@@ -281,7 +278,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
     busy: false,
     issue: null,
     interval: null,
-    keepAlive: null,
     mediaObserver: null,
     overlayTimer: null,
     overlayHost: null,
@@ -724,9 +720,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
   async function stopAll(reason) {
     X.finishing++;
     try {
-      if (X.keepAlive) clearInterval(X.keepAlive);
       X.interval = null;
-      X.keepAlive = null;
       cleanUpPerformanceMode();
       if (reason) X.issue = reason;
       const historySave = persistJob(reason);
@@ -737,10 +731,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
     }
   }
   window.__xCleanerStop = () => stopAll('Stopped by user');
-
-  X.keepAlive = setInterval(() => {
-    document.body?.setAttribute('data-keepalive', String(Date.now()));
-  }, 25000);
 
   applyPerformanceMode();
   createJobOverlay();
@@ -1430,11 +1420,9 @@ function stopWorker() {
   }
   const X = window.__xCleaner;
   if (!X) return;
-  if (X.keepAlive) clearInterval(X.keepAlive);
   if (X.mediaObserver) X.mediaObserver.disconnect();
   document.getElementById('__openxPerformanceStyle')?.remove();
   X.interval = null;
-  X.keepAlive = null;
   if (!X.issue) X.issue = 'Stopped by user';
 }
 
@@ -1965,5 +1953,5 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   await pollOnce();
-  pollHandle = setInterval(pollOnce, 750);
+  setInterval(pollOnce, 750);
 });

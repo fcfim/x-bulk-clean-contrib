@@ -504,7 +504,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       : type === 'reposts' ? { unreposts: 0, foundReposts: selected.size }
         : type === 'unfollow' ? { unfollows: 0, foundFollowing: selected.size } : { deleted: 0, found: selected.size },
     backup: { tweets: [], replies: [], unliked: [], unreposted: [], follows: [], unfollows: [] },
-    processed: new Set(), interval: null, keepAlive: null, busy: false, issue: null,
+    processed: new Set(), interval: null, busy: false, issue: null,
     emptyCycles: 0, successCount: 0, startedAt: Date.now(), historySaved: false, historyPersisted: false,
     checkpointCount: 0, lastCheckpointAt: 0, checkpointing: null, checkpointPending: false, finishing: 0,
     jobId: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -723,8 +723,8 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   const stop = async reason => {
     X.finishing++;
     try {
-      if (X.keepAlive) clearInterval(X.keepAlive); if (X.overlayTimer) clearInterval(X.overlayTimer);
-      X.interval=null;X.keepAlive=null;X.issue=reason;X.performanceStyle?.remove();updateOverlay();
+      if (X.overlayTimer) clearInterval(X.overlayTimer);
+      X.interval=null;X.issue=reason;X.performanceStyle?.remove();updateOverlay();
       const shadow=X.overlayHost?.shadowRoot;if(shadow){shadow.querySelector('.k').textContent=reason;const button=shadow.getElementById('stop');if(/rate.?limit/i.test(reason||'')){button.textContent='Dismiss';button.disabled=false}else{button.disabled=true;setTimeout(()=>X.overlayHost?.remove(),2200)}}
       await persist(reason);
     } finally {
@@ -733,7 +733,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   };
   window.__xCleanerStop=()=>stop('Stopped by user');
   if(performanceMode){const style=document.createElement('style');style.textContent='article[data-testid="tweet"] [data-testid="tweetPhoto"],article[data-testid="tweet"] [data-testid="videoPlayer"],article[data-testid="tweet"] video{display:none!important}';(document.head||document.documentElement).appendChild(style);X.performanceStyle=style}
-  createOverlay(); X.keepAlive=setInterval(()=>document.body?.setAttribute('data-xbc-keepalive',String(Date.now())),25000);
+  createOverlay();
   setJobRunning(true);
   const recordSuccess=(id,snap)=>{
     X.processed.add(id);
