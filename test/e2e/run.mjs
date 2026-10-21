@@ -1015,6 +1015,8 @@ const SCENARIOS = [
           return [
             ['mode is dom', r.worker?.mode === 'dom', r.worker],
             ...checks(state, own),
+            // "found" counts your own posts whether they were deleted or tried 3 times (VER-824).
+            ['found counts your own posts only', r.worker?.stats.found === own.length, r.worker?.stats],
             ['reposts untouched', state.tweets.filter(t => t.retweetOf).length === 2, state.tweets.length],
             ['history total', r.job.total === (deletes ? own.length : 0), r.job]
           ];
@@ -1467,6 +1469,19 @@ const SCENARIOS = [
       return [
         ['job interrupted with the error', r.job.status === 'interrupted' && /3 errors in a row: synthetic step failure/.test(r.job.statusText), r.job.statusText],
         ['stopped at the third failure', fault?.thrown === 3 && fault.left === 0, fault]
+      ];
+    }
+  },
+  // "found" in click mode counts your own posts, not the reposts of others it skips (VER-824).
+  {
+    name: 'click mode found: reposts of others are skipped and not counted as found',
+    state: { own: 3, retweets: 2 },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      return [
+        ['mode is dom', r.worker?.mode === 'dom', r.worker],
+        ['found counts your 3 posts only', r.worker?.stats.found === 3, r.worker?.stats],
+        ['your posts deleted, the reposts untouched', r.worker?.stats.deleted === 3 && state.tweets.length === 2 && state.tweets.every(t => t.retweetOf), state.tweets.map(t => t.id)]
       ];
     }
   },

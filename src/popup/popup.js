@@ -277,6 +277,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
     stats: {},
     backup: { tweets: [], replies: [], unliked: [], unreposted: [], follows: [], unfollows: [] },
     processed: new Set(),
+    ownSeen: new Set(),
     busy: false,
     issue: null,
     interval: null,
@@ -1063,8 +1064,11 @@ function runWorker(action, performanceMode, account, useApi = false) {
             }
           }
 
-          if (action === 'delete') X.stats.found = X.processed.size + candidates.length;
-          else X.stats.foundReposts = X.processed.size + candidates.length;
+          // "found" counts your own posts only: the ids of others sit in X.processed just to be skipped.
+          if (action === 'delete') {
+            for (const c of candidates) X.ownSeen.add(c.id);
+            X.stats.found = X.ownSeen.size;
+          } else X.stats.foundReposts = X.processed.size + candidates.length;
 
           const maxPerCycle = hidden() ? 2 : 4;
           for (const { article: initial, id, kind } of candidates) {
