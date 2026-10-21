@@ -229,6 +229,11 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
       }
       return json(route, 200, { ok: true });
     }
+    // Post menus drawn by state.dom.deleteMenu: each menu opened, other item clicked and list redrawn.
+    if (url.pathname === '/__fake/menu') {
+      state.calls.push({ method: 'DOM', op: `menu-${url.searchParams.get('event')}`, id: url.searchParams.get('id') });
+      return json(route, 200, { ok: true });
+    }
     return json(route, 404, {});
   });
 
@@ -303,6 +308,10 @@ render();
 //  noPrimaryColumn: the main column carries no data-testid
 //  navigateAfter:   after that many actions, move to /explore with pushState, as X's SPA does,
 //                   keeping the same content on screen
+//  lang:            the page language, as <html lang>
+//  deleteMenu:      the menu of your own posts as X draws it in another language: the first item
+//                   ({ label, red, confirm }) deletes, red or not; recorded as menu-open, menu-other
+//                   (any other item clicked) and menu-render (the list redrawn after a deletion)
 // Every action is recorded with the pathname it happened on and where its button was.
 function domScript(dom) {
   return `<script>
@@ -353,6 +362,26 @@ function domScript(dom) {
       document.body.insertBefore(aside, layers);
     }
     aside.replaceChildren(Object.assign(document.createElement('h2'), { textContent: 'Who to follow' }), ...dom.sidebar.map(user => userCell(user, 'sidebar')));
+  }
+  if (dom.lang) document.documentElement.lang = dom.lang;
+  if (dom.deleteMenu) {
+    const { label, red, confirm } = dom.deleteMenu;
+    const record = (event, id) => realFetch('/__fake/menu?event=' + event + '&id=' + id);
+    const item = (text, style) => '<div role="menuitem"><span' + (style ? ' style="' + style + '"' : '') + '>' + text + '</span></div>';
+    // Replaces the page's openMenu, which the carets call by name.
+    window.openMenu = (id, mine) => {
+      record('open', id);
+      layers.innerHTML = mine
+        ? item(label, red ? 'color:rgb(244,33,46)' : '') + item('Fixar no seu perfil')
+        : item('Não tenho interesse neste post');
+      Array.from(layers.children).forEach((menuItem, i) => {
+        menuItem.onclick = () => {
+          if (!mine || i > 0) return record('other', id);
+          layers.innerHTML = '<button data-testid="confirmationSheetConfirm">' + confirm + '</button>';
+          layers.firstChild.onclick = async () => { layers.innerHTML = ''; await fetch('/__fake/delete?id=' + id); await render(); record('render', id); };
+        };
+      });
+    };
   }
   renderUsers();
   renderSidebar();
