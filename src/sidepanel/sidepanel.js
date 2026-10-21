@@ -774,7 +774,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
         }else{
           if(!me||authorHandle(article)!==me)continue;
           const selectedItem=selected.get(id);
-          if(type==='replies' && !['orphan','standalone'].includes(selectedItem?.classification) && !isReply(article))continue;
+          if(type==='replies' && selectedItem?.classification!=='standalone' && !isReply(article))continue;
           if(type==='tweets' && isReply(article))continue;
           const control=article.querySelector('[data-testid="caret"]');if(control)candidates.push({article,id,control});
         }
@@ -1119,8 +1119,7 @@ function formatItemDate(value) {
 function createResult(item) {
   const label = document.createElement('label'); label.className = `result${item.type === 'account' ? ' account-result' : ''}`;
   label.dataset.id = item.id;
-  const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = item.selected; checkbox.disabled = item.classification === 'unresolved';
-  if (checkbox.disabled) { label.classList.add('unverified'); label.title = 'Could not safely compare this item with the main profile. It is excluded from deletion.'; }
+  const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = item.selected;
   checkbox.addEventListener('change', async () => { item.selected = checkbox.checked; updateSelectionCounts(); await savePreviewSelection([item.id], item.selected); });
   const text = document.createElement('span'); text.className = 'result-text'; text.textContent = item.type === 'account' ? (item.displayName || item.username) : item.text || '(No text content)';
   const meta = document.createElement('span'); meta.className = 'result-meta';
@@ -1158,7 +1157,7 @@ function renderReview() {
 }
 
 function updateSelectionCounts() {
-  const selected = previewItems.filter(item => item.selected && item.classification !== 'unresolved').length;
+  const selected = previewItems.filter(item => item.selected).length;
   $('selectedCount').textContent = `${selected} selected`;
   $('stickySelected').textContent = `${selected}`; $('stickyScanned').textContent = `${previewItems.length} found`;
   $('deleteSelected').disabled = !selected || cleanupRunning;
@@ -1170,7 +1169,7 @@ function updateSelectionCounts() {
 }
 
 async function setFilteredSelection(mode) {
-  const items = filteredItems().filter(item => item.classification !== 'unresolved');
+  const items = filteredItems();
   items.forEach(item => { item.selected = mode === 'invert' ? !item.selected : mode === 'all'; });
   const writes = [];
   if (mode === 'invert') {
@@ -1182,7 +1181,7 @@ async function setFilteredSelection(mode) {
 }
 
 function openDeleteDialog() {
-  const selected = previewItems.filter(item => item.selected && item.classification !== 'unresolved');
+  const selected = previewItems.filter(item => item.selected);
   if (!selected.length) return;
   const reposts = selectedType() === 'reposts';
   const unfollow = selectedType() === 'unfollow';
@@ -1202,7 +1201,7 @@ function openDeleteDialog() {
 
 async function beginSelectedDelete() {
   $('deleteDialog').close(); showError('');
-  const selected = previewItems.filter(item => item.selected && item.classification !== 'unresolved');
+  const selected = previewItems.filter(item => item.selected);
   const currentAccount = await detectAccount(activeTab);
   if (!currentAccount || currentAccount.username.toLowerCase() !== activeAccount.username.toLowerCase()) {
     showError('The active X account changed after scanning. Start a new scan for the current account.'); return;
