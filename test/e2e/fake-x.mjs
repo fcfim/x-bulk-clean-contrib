@@ -312,6 +312,9 @@ render();
 //  deleteMenu:      the menu of your own posts as X draws it in another language: the first item
 //                   ({ label, red, confirm }) deletes, red or not; recorded as menu-open, menu-other
 //                   (any other item clicked) and menu-render (the list redrawn after a deletion)
+//  noProfileLink:   the nav has no profile link; the account switcher still shows @me
+//  switchedAccount: on your profile pages the profile link names this other account, as if the
+//                   tab switched accounts after the extension read it elsewhere
 // Every action is recorded with the pathname it happened on and where its button was.
 function domScript(dom) {
   return `<script>
@@ -363,6 +366,9 @@ function domScript(dom) {
     }
     aside.replaceChildren(Object.assign(document.createElement('h2'), { textContent: 'Who to follow' }), ...dom.sidebar.map(user => userCell(user, 'sidebar')));
   }
+  const profileLink = document.querySelector('[data-testid="AppTabBar_Profile_Link"]');
+  if (dom.noProfileLink) profileLink.remove();
+  if (dom.switchedAccount && location.pathname.split('/')[1] === '${ME.screen}') profileLink.setAttribute('href', '/' + dom.switchedAccount);
   if (dom.lang) document.documentElement.lang = dom.lang;
   if (dom.deleteMenu) {
     const { label, red, confirm } = dom.deleteMenu;
