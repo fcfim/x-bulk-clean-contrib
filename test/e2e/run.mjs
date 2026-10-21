@@ -1,7 +1,7 @@
 // End-to-end tests: the real unpacked extension in Chromium, driven through its popup, against
 // the fake x.com in fake-x.mjs. Usage: node test/e2e/run.mjs [scenario-name-filter]
 import { launch, openExtensionPage, storage, waitFor } from './launch.mjs';
-import { createState, installFakeX, fakeQueryIds, ME, scriptedTimeline } from './fake-x.mjs';
+import { createState, installFakeX, fakeQueryIds, ME, scriptedTimeline, seededBundle } from './fake-x.mjs';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
@@ -312,6 +312,53 @@ async function readFault(env) {
   });
 }
 
+// "Find & delete replies" with API mode on (VER-624). X builds change the UserTweetsAndReplies
+// query id; the page asks for its replies with the new id, sometimes only after the extension
+// started. The bundle is seeded, so these scenarios never fetch X's real main.js.
+const ROTATED_UTR = 'RotatedRepliesQueryId001';
+const FALLBACK_UTR = fakeQueryIds.UserTweetsAndReplies; // the fake's default ids are the extension's built-in ones
+const REPORTED_404 = 'Scan interrupted after 0 items: HTTP 404. Try again with API, or turn off API mode and start a new scan.';
+const idLabel = queryId => queryId === ROTATED_UTR ? 'rotated' : queryId === FALLBACK_UTR ? 'fallback' : 'other';
+const rotatedReplies = (pageRequest) => (state) => {
+  state.queryIds = { UserTweetsAndReplies: ROTATED_UTR };
+  state.pageRequest = pageRequest;
+  state.misbehave.emptyNotFound = true;
+};
+async function seedBundle(env, state, options) {
+  await env.worker.evaluate(bundle => chrome.storage.local.set({ xbcBundleOps: bundle }), seededBundle(state, options));
+}
+async function scanRepliesByApi(env, state) {
+  const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+  try {
+    await panel.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
+    const clicked = Date.now();
+    await panel.evaluate(() => {
+      document.querySelector('input[name="previewType"][value="replies"]').click();
+      document.querySelector('input[name="replyScope"][value="fast"]').click();
+      const box = document.getElementById('previewApi');
+      if (!box.checked) box.click();
+      document.getElementById('startScan').click();
+    });
+    await panel.waitForFunction(() => /Scan complete|Scan interrupted|Scan stopped/.test(document.getElementById('scanState')?.textContent || ''), null, { timeout: 60000 });
+    const seconds = (Date.now() - clicked) / 1000;
+    const scan = await env.worker.evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+      const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+        const P = window.__xbcPreview;
+        return P && { mode: P.mode, done: P.done, running: !!P.interval, issue: P.issue, startedAt: P.startedAt, items: P.items.length,
+          replies: P.items.filter(i => i.classification === 'definite').length, source: globalThis.__xbcApi?.sources().UserTweetsAndReplies || null };
+      } });
+      return r?.result;
+    });
+    // Only the cached id and its source: the cache also holds the bearer, which is never shown.
+    const entry = (await storage(env.worker, ['xbcApiCache'])).xbcApiCache?.ops?.UserTweetsAndReplies;
+    return { scan, seconds, cached: entry ? { id: idLabel(entry.queryId), source: entry.source ?? null } : null };
+  } finally {
+    await panel.close();
+  }
+}
+const repliesRequests = state => state.calls.filter(c => c.op === 'UserTweetsAndReplies').map(c => ({ at: c.at, fromPage: !!c.fromPage, id: idLabel(c.path.split('/').at(-2)) }));
+
 const SCENARIOS = [
   ...[
     { name: 'ten empty pages interrupt with empty_streak', expected: 0, complete: false, reason: /10 consecutive pages without new items/, sequence: state => Array.from({ length: 10 }, (_, i) => scriptedTimeline(state, { cursor: `empty-${i}` })) },
@@ -412,7 +459,7 @@ const SCENARIOS = [
       return [
         ['job interrupted with zero recorded actions', r.job.status === 'interrupted' && r.job.total === 0 && !/^Finished/.test(r.worker.issue), r.job],
         ['no automatic deletion or click fallback', r.worker.mode === 'api' && !r.worker.apiFallback && !state.calls.some(c => c.op === 'DeleteTweet' || c.op === 'dom-delete') && state.tweets.length === 2, r.worker],
-        ['explicit new choice offered', /turn off API.*new job/.test(r.worker.issue), r.worker.issue]
+        ['explicit new choice offered', /Start a new job to try the API again, or turn off API mode/.test(r.worker.issue), r.worker.issue]
       ];
     }
   })),
@@ -822,7 +869,7 @@ const SCENARIOS = [
       const manual = await quickClean(env, 'delete', { apiMode: false });
       return [
         ['refusal interrupts without automatic DOM', r.worker?.mode === 'api' && !r.worker.apiFallback && r.job.status === 'interrupted' && r.job.total === 0, r],
-        ['choice mentions API off and new job', /turn off API.*new job/.test(r.worker.issue), r.worker.issue],
+        ['choice mentions API off and new job', /Start a new job to try the API again, or turn off API mode/.test(r.worker.issue), r.worker.issue],
         ['all posts untouched before explicit new choice', beforeChoice.remaining === 5 && beforeChoice.dom === 0, beforeChoice],
         ['new confirmed click job deletes all 5', manual.worker.mode === 'dom' && state.tweets.length === 0 && state.calls.filter(c => c.op === 'dom-delete').length === 5, manual],
         ['new history has 5 records', manual.job.total === 5, manual.job]
@@ -840,7 +887,7 @@ const SCENARIOS = [
         ['reason mentions the signed session', /signed session/.test(r.worker?.issue || ''), r.worker?.issue],
         ['no repost removed through the API', state.tweets.filter(t => t.retweetOf).length === 3, state.tweets.length],
         ['the refused DeleteRetweet was tried once, then no more', state.calls.filter(c => c.op === 'DeleteRetweet').length === 1],
-        ['manual choice requires a new confirmed job', /turn off API.*new job/.test(r.worker.issue) && !state.calls.some(c => c.op === 'dom-delete'), r.worker.issue]
+        ['manual choice requires a new confirmed job', /Start a new job to try the API again, or turn off API mode/.test(r.worker.issue) && !state.calls.some(c => c.op === 'dom-delete'), r.worker.issue]
       ];
     }
   },
@@ -1716,6 +1763,61 @@ const SCENARIOS = [
       return [
         ['moved while the API scan was running', during.mode === 'api' && during.ids.length < 9, during],
         ['the scan finished with every post', scan?.mode === 'api' && scan.done && scan.ids.length === 9, scan]
+      ];
+    }
+  },
+  {
+    name: 'replies api 404: a scan that starts before the page asks for its replies waits and uses the page id',
+    state: { own: 2, replies: 5, pageSize: 3 },
+    setup: rotatedReplies({ delay: 2500 }),
+    async run(env, state) {
+      await seedBundle(env, state, { omit: ['UserTweetsAndReplies'] });
+      const r = await scanRepliesByApi(env, state);
+      const requests = repliesRequests(state);
+      return [
+        ['the scan does not end with the reported HTTP 404', r.scan?.issue !== REPORTED_404, r.scan?.issue],
+        ['the scan completes with every reply', r.scan?.mode === 'api' && r.scan.done && r.scan.issue === 'Scan complete' && r.scan.replies === 5 && r.scan.items === 5, r.scan],
+        ['the id is reported, and cached, as taken from the page', r.scan?.source === 'page' && r.cached?.source === 'page' && r.cached.id === 'rotated', { source: r.scan?.source, cached: r.cached }],
+        ['no request ever carries the fallback id', requests.length > 1 && requests.every(c => c.id !== 'fallback'), requests],
+        ["the extension asked only after the page's own request", requests.some(c => c.fromPage) && requests.filter(c => !c.fromPage).every(c => c.at >= requests.find(p => p.fromPage).at), requests]
+      ];
+    }
+  },
+  {
+    name: 'replies api 404: with the id in the bundle the scan does not wait for the page',
+    state: { own: 2, replies: 5, pageSize: 3 },
+    setup: rotatedReplies({ delay: 2500 }),
+    async run(env, state) {
+      await seedBundle(env, state);
+      const r = await scanRepliesByApi(env, state);
+      await waitFor(() => state.calls.some(c => c.op === 'UserTweetsAndReplies' && c.fromPage), { timeout: 15000, label: "the page's own delayed request" }).catch(() => null);
+      const requests = repliesRequests(state);
+      const first = requests.find(c => !c.fromPage), page = requests.find(c => c.fromPage);
+      return [
+        ['the scan completes with every reply', r.scan?.mode === 'api' && r.scan.done && r.scan.issue === 'Scan complete' && r.scan.replies === 5, r.scan],
+        ['the id came from the bundle', r.scan?.source === 'bundle', r.scan?.source],
+        ["the extension's first request went before the page's delayed one", !!first && !!page && first.at < page.at, requests],
+        ['no request ever carries the fallback id', requests.every(c => c.id !== 'fallback'), requests]
+      ];
+    }
+  },
+  {
+    name: 'replies api 404: when the page never asks, the scan stops naming the operation, the status and the id source',
+    state: { own: 2, replies: 5, pageSize: 3 },
+    setup: rotatedReplies({ skip: true }),
+    async run(env, state) {
+      await seedBundle(env, state, { omit: ['UserTweetsAndReplies'] });
+      const tweets = state.tweets.length;
+      const r = await scanRepliesByApi(env, state);
+      const requests = repliesRequests(state);
+      const sent = requests.filter(c => !c.fromPage);
+      const waited = sent[0] && r.scan ? sent[0].at - r.scan.startedAt : null;
+      return [
+        ['the scan ends naming UserTweetsAndReplies, HTTP 404 and the fallback id', r.scan?.issue === 'Scan interrupted after 0 items: X did not accept the request for UserTweetsAndReplies (HTTP 404, id source: fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.', r.scan?.issue],
+        ['it waited about 8 s for the page, no longer', waited >= 7900 && waited <= 9500, { waited, seconds: r.seconds }],
+        ['one request, with the fallback id; the page sent none', sent.length === 1 && sent[0].id === 'fallback' && sent.length === requests.length, requests],
+        ['no click scan and no deletion', r.scan?.mode === 'api' && !r.scan.done && !r.scan.running && !state.calls.some(c => /^dom-/.test(c.op || '') || c.method === 'POST') && state.tweets.length === tweets, { mode: r.scan?.mode, done: r.scan?.done, tweets: state.tweets.length }],
+        ['no fallback-sourced UserTweetsAndReplies cached', !r.cached || (r.cached.source !== 'fallback' && r.cached.id !== 'fallback'), r.cached]
       ];
     }
   },

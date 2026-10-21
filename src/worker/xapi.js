@@ -8,8 +8,11 @@
 // change with every X build, so they are discovered at runtime, freshest source first:
 //   1. what X itself requested on this page load (recorded by inject/capture.js),
 //   2. the operation definitions in the loaded main.js (parsed by the service worker),
-//   3. the last values that worked (chrome.storage),
-//   4. the values of the build this was written against.
+//   3. what 1 or 2 gave on an earlier run (chrome.storage xbcApiCache, each entry with its
+//      source). Entries are saved when found, before any request, so they are not proof that
+//      an id still works; a stored list id that X answers with 404 is removed,
+//   4. the values of the build this was written against, never saved.
+// A list whose id comes from 3 or 4 first waits briefly for the page's own request (pageListOp).
 (() => {
   if (globalThis.__xbcApi) return;
 
@@ -103,7 +106,7 @@
   const MIN_RATE_WAIT = 15 * 60000;
   const MAX_JOB_WAIT = 30 * 60000;
   const MAX_RATE_RETRIES = 3;
-  const state = { ready: false, bearer: FALLBACK_BEARER, ops: {}, me: null, sources: {}, job: null };
+  const state = { ready: false, bearer: FALLBACK_BEARER, ops: {}, me: null, sources: {}, job: null, bundle: {}, stored: {}, pageWait: {} };
 
   // Each response writes a unique, immutable claim. chrome.storage has no atomic
   // read/modify/write; a short wait must never overwrite another job's longer stop.
@@ -166,10 +169,74 @@
     return waitForCooldown(job, operation, { isActive, onWait });
   }
 
+  // One operation from, in order: what the page itself requested (live), the loaded main.js
+  // (bundle), what was stored before, and the build this was written against.
+  function resolveOp(name, live, bundle, stored) {
+    const fromLive = live.ops?.[name] || {};
+    const fromBundle = bundle.ops?.[name] || {};
+    const fromStore = stored.ops?.[name] || {};
+    const queryId = fromLive.queryId || fromBundle.queryId || fromStore.queryId || FALLBACK_QUERY_IDS[name];
+    if (!queryId) return null;
+    // Feature names come from the current build; each value from the page's own feature config,
+    // then from what X sent for this operation, then from storage, then the defaults above.
+    const known = { ...FEATURE_DEFAULTS, ...(fromStore.features || {}), ...(fromLive.features || {}), ...(live.features || {}) };
+    let names = fromBundle.featureSwitches || Object.keys({ ...(fromStore.features || {}), ...(fromLive.features || {}) });
+    if (!fromBundle.featureSwitches && !names.length && LIST_DEFAULT_VARIABLES[name]) names = Object.keys(FEATURE_DEFAULTS);
+    const features = names.length ? Object.fromEntries(names.map(f => [f, known[f] === true])) : null;
+    // Field toggles: what X sent for this operation, else what X's web app sends for it, kept
+    // to the names the current build defines, in its order.
+    const toggles = fromLive.fieldToggles || fromStore.fieldToggles || LIST_FIELD_TOGGLES[name] || null;
+    const fieldToggles = toggles && fromBundle.fieldToggles
+      ? Object.fromEntries(fromBundle.fieldToggles.filter(f => f in toggles).map(f => [f, toggles[f]]))
+      : toggles;
+    return {
+      op: {
+        queryId,
+        operationType: fromBundle.operationType || fromStore.operationType || (fromLive.method && fromLive.method !== 'GET' ? 'mutation' : null),
+        features,
+        fieldToggles,
+        variables: fromLive.variables || fromStore.variables || null
+      },
+      source: fromLive.queryId ? 'page' : fromBundle.queryId ? 'bundle' : fromStore.queryId ? 'stored' : 'fallback'
+    };
+  }
+
+  // Cache entries saved with their source. Older versions also saved built-in ids, without a
+  // source; those are not trusted, so a built-in id is never reported as stored.
+  const trustedOps = (cache) => Object.fromEntries(Object.entries(cache?.ops || {})
+    .filter(([, op]) => op?.queryId && (op.source === 'page' || op.source === 'bundle')));
+
+  // Saves the named operations that came from the page or the bundle, with their source, and
+  // keeps the stored entries of every other operation. Best effort.
+  async function saveCache(names) {
+    try {
+      const cache = (await chrome.storage.local.get(['xbcApiCache'])).xbcApiCache;
+      const ops = trustedOps(cache);
+      for (const name of names) {
+        const source = state.sources[name];
+        if (state.ops[name] && (source === 'page' || source === 'bundle')) ops[name] = { ...state.ops[name], source };
+      }
+      await chrome.storage.local.set({ xbcApiCache: { bearer: state.bearer, ops, savedAt: Date.now() } });
+    } catch (_) {}
+  }
+
+  // A stored id that X answers with 404 belongs to an older build: removes it, unless another
+  // run has saved a different id since. Best effort.
+  async function forgetStored(name, queryId) {
+    try {
+      const cache = (await chrome.storage.local.get(['xbcApiCache'])).xbcApiCache;
+      if (cache?.ops?.[name]?.queryId !== queryId) return;
+      const ops = { ...cache.ops };
+      delete ops[name];
+      await chrome.storage.local.set({ xbcApiCache: { ...cache, ops } });
+    } catch (_) {}
+  }
+
   async function init(account) {
     const live = captured();
     const settings = await chrome.storage.local.get(['xbcApiCache', 'apiPace']);
-    const stored = settings.xbcApiCache || {};
+    const cache = settings.xbcApiCache || {};
+    const stored = { bearer: cache.bearer, ops: trustedOps(cache) };
     // Production never runs faster than click-like pacing. Tests control their clocks instead.
     const configuredPace = Number(settings.apiPace);
     const job = { paceFactor: Number.isFinite(configuredPace) ? Math.max(1, configuredPace) : 1, slowdown: 1, waited: 0, rateRetries: 0 };
@@ -177,50 +244,58 @@
     state.bearer = live.bearer || stored.bearer || bundle.bearer || FALLBACK_BEARER;
 
     const names = new Set([...Object.keys(FALLBACK_QUERY_IDS), ...Object.keys(live.ops || {}), ...Object.keys(stored.ops || {})]);
-    const ops = {};
+    const ops = {}, sources = {};
     for (const name of names) {
-      const fromLive = live.ops?.[name] || {};
-      const fromBundle = bundle.ops?.[name] || {};
-      const fromStore = stored.ops?.[name] || {};
-      const queryId = fromLive.queryId || fromBundle.queryId || fromStore.queryId || FALLBACK_QUERY_IDS[name];
-      if (!queryId) continue;
-      // Feature names come from the current build; each value from the page's own feature config,
-      // then from what X sent for this operation, then from storage, then the defaults above.
-      const known = { ...FEATURE_DEFAULTS, ...(fromStore.features || {}), ...(fromLive.features || {}), ...(live.features || {}) };
-      let names = fromBundle.featureSwitches || Object.keys({ ...(fromStore.features || {}), ...(fromLive.features || {}) });
-      if (!fromBundle.featureSwitches && !names.length && LIST_DEFAULT_VARIABLES[name]) names = Object.keys(FEATURE_DEFAULTS);
-      const features = names.length ? Object.fromEntries(names.map(f => [f, known[f] === true])) : null;
-      // Field toggles: what X sent for this operation, else what X's web app sends for it, kept
-      // to the names the current build defines, in its order.
-      const toggles = fromLive.fieldToggles || fromStore.fieldToggles || LIST_FIELD_TOGGLES[name] || null;
-      const fieldToggles = toggles && fromBundle.fieldToggles
-        ? Object.fromEntries(fromBundle.fieldToggles.filter(f => f in toggles).map(f => [f, toggles[f]]))
-        : toggles;
-      ops[name] = {
-        queryId,
-        operationType: fromBundle.operationType || fromStore.operationType || (fromLive.method && fromLive.method !== 'GET' ? 'mutation' : null),
-        features,
-        fieldToggles,
-        variables: fromLive.variables || fromStore.variables || null
-      };
-      state.sources[name] = fromLive.queryId ? 'page' : fromBundle.queryId ? 'bundle' : fromStore.queryId ? 'stored' : 'fallback';
+      const resolved = resolveOp(name, live, bundle, stored);
+      if (!resolved) continue;
+      ops[name] = resolved.op;
+      sources[name] = resolved.source;
     }
     state.ops = ops;
+    state.sources = sources;
+    // Kept to resolve a list again from the page's own request (pageListOp), with no new request.
+    state.bundle = bundle;
+    state.stored = stored;
+    state.pageWait = {};
     state.me = { id: live.viewerId || viewerId(), username: (account?.username || '').toLowerCase() };
     state.ready = !!cookie('ct0') && !!state.me.id;
     job.me = { ...state.me };
     state.job = job;
     // A late response keeps its original job/account context, even after another init.
     try { await pruneCooldowns(); } catch (_) { /* Gates below fail closed on storage errors. */ }
-    try {
-      await chrome.storage.local.set({ xbcApiCache: { bearer: state.bearer, ops, savedAt: Date.now() } });
-    } catch (_) {}
+    await saveCache(Object.keys(ops));
     return {
       ok: state.ready,
       reason: state.ready ? null : !cookie('ct0') ? 'no CSRF cookie (ct0); is X signed in?' : 'could not read the signed-in account id (twid cookie)',
       me: state.me,
       sources: { ...state.sources }
     };
+  }
+
+  // X's web app asks for a list when its page loads, which can be after a job or scan started
+  // (init reads the page's record once). A list id that came neither from this page load nor
+  // from the loaded bundle may be out of date, so before the first request of that list, wait
+  // up to PAGE_LIST_WAIT_MS for the page's own request and take the operation from it. Without
+  // it, the list goes on with the id it has. The wait sends nothing; Stop ends it.
+  const PAGE_LIST_WAIT_MS = 8000;
+  const PAGE_LIST_POLL_MS = 250;
+  async function pageListOp(name, isActive) {
+    if (state.pageWait[name] || !['stored', 'fallback'].includes(state.sources[name])) return;
+    state.pageWait[name] = true;
+    const until = Date.now() + PAGE_LIST_WAIT_MS;
+    for (;;) {
+      if (isActive && !isActive()) throw paginationError('cancelled', 'API pagination cancelled', 'stopped');
+      const live = captured();
+      if (live.ops?.[name]?.queryId) {
+        const resolved = resolveOp(name, live, state.bundle, state.stored);
+        state.ops[name] = resolved.op;
+        state.sources[name] = resolved.source;
+        await saveCache([name]);
+        return;
+      }
+      if (Date.now() >= until) return;
+      await sleep(PAGE_LIST_POLL_MS);
+    }
   }
 
   function headers(json) {
@@ -497,8 +572,11 @@
   // Normal return means an explicit bottom termination in a recognized timeline.
   // Every incomplete/cancelled path throws, so callers cannot mistake it for completion.
   async function* pages(name, { isActive, onWait, pause = 900 } = {}) {
-    const op = graphql(name);
+    graphql(name);
     const job = state.job;
+    await pageListOp(name, isActive);
+    const op = graphql(name);
+    const source = state.sources[name];
     const base = { ...(LIST_DEFAULT_VARIABLES[name] || {}), ...(op.variables || {}) };
     base.userId = job.me.id;
     delete base.cursor;
@@ -506,15 +584,23 @@
     let cursor = null, emptyStreak = 0;
     for (let page = 0; page < 2000; page++) {
       const variables = cursor ? { ...base, cursor } : base;
-      let parsed = null;
+      let parsed = null, status = null;
       const result = await perform(name, async () => {
         const nonEmpty = o => o && Object.keys(o).length ? o : undefined;
         const r = await call('GET', `/i/api/graphql/${op.queryId}/${name}`, { params: { variables, features: nonEmpty(op.features), fieldToggles: nonEmpty(op.fieldToggles) } });
         parsed = r.json ? parsePage(r.json) : null;
+        status = r.status;
         return r;
       }, { isActive, onWait, okWhen: json => !!json?.data }, job);
+      if (status === 404 && source === 'stored') await forgetStored(name, op.queryId);
       if (result.kind === 'stopped') throw paginationError('cancelled', 'API pagination cancelled', 'stopped');
-      if (result.kind !== 'ok') { const error = new Error(result.message || result.kind); error.result = result; throw error; }
+      if (result.kind !== 'ok') {
+        const error = new Error(result.message || result.kind);
+        // What X refused, without secrets: the operation, the HTTP status (null when no request
+        // was sent) and where its query id came from.
+        error.result = { ...result, operation: name, status, source };
+        throw error;
+      }
       if (!parsed?.recognized) throw paginationError('invalid_timeline', 'X returned an unrecognized or malformed timeline');
       const fresh = {
         tweets: parsed.tweets.filter(t => !seen.has(`t${t.id}`) && seen.add(`t${t.id}`)),

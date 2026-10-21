@@ -63,7 +63,7 @@ export async function testApiPagination() {
   });
   await check('real scanner empty streak reports interruption and no automatic DOM', async () => {
     const h = await harness([...Array.from({ length: 10 }, (_, i) => response([], `c${i}`)), response(['9001'], null, { end: true })]);
-    const p = await scan(h); assert.equal(h.calls.length, 10); assert.equal(p.done, false); assert.equal(p.items.length, 0); assert.equal(p.domStarted, false); assert.equal(!!p.apiFallback, false); assert(!/Scan complete/.test(p.issue)); assert.match(p.issue, /10 consecutive pages without new items/); assert.match(p.issue, /Try again/);
+    const p = await scan(h); assert.equal(h.calls.length, 10); assert.equal(p.done, false); assert.equal(p.items.length, 0); assert.equal(p.domStarted, false); assert.equal(!!p.apiFallback, false); assert(!/Scan complete/.test(p.issue)); assert.match(p.issue, /10 consecutive pages without new items/); assert.match(p.issue, /Start a new scan to try the API again/);
   });
   await check('two empty advancing pages reach the later post', async () => {
     const h = await harness([response([], 'c1'), response([], 'c2'), response(['9001'], null, { end: true })]);
@@ -156,7 +156,7 @@ export async function testApiPagination() {
     ['selected delete', h => deletion(h, true), [{ status: 403, body: {} }]]
   ]) await check(`${name} offers a new explicit retry/manual job instead of automatic fallback`, async () => {
     const h = await harness(specs); const r = await run(h);
-    assert.equal(r.domStarted, false); assert.equal(!!r.apiFallback, false); assert.match(r.issue, /try again|retry/i); assert.match(r.issue, /turn off API/i);
+    assert.equal(r.domStarted, false); assert.equal(!!r.apiFallback, false); assert.match(r.issue, /Start a new (scan|job) to try the API again/); assert.match(r.issue, /turn off API/i);
   });
   for (const spec of [error(429, 88, { 'x-rate-limit-reset': String(START / 1000 + 3600) }), error(429, 344), error(429, 226), { status: 403, headers: { 'Retry-After': '3600' }, body: {} }]) await check(`scanner restriction ${spec.status}/${spec.body.errors?.[0]?.code || 'cooldown'} never offers DOM`, async () => {
     const h = await harness([spec]); const r = await scan(h);

@@ -18,7 +18,9 @@ const timeline = cursor => ({ data: { timeline: { instructions: [{ type: 'Timeli
   ...(cursor ? [{ content: { cursorType: 'Bottom', value: cursor } }] : [])
 ] }, ...(!cursor ? [{ type: 'TimelineTerminateTimeline', direction: 'Bottom' }] : [])] } } });
 
-export async function harness(responses, { store = {}, clock = { now: START }, account = '42', queryId = 'synthetic-id', onSleep, failGet = false, failSet = false, onGet, beforeSet, afterSet, requestBudget = 50 } = {}) {
+// capture: the operations the page itself requested ({ Operation: { queryId } }); bundle: the
+// operations of a loaded main.js ({ ops: { Operation: { queryId } } }), absent by default.
+export async function harness(responses, { store = {}, clock = { now: START }, account = '42', queryId = 'synthetic-id', capture, bundle, onSleep, failGet = false, failSet = false, onGet, beforeSet, afterSet, requestBudget = 50 } = {}) {
   const calls = [], sleeps = [];
   let responseIndex = 0, initialized = false;
   class ClockDate extends Date {
@@ -26,17 +28,17 @@ export async function harness(responses, { store = {}, clock = { now: START }, a
     static now() { return clock.now; }
   }
   const schedule = (fn, ms = 0) => { sleeps.push(ms); clock.now += Math.max(0, ms); onSleep?.(ms); queueMicrotask(fn); return 1; };
-  const runtime = { sendMessage(message, callback) { if (message.type === 'xbc:sleep') { callback?.(); return; } return Promise.resolve({ ok: false }); } };
+  const runtime = { sendMessage(message, callback) { if (message.type === 'xbc:sleep') { callback?.(); return; } return Promise.resolve(message.type === 'xbc:bundleOps' && bundle ? { ok: true, ...clone(bundle) } : { ok: false }); } };
   const math = Object.create(Math); math.random = () => 0;
   const context = vm.createContext({ URL, URLSearchParams, Date: ClockDate, Math: math, console, setTimeout: schedule, crypto: { randomUUID: () => `synthetic-${++syntheticUuid}` },
-    location: { origin: 'https://x.com' }, document: { cookie: `ct0=synthetic; twid=u%3D${account}`, scripts: [], documentElement: { lang: 'en', dataset: { xbcApi: JSON.stringify({ viewerId: account, ops: { UserTweets: { queryId }, DeleteTweet: { queryId } } }) } } },
+    location: { origin: 'https://x.com' }, document: { cookie: `ct0=synthetic; twid=u%3D${account}`, scripts: bundle ? [{ src: 'https://abs.twimg.com/responsive-web/client-web/main.synthetic.js' }] : [], documentElement: { lang: 'en', dataset: { xbcApi: JSON.stringify({ viewerId: account, ops: capture || { UserTweets: { queryId }, DeleteTweet: { queryId } } }) } } },
     chrome: { runtime, storage: { local: {
       get: async keys => { if (failGet && (keys == null || keys.some(k => k.startsWith('xbcApiCooldown:')))) throw new Error('synthetic storage failure'); const value = Object.fromEntries((keys ?? Object.keys(store)).filter(k => k in store).map(k => [k, clone(store[k])])); if (initialized) await onGet?.(keys, value); return value; },
       remove: async keys => { for (const key of keys) delete store[key]; },
       set: async values => { if (failSet && Object.keys(values).some(k => k.startsWith('xbcApiCooldown:'))) throw new Error('synthetic storage failure'); await beforeSet?.(values); Object.assign(store, clone(values)); afterSet?.(values); }
     } } },
     fetch: async (url, options) => {
-      calls.push({ at: clock.now, operation: url.pathname.split('/').at(-1), method: options.method });
+      calls.push({ at: clock.now, operation: url.pathname.split('/').at(-1), queryId: url.pathname.split('/').at(-2), method: options.method });
       assert(calls.length <= requestBudget, 'finite synthetic request budget');
       const index = responseIndex++;
       const spec = await (typeof responses === 'function' ? responses(index, url, options) : responses[index]);
@@ -55,7 +57,8 @@ export async function harness(responses, { store = {}, clock = { now: START }, a
 
 export async function scan(h, { useApi = true, type = 'tweets', whileRunning } = {}) {
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
-  const globals = { window, location: { pathname: '/synthetic_me' }, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {} }, chrome: { runtime: h.runtime, storage: h.storage },
+  h.infos = [];
+  const globals = { window, location: { pathname: '/synthetic_me' }, __xbcApi: useApi ? h.api : undefined, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event: class {}, console: { warn() {}, info: (...args) => h.infos.push(clone(args)) }, chrome: { runtime: h.runtime, storage: h.storage },
     document: { cookie: h.document.cookie, hidden: false, visibilityState: 'visible', documentElement: { scrollHeight: 10 }, addEventListener() {}, querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : null, querySelectorAll: () => [] } };
   const definitions = vm.createContext({ ...globals });
   vm.runInContext(panelSource, definitions);
@@ -447,6 +450,106 @@ export async function testApiLimits() {
     const store = { 'xbcApiCooldown:42:DeleteTweet': { until: START - 1, blocked: true, reason: 'old daily restriction' } };
     const h = await harness([rate(reset(5)), ok], { store });
     assert.equal((await h.api.deleteTweet('synthetic')).kind, 'ok'); assert.equal(h.calls.length, 2);
+  });
+  // Query ids for lists (VER-624). An id that did not come from this page load or the loaded
+  // bundle may be stale, so the first request of a list waits a little for the page's own one.
+  const FALLBACK_UTR = 'bnsYxFljT6y98rFwiGr3fw'; // the built-in UserTweetsAndReplies id
+  const empty404 = { status: 404, body: undefined }; // X's answer to an unknown id: no body at all
+  const repliesPage = { body: timeline(null) };
+  const listError = async iterator => { try { for await (const _ of iterator) { /* consume */ } } catch (error) { return error; } return null; };
+  const cachedOps = store => store.xbcApiCache?.ops || {};
+  await check('list ids: a fallback list id waits for the page request and uses its id', async () => {
+    let h; const late = { UserTweets: { queryId: 'synthetic-id' }, UserTweetsAndReplies: { queryId: 'page-utr' } };
+    h = await harness([repliesPage], { onSleep: () => { if (h && h.clock.now - START >= 1000) h.document.documentElement.dataset.xbcApi = JSON.stringify({ viewerId: '42', ops: late }); } });
+    assert.equal(h.api.sources().UserTweetsAndReplies, 'fallback');
+    assert.equal(await listError(h.api.pages('UserTweetsAndReplies')), null);
+    assert.equal(h.calls.length, 1); assert.equal(h.calls[0].queryId, 'page-utr'); assert.equal(h.api.sources().UserTweetsAndReplies, 'page');
+    assert(h.calls[0].at - START >= 1000 && h.calls[0].at - START < 1500, `request ${h.calls[0].at - START} ms after start, as soon as the page asked`);
+  });
+  await check('list ids: a page or bundle list id is used at once, with no wait', async () => {
+    const page = await harness([repliesPage]);
+    assert.equal(await listError(page.api.pages('UserTweets')), null);
+    assert.equal(page.calls[0].at, START); assert.equal(page.calls[0].queryId, 'synthetic-id');
+    const bundle = await harness([repliesPage], { bundle: { ops: { UserTweetsAndReplies: { queryId: 'bundle-utr', featureSwitches: [], fieldToggles: [] } } } });
+    assert.equal(bundle.api.sources().UserTweetsAndReplies, 'bundle');
+    assert.equal(await listError(bundle.api.pages('UserTweetsAndReplies')), null);
+    assert.equal(bundle.calls[0].at, START); assert.equal(bundle.calls[0].queryId, 'bundle-utr');
+  });
+  await check('list ids: without the page request the wait ends after 8 s and keeps the id it had', async () => {
+    const h = await harness([repliesPage]);
+    assert.equal(await listError(h.api.pages('UserTweetsAndReplies')), null);
+    assert.equal(h.calls.length, 1); assert.equal(h.calls[0].queryId, FALLBACK_UTR); assert.equal(h.api.sources().UserTweetsAndReplies, 'fallback');
+    assert(h.calls[0].at - START >= 8000 && h.calls[0].at - START <= 8250, `request ${h.calls[0].at - START} ms after start`);
+  });
+  await check('list ids: Stop during the wait cancels without a request', async () => {
+    let active = true;
+    const h = await harness([], { onSleep: () => { active = false; } });
+    const error = await listError(h.api.pages('UserTweetsAndReplies', { isActive: () => active }));
+    assert.equal(error?.result?.reason, 'cancelled'); assert.equal(error.result.kind, 'stopped'); assert.equal(h.calls.length, 0);
+    assert(h.clock.now - START < 1000, `the wait ends at the Stop, not after 8 s (${h.clock.now - START} ms)`);
+  });
+  await check('cache: fallback ids are never cached', async () => {
+    const h = await harness([repliesPage]);
+    assert.deepEqual(Object.keys(cachedOps(h.store)).sort(), ['DeleteTweet', 'UserTweets']);
+    assert(Object.values(cachedOps(h.store)).every(op => op.source === 'page'), 'each entry records its source');
+    await listError(h.api.pages('UserTweetsAndReplies'));
+    assert.equal(h.calls[0].queryId, FALLBACK_UTR);
+    assert(!('UserTweetsAndReplies' in cachedOps(h.store)), 'the fallback id used after the wait is not cached');
+  });
+  await check('cache: entries are merged and record their source, and a page id found while waiting is saved', async () => {
+    const store = { xbcApiCache: { ops: { Likes: { queryId: 'cached-likes', source: 'bundle' } } } };
+    let h; const late = { UserTweets: { queryId: 'synthetic-id' }, UserTweetsAndReplies: { queryId: 'page-utr' } };
+    h = await harness([repliesPage], { store, bundle: { ops: { Following: { queryId: 'bundle-following', featureSwitches: [] } } }, onSleep: () => { if (h) h.document.documentElement.dataset.xbcApi = JSON.stringify({ viewerId: '42', ops: late }); } });
+    assert.equal(h.api.sources().Likes, 'stored');
+    assert.deepEqual(cachedOps(store).Likes, { queryId: 'cached-likes', source: 'bundle' }, 'an entry not resolved from the page or bundle is kept as it was');
+    assert.equal(cachedOps(store).Following?.source, 'bundle'); assert.equal(cachedOps(store).UserTweets?.source, 'page');
+    assert.equal(await listError(h.api.pages('UserTweetsAndReplies')), null);
+    assert.equal(cachedOps(store).UserTweetsAndReplies?.queryId, 'page-utr'); assert.equal(cachedOps(store).UserTweetsAndReplies?.source, 'page');
+  });
+  await check('cache: an entry saved without its source is not trusted as stored', async () => {
+    const store = { xbcApiCache: { ops: { UserTweetsAndReplies: { queryId: FALLBACK_UTR }, Likes: { queryId: 'legacy-likes' } } } };
+    const h = await harness([], { store });
+    assert.equal(h.api.sources().UserTweetsAndReplies, 'fallback'); assert.equal(h.api.sources().Likes, 'fallback');
+    assert(!('UserTweetsAndReplies' in cachedOps(store)) && !('Likes' in cachedOps(store)), 'entries of unknown origin are dropped');
+  });
+  await check('cache: a 404 on a stored list id removes it from the cache', async () => {
+    const store = { xbcApiCache: { ops: { Likes: { queryId: 'stale-likes', source: 'page' } } } };
+    const h = await harness([empty404], { store });
+    assert.equal(h.api.sources().Likes, 'stored');
+    const error = await listError(h.api.pages('Likes'));
+    assert.equal(error?.result?.kind, 'refused'); assert.equal(h.calls[0].queryId, 'stale-likes');
+    assert(!('Likes' in cachedOps(store)), 'the stale stored id is removed'); assert.equal(cachedOps(store).UserTweets?.source, 'page');
+    const page = await harness([empty404], { store });
+    await listError(page.api.pages('UserTweets'));
+    assert.equal(cachedOps(store).UserTweets?.queryId, 'synthetic-id', 'a 404 on an id from the page does not remove it');
+    const other = await harness([{ status: 403, body: undefined }], { store: { xbcApiCache: { ops: { Likes: { queryId: 'kept-likes', source: 'bundle' } } } } });
+    await listError(other.api.pages('Likes'));
+    assert.equal(cachedOps(other.store).Likes?.queryId, 'kept-likes', 'only a 404 removes a stored id');
+  });
+  await check('errors: a refused list request names the operation, the HTTP status and the id source', async () => {
+    const h = await harness([empty404]);
+    const error = await listError(h.api.pages('UserTweetsAndReplies'));
+    assert.deepEqual({ ...error?.result }, { kind: 'refused', message: 'HTTP 404', operation: 'UserTweetsAndReplies', status: 404, source: 'fallback' });
+    const scanned = await scan(await harness([empty404]), { type: 'replies' });
+    assert.equal(scanned.issue, 'Scan interrupted after 0 items: X did not accept the request for UserTweetsAndReplies (HTTP 404, id source: fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.');
+    assert.equal(scanned.mode, 'api'); assert.equal(scanned.domStarted, false);
+  });
+  await check('errors: a list request that gets no answer from X says so, instead of saying X refused it', async () => {
+    const offline = () => { throw new TypeError('Failed to fetch'); };
+    const scanned = await scan(await harness(offline), { type: 'replies' });
+    assert.match(scanned.issue, /^Scan interrupted after 0 items: The request for UserTweetsAndReplies got no answer from X \(network error, id source: fallback\)/);
+    assert.doesNotMatch(scanned.issue, /did not accept/);
+    assert.equal(scanned.mode, 'api'); assert.equal(scanned.domStarted, false);
+  });
+  await check('logs: an API scan logs its operation sources once, without secrets', async () => {
+    const h = await harness([repliesPage]);
+    await scan(h);
+    const logged = h.infos.filter(args => args[0] === '[Postscrub] API mode, operation sources:');
+    assert.equal(logged.length, 1, 'logged once per scan');
+    const sources = logged[0][1];
+    assert(sources && Object.entries(sources).every(([name, source]) => /^\w+$/.test(name) && ['page', 'bundle', 'stored', 'fallback'].includes(source)), 'only operation names and their sources');
+    const text = JSON.stringify(h.infos);
+    for (const secret of ['ct0', 'twid', 'synthetic-id', 'AAAAAAAA', '"42"', 'Bearer']) assert(!text.includes(secret), `the log holds no ${secret}`);
   });
   console.log(`${passed}/${passed + failures.length} synthetic API limit checks passed (not browser e2e)`);
   assert.equal(failures.length, 0, `${failures.length} synthetic API limit checks failed`);

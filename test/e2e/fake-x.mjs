@@ -12,6 +12,9 @@ const QUERY_IDS = {
 };
 const PATH_OP = { '': 'UserTweets', with_replies: 'UserTweetsAndReplies', likes: 'Likes', following: 'Following', followers: 'Followers', verified_followers: 'BlueVerifiedFollowers' };
 export const ME = { id: '42', screen: 'me', name: 'Test Account' };
+// The web bundle the fake page names. The extension's service worker reads its operations from
+// the xbcBundleOps cache when the URL matches, so a test can seed it instead of fetching it.
+export const BUNDLE_URL = 'https://abs.twimg.com/responsive-web/client-web/main.b09082b07a640734a.js';
 
 const twitterDate = (i) => new Date(Date.UTC(2024, 0, 1 + i, 12)).toUTCString().replace(/^(\w+), (\d+) (\w+) (\d+) ([\d:]+) GMT$/, '$1 $3 $2 $5 +0000 $4');
 
@@ -34,6 +37,33 @@ export function createState({ own = 12, replies = 0, retweets = 0, likes = 0, fo
     misbehave: { rateLimitAfter: null, rateLimitSeconds: 3, refuse: {}, binding: {}, errorCode: null, responses: {} },
     mutations: 0
   };
+}
+
+// Opt-in X behaviours, set by a scenario's setup; without them X is unchanged:
+//  state.queryIds:              { Operation: queryId } X's current ids where they differ from the
+//                               defaults (which equal the extension's built-in ones), as after a
+//                               new X build; the page uses them and any other id gets a 404
+//  state.pageRequest:           { delay } the page asks for its list that many ms after load
+//                               instead of inline, or { skip: true } it never asks; the page's
+//                               own request is then recorded with fromPage: true
+//  state.misbehave.emptyNotFound: an unknown query id gets a 404 with an empty body, as X answers
+const currentIds = (state) => ({ ...QUERY_IDS, ...(state.queryIds || {}) });
+
+// The xbcBundleOps cache entry for the fake page's bundle: X's current operations, without the
+// ones named in `omit`. Seeding it keeps the service worker from fetching the bundle.
+export function seededBundle(state, { omit = [] } = {}) {
+  const ops = {};
+  for (const [name, queryId] of Object.entries(currentIds(state))) {
+    if (omit.includes(name)) continue;
+    const query = !/^(Delete|Unfavorite)/.test(name);
+    ops[name] = {
+      queryId,
+      operationType: query ? 'query' : 'mutation',
+      featureSwitches: query ? ['rweb_video_screen_enabled', 'responsive_web_graphql_timeline_navigation_enabled'] : [],
+      fieldToggles: query && !/Follow/.test(name) ? ['withPayments', 'withArticlePlainText'] : []
+    };
+  }
+  return { url: BUNDLE_URL, ops, bearer: BEARER, at: Date.now() };
 }
 
 const userResult = (u, extra = {}) => ({
@@ -117,6 +147,7 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
     const request = route.request();
     const url = new URL(request.url());
     const call = { method: request.method(), path: url.pathname, at: Date.now() };
+    if (request.headers()['x-fake-page-request']) call.fromPage = true;
     state.calls.push(call);
     if (!authOk(request, ct0)) return json(route, 403, { errors: [{ code: 353, message: 'This request requires a matching csrf cookie and header.' }] });
 
@@ -124,7 +155,10 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
     if (graphql) {
       const [, queryId, op] = graphql;
       call.op = op;
-      if (QUERY_IDS[op] !== queryId) return json(route, 404, { errors: [{ message: 'Query not found' }] });
+      if (currentIds(state)[op] !== queryId) {
+        if (state.misbehave.emptyNotFound) return route.fulfill({ status: 404, body: '' });
+        return json(route, 404, { errors: [{ message: 'Query not found' }] });
+      }
       // One-shot synthetic responses, including server deadlines. Tests can enqueue these
       // after the page's discovery request, so they target the extension worker alone.
       const forcedResponse = state.misbehave.responses[op]?.shift();
@@ -261,13 +295,19 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
     const path = new URL(route.request().url()).pathname.replace(/^\/|\/$/g, '');
     const [handle, tab = ''] = path.split('/');
     const op = handle === ME.screen ? PATH_OP[tab] : null;
-    route.fulfill({ status: 200, contentType: 'text/html', body: pageHtml(op, state.dom) });
+    route.fulfill({ status: 200, contentType: 'text/html', body: pageHtml(op, state.dom, state) });
   });
 }
 
-function pageHtml(op, dom) {
+function pageHtml(op, dom, state) {
+  const { pageRequest } = state;
+  // Without state.pageRequest the page asks for its list inline, as it always did.
+  const ask = !pageRequest ? 'if (op) {'
+    : pageRequest.skip ? '// state.pageRequest.skip: this page never asks for its list.\nif (false) {'
+      : `// state.pageRequest.delay: ask for the list ${Number(pageRequest.delay) || 0} ms after load.\nif (op) window.addEventListener('load', () => setTimeout(() => {`;
+  const asked = pageRequest && !pageRequest.skip ? `}, ${Number(pageRequest.delay) || 0}));` : '}';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<script type="text/plain" src="https://abs.twimg.com/responsive-web/client-web/main.b09082b07a640734a.js"></script>
+<script type="text/plain" src="${BUNDLE_URL}"></script>
 <script>
 // Like x.com: the page seeds its state, feature switches included; main.js deletes it later.
 window.__INITIAL_STATE__ = { session: { user_id: '${ME.id}' }, featureSwitch: { defaultConfig: { rweb_video_screen_enabled: { value: false } }, user: { config: { rweb_video_screen_enabled: { value: true } } }, customOverrides: {} } };
@@ -281,15 +321,15 @@ delete window.__INITIAL_STATE__;
 <script>
 // Like X's web app, ask the API for this page's list on load.
 const op = ${JSON.stringify(op)};
-const ids = ${JSON.stringify(QUERY_IDS)};
-if (op) {
+const ids = ${JSON.stringify(currentIds(state))};
+${ask}
   const variables = { userId: '${ME.id}', count: 20, includePromotedContent: true, withVoice: true };
   const features = { rweb_video_screen_enabled: false, responsive_web_graphql_timeline_navigation_enabled: true };
   const params = new URLSearchParams({ variables: JSON.stringify(variables), features: JSON.stringify(features) });
   fetch('/i/api/graphql/' + ids[op] + '/' + op + '?' + params, { credentials: 'include', headers: {
     authorization: 'Bearer ${BEARER}', 'x-csrf-token': (document.cookie.match(/ct0=([^;]+)/) || [])[1] || '',
-    'x-twitter-auth-type': 'OAuth2Session', 'content-type': 'application/json' } }).catch(() => {});
-}
+    'x-twitter-auth-type': 'OAuth2Session', 'content-type': 'application/json'${pageRequest ? ", 'x-fake-page-request': '1'" : ''} } }).catch(() => {});
+${asked}
 // Minimal clickable timeline for click mode: caret, red "Delete" item, confirmation.
 async function render() {
   if (op !== 'UserTweets') return;
