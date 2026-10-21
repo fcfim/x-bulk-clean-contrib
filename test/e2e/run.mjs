@@ -1086,13 +1086,14 @@ const SCENARIOS = [
     const at = Date.UTC(2024, 0, 2, 12);
     const job = {
       id: 'csv-job', action: 'delete', account: { username: ME.screen }, startedAt: at - 60000, completedAt: at, durationMs: 60000,
-      status: 'completed', statusText: 'Finished', total: 4, counts: { tweets: 1, replies: 1, unliked: 1, unreposted: 0, follows: 1, unfollows: 0 }
+      status: 'completed', statusText: 'Finished', total: 6, counts: { tweets: 1, replies: 1, unliked: 1, unreposted: 2, follows: 1, unfollows: 0 }
     };
     const backup = {
       tweets: [{ date: '2024-01-01T00:00:00.000Z', text: '=HYPERLINK("http://example.com","x")', author: 'me', url: 'https://x.com/me/status/1', action: 'deleted', actionAt: '2024-01-02T12:00:00.000Z' }],
       replies: [{ date: '2024-01-01T00:00:00.000Z', text: '@fulano obrigado pela atenção', author: 'me', url: 'https://x.com/me/status/2', action: 'deleted_reply', actionAt: '2024-01-02T12:00:00.000Z' }],
       unliked: [{ date: '2024-01-01T00:00:00.000Z', text: '+1 and -2\tminus', author: 'other', url: 'https://x.com/other/status/3', action: 'unliked', actionAt: '2024-01-02T12:00:00.000Z' }],
-      unreposted: [],
+      unreposted: [{ date: '2024-01-01T00:00:00.000Z', text: '\tstarts with a tab', author: 'other', url: 'https://x.com/other/status/4', action: 'unreposted', actionAt: '2024-01-02T12:00:00.000Z' },
+        { date: '2024-01-01T00:00:00.000Z', text: '\rstarts with a carriage return', author: 'other', url: 'https://x.com/other/status/5', action: 'unreposted', actionAt: '2024-01-02T12:00:00.000Z' }],
       follows: [{ username: 'fulano', displayName: '-dash name', profileUrl: 'https://x.com/fulano', action: 'followed', actionAt: '2024-01-02T12:00:00.000Z' }],
       unfollows: []
     };
@@ -1112,9 +1113,10 @@ const SCENARIOS = [
     const checks = ({ bytes, revokedEarly }) => {
       const text = bytes.toString('utf8');
       return [
-        ['the file starts with the UTF-8 byte order mark', bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf, [...bytes.subarray(0, 3)]],
+        ['the file starts with one UTF-8 byte order mark', bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf && !text.slice(1).includes('\ufeff'), [...bytes.subarray(0, 6)]],
         ['a formula is kept as text', text.includes(`"'=HYPERLINK(""http://example.com"",""x"")"`), text],
         ['cells starting with @, +, - are kept as text, accents intact', text.includes("'@fulano obrigado pela atenção") && text.includes("'+1 and -2\tminus") && text.includes("'-dash name"), text],
+        ['cells starting with a tab or a carriage return are kept as text', text.includes("'\tstarts with a tab") && text.includes(`"'\rstarts with a carriage return"`), text],
         ['ordinary cells are unchanged', text.includes(',https://x.com/me/status/1,') && !text.includes("'me") && !text.includes("'https"), text],
         ['the download URL is not revoked right after the click', !revokedEarly, revokedEarly]
       ];
