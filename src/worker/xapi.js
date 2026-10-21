@@ -55,7 +55,7 @@
   // speed of clicking (about 20 a minute). Following is slower: X limits it to ~400 a day.
   const PACE_MS = { delete: 2500, unrepost: 2200, unlike: 2000, unfollow: 4000, follow: 6000 };
 
-  const sleep = (ms) => new Promise(resolve => {
+  const sleepStep = (ms) => new Promise(resolve => {
     // Timed by the service worker: page timers are throttled in background tabs.
     let settled = false;
     const done = () => { if (!settled) { settled = true; resolve(); } };
@@ -64,6 +64,9 @@
       chrome.runtime.sendMessage({ type: 'xbc:sleep', ms }, () => { if (!chrome.runtime.lastError) done(); });
     } catch (_) {}
   });
+  // The service worker times at most 20 s per request (background.js), so a longer sleep is
+  // taken in steps; otherwise a long pause, such as a slowed-down pace, would end after 20 s.
+  const sleep = async (ms) => { do { const step = Math.min(ms, 20000); await sleepStep(step); ms -= step; } while (ms > 0); };
 
   // Sleeps up to `until`, in short steps so a stop request is honored quickly.
   async function waitUntil(until, isActive) {

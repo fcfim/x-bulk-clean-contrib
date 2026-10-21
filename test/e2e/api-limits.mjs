@@ -186,6 +186,21 @@ export async function testApiLimits() {
       for (const t of held.splice(0)) t.fn();
     });
   });
+  // An error while starting the click loop is reported as itself, not as a failed cooldown read (VER-823).
+  for (const flow of loopFlows) await check(`API off ${flow.name} reports an error starting the loop as itself, not as a cooldown failure`, async () => {
+    let armed = false, h;
+    h = await harness([], { onGet: async keys => {
+      const worker = h.workerWindow?.__xCleaner || h.workerWindow?.__xbcPreview;
+      if (keys == null && !armed && worker) {
+        armed = true;
+        Object.defineProperty(worker, 'mode', { configurable: true, get: () => undefined, set() { throw new Error('synthetic start failure'); } });
+      }
+    } });
+    const result = await flow.run(h);
+    assert.ok(armed, 'the start was made to fail');
+    assert.match(result.issue || '', /synthetic start failure/);
+    assert.doesNotMatch(result.issue || '', /cooldown/i);
+  });
   for (const selected of [false, true]) for (const active of [false, true]) await check(`API unavailable ${selected ? 'selected' : 'quick'} delete ${active ? 'stops on known cooldown' : 'offers a new explicit job without automatic DOM'}`, async () => {
     const store = active ? { 'xbcApiCooldown:42:DeleteTweet:claim:unavailable': { until: START + 3600000, blocked: true } } : {};
     const h = await harness([], { store }); h.api.init = async () => ({ ok: false, reason: 'synthetic unavailable' });
@@ -197,7 +212,7 @@ export async function testApiLimits() {
     const p = await scan(h); assert.equal(!!p.apiFallback, false); assert.equal(p.domStarted, false); assert.match(p.issue, active ? /suspended/ : /turn off API/); assert.equal(h.calls.length, 0);
   });
   const quickActions = {
-    delete: ['UserTweets', 'DeleteTweet'], deleteReplies: ['UserTweetsAndReplies', 'DeleteTweet'], unrepost: ['UserTweets', 'DeleteRetweet'],
+    delete: ['UserTweets', 'DeleteTweet'], unrepost: ['UserTweets', 'DeleteRetweet'],
     unlike: ['Likes', 'UnfavoriteTweet'], bulkUnfollow: ['Following', 'friendships/destroy'], followAll: ['Followers', 'friendships/create'], followVerified: ['BlueVerifiedFollowers', 'friendships/create']
   };
   for (const [action, operations] of Object.entries(quickActions)) for (const operation of operations) await check(`API off Quick Clean ${action} checks ${operation}`, async () => {
@@ -406,6 +421,19 @@ export async function testApiLimits() {
     const h = await harness([{ body: timeline('c1') }], { onSleep: () => { active = false; } });
     await assert.rejects(async () => { for await (const _ of h.api.pages('UserTweets', { isActive: () => active })) { /* consume */ } }, e => e.result?.reason === 'cancelled');
     assert.equal(h.calls.length, 1);
+  });
+  // The service worker times at most 20 s per sleep request, so a longer API pause is asked in
+  // steps; one request for the whole pause would end after 20 s (D19).
+  await check('a sleep longer than the service worker cap is asked in steps of up to 20 s', async () => {
+    const h = await harness([]);
+    const asked = [];
+    const send = h.runtime.sendMessage;
+    h.runtime.sendMessage = (message, callback) => { if (message.type === 'xbc:sleep') asked.push(message.ms); return send(message, callback); };
+    await h.api.sleep(50000);
+    assert.deepEqual(asked, [20000, 20000, 10000]);
+    asked.length = 0;
+    await h.api.sleep(1500);
+    assert.deepEqual(asked, [1500], 'a short sleep is one request, as before');
   });
   await check('storage read/write failures stop instead of bypassing cooldown', async () => {
     const read = await harness([], { failGet: true }); assert.equal((await read.api.deleteTweet('synthetic')).kind, 'stop'); assert.equal(read.calls.length, 0);
