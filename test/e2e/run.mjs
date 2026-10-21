@@ -1230,6 +1230,113 @@ const SCENARIOS = [
       ];
     }
   })),
+  // Click mode stops for the right reason (VER-822): no main column is not the end of the list,
+  // a changed page gets no more scrolling, the same page spelled differently is still the same
+  // page, and the selected-deletion worker stops at X's login form like the popup does.
+  {
+    name: 'click mode stop: without a main column the job stops as interrupted, with the reason',
+    state: { own: 3 },
+    setup: (state) => { state.dom = { noPrimaryColumn: true }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      return [
+        ['job interrupted with the reason', r.job.status === 'interrupted' && /main column was not found/.test(r.job.statusText), r.job.statusText],
+        ['no click action', domActions(state).length === 0 && state.tweets.length === 3, domActions(state)]
+      ];
+    }
+  },
+  {
+    name: 'preview stop: without a main column the scan stops unfinished, with the reason',
+    state: { own: 3 },
+    setup: (state) => { state.dom = { noPrimaryColumn: true }; },
+    async run(env) {
+      const panel = await startDomScan(env, 'tweets');
+      const scan = await waitFor(async () => { const P = await readPreview(env); return P && !P.running && P; }, { timeout: 40000, label: 'scan to stop' });
+      const label = await panel.waitForFunction(() => /main column was not found/.test(document.getElementById('scanState').textContent), null, { timeout: 5000 })
+        .then(() => 'main column was not found', () => panel.evaluate(() => document.getElementById('scanState').textContent));
+      await panel.close();
+      return [
+        ['scan stopped unfinished, with the reason', !scan.done && /main column was not found/.test(scan.issue || ''), scan],
+        ['the panel says why', /main column was not found/.test(label), label]
+      ];
+    }
+  },
+  {
+    name: 'preview stop: selected deletion without a main column stops as interrupted, with the reason',
+    state: { own: 3 },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false, beforeAct: () => xPage(env).evaluate(() => document.querySelector('[data-testid="primaryColumn"]').removeAttribute('data-testid')) });
+      return [
+        ['job interrupted with the reason', r.job.status === 'interrupted' && /main column was not found/.test(r.job.statusText), r.job.statusText],
+        ['no click action', domActions(state).length === 0 && state.tweets.length === 3, domActions(state)]
+      ];
+    }
+  },
+  {
+    name: 'click mode stop: no scrolling on the page a stray click moved to',
+    state: { own: 1 },
+    setup: (state) => { state.dom = { navigateOnCaret: true, recordScroll: true }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      const scrolls = state.calls.filter(c => c.op === 'scroll' && c.path !== `/${ME.screen}`);
+      return [
+        ['job stopped because the page changed', r.job.status === 'interrupted' && /The page changed/.test(r.job.statusText), r.job.statusText],
+        ['no scroll on the new page', scrolls.length === 0, scrolls],
+        ['nothing deleted', domActions(state).length === 0 && state.tweets.length === 1, domActions(state)]
+      ];
+    }
+  },
+  {
+    name: 'preview stop: selected deletion does not scroll the page a stray click moved to',
+    state: { own: 1 },
+    setup: (state) => { state.dom = { navigateOnCaret: true, recordScroll: true }; },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false });
+      const scrolls = state.calls.filter(c => c.op === 'scroll' && c.path !== `/${ME.screen}`);
+      return [
+        ['job stopped because the page changed', r.job.status === 'interrupted' && /The page changed/.test(r.job.statusText), r.job.statusText],
+        ['no scroll on the new page', scrolls.length === 0, scrolls],
+        ['nothing deleted', domActions(state).length === 0 && state.tweets.length === 1, domActions(state)]
+      ];
+    }
+  },
+  {
+    name: 'click mode stop: the same page with capitals, a trailing slash, query and hash keeps the job going',
+    state: { own: 4 },
+    setup: (state) => { state.dom = { renameAfter: 2 }; },
+    async run(env, state) {
+      const r = await quickClean(env, 'delete', { apiMode: false });
+      return [
+        ['job finished, not stopped', r.job.status === 'completed' && !/page changed/i.test(r.job.statusText), r.job.statusText],
+        ['all 4 deleted', state.tweets.length === 0 && r.job.total === 4, { left: state.tweets.length, total: r.job.total }]
+      ];
+    }
+  },
+  {
+    name: 'preview stop: selected deletion keeps going on the same page with capitals, a trailing slash, query and hash',
+    state: { own: 4 },
+    setup: (state) => { state.dom = { renameAfter: 2 }; },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false });
+      return [
+        ['job finished, not stopped', r.job.status === 'completed' && !/page changed/i.test(r.job.statusText), r.job.statusText],
+        ['all 4 deleted', state.tweets.length === 0, state.tweets.length]
+      ];
+    }
+  },
+  {
+    name: "preview stop: selected deletion stops at X's login form",
+    state: { own: 6 },
+    setup: (state) => { state.dom = { loginAfter: 2 }; },
+    async run(env, state) {
+      const r = await previewAndAct(env, 'tweets', { apiMode: false });
+      const deletes = state.calls.filter(c => c.op === 'dom-delete');
+      return [
+        ['job interrupted: login required', r.job.status === 'interrupted' && /Login required/.test(r.job.statusText), r.job.statusText],
+        ['no deletion after the login form', deletes.length === 2 && state.tweets.length === 4, deletes.length]
+      ];
+    }
+  },
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 

@@ -244,6 +244,11 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
       }
       return json(route, 200, { ok: true });
     }
+    // Scrolls recorded by state.dom.recordScroll, with the pathname they happened on.
+    if (url.pathname === '/__fake/scroll') {
+      state.calls.push({ method: 'DOM', op: 'scroll', path: url.searchParams.get('path') });
+      return json(route, 200, { ok: true });
+    }
     // Post menus drawn by state.dom.deleteMenu: each menu opened, other item clicked and list redrawn.
     if (url.pathname === '/__fake/menu') {
       state.calls.push({ method: 'DOM', op: `menu-${url.searchParams.get('event')}`, id: url.searchParams.get('id') });
@@ -332,6 +337,11 @@ render();
 //  reject:          { unlike, follow, unfollow }: X refuses that action without a word and the
 //                   list stays as it was; recorded as dom-<action>-rejected
 //  slow:            { unlike, follow, unfollow }: milliseconds X takes to show that action done
+//  navigateOnCaret: clicking a post's menu caret moves to /explore first, as a stray link would
+//  recordScroll:    every scroll is recorded as scroll with the pathname it happened on
+//  renameAfter:     after that many deletions the address keeps the page but changes its spelling
+//                   (capitals, trailing slash, query and hash), as X's redirects do
+//  loginAfter:      after that many deletions X shows its login form, without changing the address
 //  switchedAccount: on your profile pages the profile link names this other account, as if the
 //                   tab switched accounts after the extension read it elsewhere
 // Every action is recorded with the pathname it happened on and where its button was.
@@ -351,6 +361,24 @@ function domScript(dom) {
     counted();
     return response;
   };
+  if (dom.renameAfter || dom.loginAfter) {
+    let deleted = 0;
+    const deleteFetch = window.fetch;
+    window.fetch = async (input, init) => {
+      const response = await deleteFetch(input, init);
+      if (!String(input).startsWith('/__fake/delete')) return response;
+      deleted++;
+      if (deleted === dom.renameAfter) history.replaceState({}, '', location.pathname.toUpperCase() + '/?ref=1#top');
+      if (deleted === dom.loginAfter) document.body.insertAdjacentHTML('beforeend', '<div data-testid="LoginForm">Log in to X</div>');
+      return response;
+    };
+  }
+  if (dom.navigateOnCaret) {
+    document.addEventListener('click', event => {
+      if (event.target.closest?.('[data-testid="caret"]')) history.pushState({}, '', '/explore');
+    }, true);
+  }
+  if (dom.recordScroll) window.addEventListener('scroll', () => realFetch('/__fake/scroll?path=' + encodeURIComponent(location.pathname)));
   async function act(kind, user, where) {
     await realFetch('/__fake/' + kind + '?id=' + user.screen + '&where=' + where + '&path=' + encodeURIComponent(location.pathname));
     if (dom.slow?.[kind]) await new Promise(resolve => setTimeout(resolve, dom.slow[kind]));

@@ -869,7 +869,8 @@ function runWorker(action, performanceMode, account, useApi = false) {
     if (hidden()) return;
     if (found === 0 && atBottom()) {
       X.emptyCycles++;
-      if (X.emptyCycles >= 5) stopAll('Finished — no more items found');
+      // Without X's main column there was nothing to look at, which is not the end of the list.
+      if (X.emptyCycles >= 5) stopAll(scopeRoot() ? 'Finished — no more items found' : "X's main column was not found — job stopped");
     } else {
       X.emptyCycles = 0;
     }
@@ -879,6 +880,8 @@ function runWorker(action, performanceMode, account, useApi = false) {
   // would only run past the posts it has yet to draw. The synthetic scroll event lets X's own
   // listener see the new position, since real scroll events wait for the tab to render.
   function advance(found, handled) {
+    // A job that stopped, or a page that changed, gets no more scrolling.
+    if (!X.interval || !onPage()) return;
     if (found > handled) return;
     if (hidden() && !scopeRoot()?.querySelector('article[data-testid="tweet"], [data-testid="UserCell"]')) return;
     window.scrollBy(0, window.innerHeight * 0.7);
