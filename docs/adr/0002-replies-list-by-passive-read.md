@@ -61,6 +61,8 @@ How it works:
 - Pagination is X's page's. If the page stops loading, the scan stops and says so. It never calls the list complete without X's end of timeline, or without an empty last page followed by silence at the bottom. X's real responses can carry instruction types the parser does not know; such a scan ends "with gaps", never "complete".
 - Any script in X's page can see the drain and record events, and so the bodies the page already received. A script could also send fake record events during a drain. Records are accepted only from the scan's own account, during its own drain. The selected items are still reviewed and confirmed before deletion, and deletion acts only on the account's own posts.
 - While armed, every UTR response of that tab is read, including another profile's replies if the user navigates there. The scan stops on any route change and ignores records for another user id. The arm expires within about 30 s of the scan ending or dying.
+- The arm is checked when each answer arrives, for fetch and XMLHttpRequest alike. A request the page aborts, or that fails without an answer (XHR status 0, a rejected fetch), is left out: the page can ask again, and if it does not, the scan stops for lack of new pages, never as complete.
+- The arm lives in the tab's `sessionStorage`, which is per origin. If the tab is on twitter.com and X redirects the Replies page to x.com, the arm is not there; the scan stops with "the scan was not ready when X's page loaded" and lists nothing. A tab duplicated during a scan inherits the arm until it expires; its answers are read and dropped then, since no scan drains them.
 - Validation against real X belongs to the user before release (VER-624): the simulated X stands in for X's page and its header.
 
 ## Evidence
@@ -79,8 +81,8 @@ Browser scenarios in `test/e2e/run.mjs` (`preview: replies only`, `preview: post
 - an honest stop when the page never asks;
 - 404 and 429 page responses;
 - Stop mid-scan;
-- no read without an arm;
+- no read without an arm: nothing outside the page clones or reads a UserTweetsAndReplies body, by fetch or XMLHttpRequest ('text' and 'json'), an arm set after an answer gets nothing, an answer that arrives after the arm is removed is not read, and an aborted request is not handed over;
 - account and route mismatches;
 - the fake's refusal itself.
 
-The eleven scenarios that exercise the extension fail on `494ed8b` and pass with this change; the fake's own refusal check is independent of the extension. Synthetic checks (`--api-limits`, `passive:`) cover the end rules, gaps, other accounts' records, hidden tabs, Pause, Stop, overflow, the checks before listing and the client's `passive_only` refusal.
+The thirteen scenarios that exercise the extension (the unarmed one runs for fetch and each XHR type) fail on `494ed8b` and pass with this change; the fake's own refusal check is independent of the extension. Synthetic checks (`--api-limits`, `passive:`) cover the end rules, gaps, other accounts' records, hidden tabs, Pause, Stop, overflow, the checks before listing and the client's `passive_only` refusal.

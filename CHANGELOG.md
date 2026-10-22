@@ -14,7 +14,7 @@
 
 ### Fixed
 
-- Scanning replies in API mode no longer stops at once with "HTTP 404". X now refuses that list unless its own page asks for it, with a header only its page makes; Postscrub does not make or copy that header.
+- Scanning replies in API mode no longer stops at once with "HTTP 404". X now refuses that list unless its own page asks for it, with a header only its page makes; Postscrub does not make or copy that header. Shown on the simulated X used by the tests; confirmation on real X is pending (VER-624).
 - Stop during the pause between two API actions ends it within a second, with no further request, and a job no longer waits a pause after its last item.
 - A Quick Clean run by API that found items but completed none of them (each attempt failed, or the item was already gone) now stops as interrupted with "N found, none deleted" instead of "No matching items returned by API".
 
