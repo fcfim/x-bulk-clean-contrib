@@ -1185,6 +1185,7 @@ function updateSelectionCounts() {
   $('selectedCount').textContent = `${selected} selected`;
   $('stickySelected').textContent = `${selected}`; $('stickyScanned').textContent = `${previewItems.length} found`;
   $('deleteSelected').disabled = !selected || cleanupRunning;
+  $('exportSelection').disabled = !selected;
   $('deleteSelected').textContent = selectedType() === 'reposts'
     ? 'Remove selected reposts'
     : selectedType() === 'unfollow' ? 'Unfollow selected accounts'
@@ -1202,6 +1203,26 @@ async function setFilteredSelection(mode) {
   } else if (items.length) writes.push(savePreviewSelection(items.map(item => item.id), mode === 'all'));
   renderReview();
   await Promise.all(writes);
+}
+
+// Saves the selected items as a CSV before anything is deleted, with the columns of the job
+// history's CSV (csvEscape and downloadCsv come from shared/csv.js: a byte order mark, and cells
+// a spreadsheet would evaluate kept as text). Read-only: nothing on X and no selection changes.
+const EXPORT_TYPES = { tweet: 'Post', reply: 'Reply', 'post or orphan reply': 'Post or orphan reply', repost: 'Repost', account: 'Account' };
+function exportSelection() {
+  const selected = previewItems.filter(item => item.selected);
+  if (!selected.length) return;
+  const absolute = url => (url && url.startsWith('/') ? `https://x.com${url}` : url || '');
+  const lines = [['Type', 'Date', 'Content', 'Author/Username', 'Display Name', 'URL', 'Action', 'Action Date'].join(',')];
+  for (const item of selected) {
+    const account = item.type === 'account';
+    lines.push([
+      EXPORT_TYPES[item.type] || item.type || '', item.date || '', account ? '' : item.text || '',
+      account ? item.username || item.author || '' : item.author || '', account ? item.displayName || '' : '',
+      absolute(item.url), 'selected', ''
+    ].map(csvEscape).join(','));
+  }
+  downloadCsv(lines, `postscrub_selection_${selectedType()}_${new Date().toISOString().slice(0, 10)}.csv`);
 }
 
 function openDeleteDialog() {
@@ -1307,7 +1328,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('startScan').addEventListener('click', startScan); $('pauseScan').addEventListener('click', togglePause); $('stopScan').addEventListener('click', stopScan);
   $('selectAll').addEventListener('click',()=>setFilteredSelection('all')); $('selectNone').addEventListener('click',()=>setFilteredSelection('none')); $('invertSelection').addEventListener('click',()=>setFilteredSelection('invert'));
   ['resultSearch','dateFrom','dateTo'].forEach(id=>$(id).addEventListener('input',()=>{shownItems=PAGE_SIZE;renderReview()}));
-  $('loadMore').addEventListener('click',()=>{shownItems+=PAGE_SIZE;renderReview()}); $('deleteSelected').addEventListener('click',openDeleteDialog); $('cancelDelete').addEventListener('click',()=>$('deleteDialog').close()); $('confirmDelete').addEventListener('click',beginSelectedDelete);
+  $('loadMore').addEventListener('click',()=>{shownItems+=PAGE_SIZE;renderReview()}); $('deleteSelected').addEventListener('click',openDeleteDialog); $('exportSelection').addEventListener('click',exportSelection); $('cancelDelete').addEventListener('click',()=>$('deleteDialog').close()); $('confirmDelete').addEventListener('click',beginSelectedDelete);
   $('cancelNewScan').addEventListener('click',()=>$('newScanDialog').close()); $('confirmNewScan').addEventListener('click',resetPreview);
   $('openHistory').addEventListener('click',()=>chrome.runtime.openOptionsPage());
   $('previewApi').addEventListener('change',()=>chrome.storage.local.set({ apiMode: $('previewApi').checked }));

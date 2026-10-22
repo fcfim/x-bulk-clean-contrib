@@ -6,6 +6,7 @@
 
 - A Speed setting for API mode, in the popup and the side panel: Normal (the default) or Careful, which waits twice as long between actions. There is no faster option, and a stored value below Normal is still paced as Normal.
 - Delete all posts can be limited by date: only posts before a chosen date, or keep the last N days. Only older posts are deleted and counted, in API and click mode; a post whose date cannot be read is skipped, never deleted. The confirmation names the range, an incomplete choice starts nothing, and the job history shows the range and how many newer posts were kept.
+- Export selection (CSV) in Preview & Select: saves the selected items only, with the columns of the job history's CSV, a byte order mark and formulas kept as text. It deletes nothing and leaves the selection as it is.
 
 ### Fixed
 

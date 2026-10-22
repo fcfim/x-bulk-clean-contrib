@@ -10,7 +10,7 @@ Postscrub is a Chrome extension that cleans up your X account in bulk: delete po
 
 ## Features
 
-- **Preview & Select** in Chrome's side panel: scan posts, replies, reposts or the accounts you follow, filter by text and date, select exactly what goes.
+- **Preview & Select** in Chrome's side panel: scan posts, replies, reposts or the accounts you follow, filter by text and date, select exactly what goes. **Export selection (CSV)** saves the selected items, with the columns of the job history's CSV, before anything is deleted; it deletes nothing and keeps the selection as it is.
 - **Quick clean**: delete all posts, clear all likes, remove all reposts, bulk unfollow, follow back followers.
 - **Delete all posts by date**: in its confirmation, choose All posts, only posts before a date (posted before 00:00 that day, in your time zone) or keep the last N days (1 to 3650). Only posts older than that are deleted, and a post whose date cannot be read is skipped, never deleted. The choice is not saved: the popup always opens on All posts.
 - **API mode** (default): Postscrub sends the same requests X's own site sends when you click, so jobs are fast and keep running in a background tab. If X refuses them, the job or scan stops and tells you why: start it again to retry the API, or turn API mode off to do it by clicking through the page.

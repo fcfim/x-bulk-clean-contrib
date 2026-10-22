@@ -2183,6 +2183,61 @@ const SCENARIOS = [
       ];
     }
   },
+  // Export of the selection before deleting (VER-636): the selected rows only, with the columns of
+  // the history CSV, a byte order mark and formulas kept as text; nothing deleted, selection kept.
+  {
+    name: 'export selection: downloads exactly the selected rows as CSV and deletes nothing',
+    state: { own: 4 },
+    setup: state => { state.tweets[0].text = '=HYPERLINK("http://example.com","x")'; },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await scanPostsByApi(panel);
+      await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent) && !document.getElementById('deleteSelected').disabled, null, { timeout: 60000 });
+      const enabled = () => panel.evaluate(() => !document.getElementById('exportSelection').disabled);
+      const allSelected = await enabled();
+      await panel.locator('#selectNone').click();
+      const noneSelected = await enabled();
+      await panel.locator('#selectAll').click();
+      const unselected = state.tweets[2].id;
+      await panel.locator(`.result[data-id="${unselected}"] input`).uncheck();
+      await panel.waitForFunction(() => document.getElementById('selectedCount').textContent === '3 selected', null, { timeout: 5000 });
+      const selection = async () => ({
+        panel: await panel.evaluate(() => document.getElementById('selectedCount').textContent),
+        tab: await env.worker.evaluate(async () => {
+          const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+          const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => window.__xbcPreview.items.map(i => `${i.id}:${i.selected}`).join(',') });
+          return r?.result;
+        })
+      });
+      await waitFor(async () => (await selection()).tab?.includes(`${unselected}:false`), { timeout: 5000, label: 'selection saved in the tab' });
+      const before = await selection();
+      const callsBefore = state.calls.length;
+      const [file] = await Promise.all([panel.waitForEvent('download', { timeout: 10000 }), panel.locator('#exportSelection').click()]);
+      const bytes = fs.readFileSync(await file.path());
+      await panel.waitForTimeout(1000);
+      const after = await selection();
+      const dialogOpen = await panel.evaluate(() => document.getElementById('deleteDialog').open);
+      await panel.close();
+      const text = bytes.toString('utf8').replace(/^﻿/, '');
+      const [header, ...rows] = text.split('\n');
+      const rowIds = rows.map(row => row.match(/\/status\/(\d+),/)?.[1]).join(',');
+      const expected = state.tweets.filter(t => t.id !== unselected);
+      return [
+        ['the button is enabled with a selection and disabled without one', allSelected && !noneSelected, { allSelected, noneSelected }],
+        ['the file name says it is the selection', /^postscrub_selection_tweets_\d{4}-\d{2}-\d{2}\.csv$/.test(file.suggestedFilename()), file.suggestedFilename()],
+        ['the file starts with one UTF-8 byte order mark', bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf && !text.includes('﻿'), [...bytes.subarray(0, 6)]],
+        ['the columns are those of the history CSV', header === 'Type,Date,Content,Author/Username,Display Name,URL,Action,Action Date', header],
+        ['exactly the 3 selected posts, in order, and not the unselected one', rows.length === 3 && rowIds === expected.map(t => t.id).join(','), rows],
+        ['each row has its type, date, author, link and the action "selected"', rows.every((row, i) => row.startsWith(`Post,${new Date(expected[i].created).toISOString()},`) && row.includes(`,me,,https://x.com/me/status/${expected[i].id},selected,`)), rows],
+        ['a formula is kept as text', rows[0].includes(`"'=HYPERLINK(""http://example.com"",""x"")"`), rows[0]],
+        ['the selection is unchanged, in the panel and in the tab', JSON.stringify(after) === JSON.stringify(before) && before.panel === '3 selected', { before, after }],
+        ['nothing deleted and no request to X', state.tweets.length === 4 && state.calls.length === callsBefore && !dialogOpen, { posts: state.tweets.length, calls: state.calls.slice(callsBefore).map(c => c.op || c.path), dialogOpen }],
+        ['no job started', !(await storage(env.worker, ['activeAction'])).activeAction && !((await storage(env.worker, ['jobHistory'])).jobHistory || []).length],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  },
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 
