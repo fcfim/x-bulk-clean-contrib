@@ -2168,7 +2168,10 @@ const SCENARIOS = [
         await choose();
         await popup.locator('#confirmStart').click();
         await popup.waitForTimeout(300);
-        attempts.push({ label, ...(await readConfirm(popup)), activeAction: (await storage(env.worker, ['activeAction'])).activeAction || null });
+        const confirm = await readConfirm(popup);
+        // A closed dialog may be a job starting: give it time to record activeAction before reading it.
+        if (!confirm.open) await popup.waitForTimeout(1500);
+        attempts.push({ label, ...confirm, activeAction: (await storage(env.worker, ['activeAction'])).activeAction || null });
       };
       await attempt('no date', async () => {});
       for (const days of ['', '0', '3651', '2.5']) await attempt(`${days || 'no'} days`, async () => { await popup.locator('#dateScopeKeep').check(); await popup.locator('#dateScopeDays').fill(days); });

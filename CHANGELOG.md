@@ -11,6 +11,7 @@
 ### Fixed
 
 - Stop during the pause between two API actions ends it within a second, with no further request, and a job no longer waits a pause after its last item.
+- A Quick Clean run by API that found items but completed none of them (each attempt failed, or the item was already gone) now stops as interrupted with "N found, none deleted" instead of "No matching items returned by API".
 
 ## [0.1.0] - Unreleased
 
