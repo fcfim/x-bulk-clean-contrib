@@ -159,6 +159,8 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
     const call = { method: request.method(), path: url.pathname, at: Date.now() };
     const transactionId = !!request.headers()['x-client-transaction-id'];
     if (transactionId || request.headers()['x-fake-page-request']) call.fromPage = true;
+    // Its value, so a test can check that nothing the extension keeps carries it.
+    if (transactionId) call.transaction = request.headers()['x-client-transaction-id'];
     state.calls.push(call);
     if (!authOk(request, ct0)) return json(route, 403, { errors: [{ code: 353, message: 'This request requires a matching csrf cookie and header.' }] });
 

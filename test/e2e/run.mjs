@@ -338,6 +338,18 @@ const drainCapture = env => xPage(env).evaluate(() => {
   document.removeEventListener('xbc:passive-record', listen);
   return got;
 });
+// A handed-over record holds exactly these keys, plus `unreadable` only when it is set: nothing
+// else from the request (its headers, the page's transaction id) can ride along under a new key.
+const RECORD_KEYS = ['seq', 'at', 'status', 'userId', 'cursor', 'body', 'rateReset', 'rateRemaining'];
+const exactRecordKeys = record => JSON.stringify(Object.keys(record).sort()) === JSON.stringify([...RECORD_KEYS, ...(record.unreadable === true ? ['unreadable'] : [])].sort());
+// Every x-client-transaction-id the page sent (the fake records each value), and whether any
+// string anywhere in the handed-over records contains one of them.
+const pageTransactions = state => state.calls.filter(c => c.transaction).map(c => c.transaction);
+const strings = value => typeof value === 'string' ? [value] : value && typeof value === 'object' ? Object.values(value).flatMap(strings) : [];
+const carriesTransaction = (records, state) => {
+  const sent = pageTransactions(state);
+  return records.some(record => strings(record).some(text => sent.some(id => text.includes(id))));
+};
 // Scrolls X's page to its bottom, as a person would, so the Replies page asks for its next page.
 const scrollPage = env => xPage(env).evaluate(() => { window.scrollTo(0, document.documentElement.scrollHeight); window.dispatchEvent(new Event('scroll')); });
 async function scanReplies(env, { replyScope = 'fast', apiMode = true } = {}) {
@@ -2145,7 +2157,8 @@ const SCENARIOS = [
         ['the page asked by ' + (transport === 'fetch' ? 'fetch' : 'XMLHttpRequest') + ' for each of its 5 pages', pageRequests.length === 5 && pageRequests.every(r => r.fromPage), pageRequests],
         ['unarmed: no response body cloned or read by anyone but the page', total(unarmedReads) === 0 && !/my reply/.test(marker.api), unarmedReads],
         ['unarmed, then armed with no new response: a drain hands over nothing', armedAfter.length === 0 && unarmed.length === 0, { armedAfter: armedAfter.length, unarmed: unarmed.length }],
-        ['armed: the page\'s own response is handed over, for this account, with its status and cursor', armed.length === 1 && armed[0].status === 200 && armed[0].userId === ME.id && armed[0].cursor && /my reply/.test(armed[0].body) && !('headers' in armed[0]) && !armed[0].unreadable, armed.map(a => ({ ...a, body: a.body?.length }))],
+        ['armed: the page\'s own response is handed over, for this account, with its status and cursor', armed.length === 1 && armed[0].status === 200 && armed[0].userId === ME.id && armed[0].cursor && /my reply/.test(armed[0].body) && !armed[0].unreadable, armed.map(a => ({ ...a, body: a.body?.length }))],
+        ['armed: the record has exactly its keys, and no value holds the page\'s transaction id', armed.length === 1 && exactRecordKeys(armed[0]) && pageTransactions(state).length >= 5 && !carriesTransaction(armed, state), { keys: armed.map(a => Object.keys(a)), sent: pageTransactions(state).length }],
         ['armed: the read is seen by the counters (so they would see an unarmed one)', (transport === 'fetch' ? armedReads.fetch : armedReads.xhr) > 0, armedReads],
         ['disarmed again: nothing read or handed over', disarmed.length === 0 && total(disarmedReads) === total(armedReads), { disarmed: disarmed.length, armedReads, disarmedReads }],
         ['disarmed while X answers: the answer is not read', inFlight.length === 0 && total(inFlightReads) === total(disarmedReads), { inFlight: inFlight.length, disarmedReads, inFlightReads }],
@@ -2191,6 +2204,7 @@ const SCENARIOS = [
         ['then one overflow record with the 5 it dropped, last', overflow.length === 1 && JSON.stringify(overflow[0]) === '{"overflow":5}' && first.at(-1) === overflow[0], overflow],
         ['a second drain hands over nothing', again.length === 0, again.length],
         ['after the drain, the queue starts over: 2 answers, no overflow', later.length === 2 && later.every(r => r.status === 200 && !('overflow' in r)), later.map(r => Object.keys(r))],
+        ['every record has exactly its keys, and none holds a transaction id the page sent', [...records, ...later].every(exactRecordKeys) && pageTransactions(state).length >= 48 && !carriesTransaction([...first, ...later], state), { keys: [...new Set([...first, ...later].map(r => Object.keys(r).join(',')))], sent: pageTransactions(state).length }],
         ['no request of the extension', extensionReplies(state).length === 0, extensionReplies(state)]
       ];
     }
