@@ -357,6 +357,76 @@ async function scanRepliesByApi(env, state) {
     await panel.close();
   }
 }
+// API speed (VER-635). Each scenario seeds the web bundle cache, so no request reaches X's CDN.
+async function seedSpeedBundle(env, state) {
+  const seeded = seededBundle(state);
+  await env.worker.evaluate(bundle => chrome.storage.local.set({ xbcBundleOps: bundle }), seeded);
+  return seeded;
+}
+const bundleKept = async (env, seeded) => (await storage(env.worker, ['xbcBundleOps'])).xbcBundleOps?.at === seeded.at;
+const setSpeed = (env, value) => env.worker.evaluate(v => chrome.storage.local.set({ apiPace: v }), value);
+// The service worker times every sleep a job asks for. Recording the requests there (only their
+// length) shows when a pace ends, without touching the page.
+async function recordSleeps(env) {
+  await env.worker.evaluate(() => {
+    globalThis.__speedSleeps = [];
+    chrome.runtime.onMessage.addListener(message => {
+      if (message?.type === 'xbc:sleep') globalThis.__speedSleeps.push({ at: Date.now(), ms: Math.min(Math.max(Number(message.ms) || 0, 0), 20000) });
+    });
+  });
+}
+const recordedSleeps = env => env.worker.evaluate(() => globalThis.__speedSleeps || []);
+// Opens the popup or the side panel and reads its speed control once it shows the stored value
+// (the control is disabled until then).
+async function openSpeed(env, path) {
+  const id = path.startsWith('popup') ? 'apiPace' : 'previewSpeed';
+  const page = await openExtensionPage(env.context, env.extensionId, path);
+  await page.waitForFunction(id => !document.getElementById(id).disabled, id, { timeout: 20000 });
+  const shown = await page.evaluate(id => {
+    const select = document.getElementById(id);
+    return { value: select.value, options: [...select.options].map(o => `${o.value} ${o.textContent}`), note: document.getElementById(select.getAttribute('aria-describedby'))?.textContent || '' };
+  }, id);
+  return { page, shown };
+}
+const latestJob = async (env, before) => {
+  const history = (await storage(env.worker, ['jobHistory'])).jobHistory || [];
+  return history.length > before && history[0]?.status !== 'running' ? history[0] : null;
+};
+async function startQuickDelete(env, popup) {
+  await popup.waitForFunction(() => document.getElementById('accountCard')?.dataset.state === 'ready', null, { timeout: 20000 });
+  await popup.evaluate(() => { const box = document.getElementById('apiMode'); if (!box.checked) box.click(); document.getElementById('startDelete').click(); });
+  await popup.waitForFunction(() => document.getElementById('confirmDialog')?.open, null, { timeout: 10000 });
+  await popup.evaluate(() => document.getElementById('confirmStart').click());
+}
+async function scanPostsByApi(panel) {
+  await panel.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
+  await panel.evaluate(() => {
+    document.querySelector('input[name="previewType"][value="tweets"]').click();
+    const box = document.getElementById('previewApi');
+    if (!box.checked) box.click();
+    document.getElementById('startScan').click();
+  });
+}
+// Stops a job by its own Stop button about 1.2 s into the Careful pace after its first
+// DeleteTweet, then waits past the time a full pace would have ended.
+async function stopDuringPace(env, state, before, pressStop) {
+  const first = await waitFor(() => state.calls.find(c => c.op === 'DeleteTweet'), { timeout: 60000, interval: 50, label: 'first DeleteTweet' });
+  await waitFor(() => Date.now() >= first.at + 1200, { interval: 50, label: 'into the pace' });
+  const deletesAtStop = state.calls.filter(c => c.op === 'DeleteTweet').length;
+  await pressStop();
+  const job = await waitFor(() => latestJob(env, before), { timeout: 10000, label: 'stopped job record' });
+  // A Careful pace lasts 5 to 7.5 s: a pace Stop did not end would still be running before this.
+  await waitFor(() => Date.now() >= first.at + 8500, { interval: 100, label: 'past a full Careful pace' });
+  const sleeps = (await recordedSleeps(env)).filter(s => s.at >= first.at);
+  return {
+    job, deletesAtStop,
+    deletes: state.calls.filter(c => c.op === 'DeleteTweet').length,
+    laterRequests: state.calls.filter(c => c.at > job.completedAt && !c.fromPage && c.method !== 'DOM').map(c => c.op || c.path),
+    steps: sleeps.map(s => s.ms),
+    // How long after the job stopped its last pace step ended.
+    lingered: sleeps.length ? Math.max(...sleeps.map(s => s.at + s.ms)) - job.completedAt : null
+  };
+}
 const repliesRequests = state => state.calls.filter(c => c.op === 'UserTweetsAndReplies').map(c => ({ at: c.at, fromPage: !!c.fromPage, id: idLabel(c.path.split('/').at(-2)) }));
 
 const SCENARIOS = [
@@ -1821,6 +1891,143 @@ const SCENARIOS = [
       ];
     }
   },
+  {
+    name: 'speed: the setting persists between popup openings and the side panel shows the same value',
+    state: { own: 0 },
+    async run(env) {
+      const stored = async () => (await storage(env.worker, ['apiPace'])).apiPace;
+      await env.worker.evaluate(() => chrome.storage.local.remove(['apiPace']));
+      const fresh = await openSpeed(env, 'popup/popup.html');
+      await fresh.page.selectOption('#apiPace', '2');
+      const savedCareful = await waitFor(async () => (await stored()) === 2, { timeout: 5000, label: 'Careful saved' }).then(() => true, () => false);
+      await fresh.page.close();
+      const reopened = await openSpeed(env, 'popup/popup.html');
+      await reopened.page.close();
+      const panel = await openSpeed(env, 'sidepanel/sidepanel.html');
+      // With both open, a change in one shows in the other.
+      const popup = await openSpeed(env, 'popup/popup.html');
+      await panel.page.selectOption('#previewSpeed', '1');
+      const savedNormal = await waitFor(async () => (await stored()) === 1, { timeout: 5000, label: 'Normal saved' }).then(() => true, () => false);
+      const popupFollowed = await popup.page.waitForFunction(() => document.getElementById('apiPace').value === '1', null, { timeout: 5000 }).then(() => true, () => false);
+      await popup.page.selectOption('#apiPace', '2');
+      const panelFollowed = await panel.page.waitForFunction(() => document.getElementById('previewSpeed').value === '2', null, { timeout: 5000 }).then(() => true, () => false);
+      await panel.page.close(); await popup.page.close();
+      // Values written by hand: shown as Normal, left as they are (the worker floors them at 1).
+      const handWritten = [];
+      for (const value of [0.6, 3, 'fast']) {
+        await setSpeed(env, value);
+        const inPopup = await openSpeed(env, 'popup/popup.html'), inPanel = await openSpeed(env, 'sidepanel/sidepanel.html');
+        handWritten.push({ value, popup: inPopup.shown.value, panel: inPanel.shown.value, stored: await stored() });
+        await inPopup.page.close(); await inPanel.page.close();
+      }
+      const notes = [fresh.shown.note, panel.shown.note];
+      return [
+        ['a missing setting shows Normal', fresh.shown.value === '1', fresh.shown],
+        ['only Normal and Careful, no Fast, in both views', [fresh.shown, panel.shown].every(v => JSON.stringify(v.options) === '["1 Normal","2 Careful"]'), [fresh.shown.options, panel.shown.options]],
+        ['the note says X publishes no limit and what Careful does, with no promise of safety', notes.every(n => /X publishes no limit for deleting/.test(n) && /Careful waits twice as long/.test(n) && !/\bsafe/i.test(n)), notes],
+        ['choosing Careful in the popup saves apiPace 2', savedCareful],
+        ['a reopened popup shows Careful', reopened.shown.value === '2', reopened.shown.value],
+        ['the side panel shows the same Careful', panel.shown.value === '2', panel.shown.value],
+        ['Normal chosen in the side panel saves apiPace 1 and shows in the open popup', savedNormal && popupFollowed, { savedNormal, popupFollowed }],
+        ['a choice in the popup shows in the open side panel', panelFollowed],
+        ['hand-written values show as Normal and stay as stored', handWritten.every(h => h.popup === '1' && h.panel === '1' && h.stored === h.value), handWritten]
+      ];
+    }
+  },
+  {
+    name: 'speed: the control is disabled while a scan or a job runs, and enabled again after',
+    state: { own: 4, pageSize: 1 },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      const panel = await openSpeed(env, 'sidepanel/sidepanel.html');
+      await scanPostsByApi(panel.page);
+      await panel.page.waitForFunction(() => document.getElementById('setupSection').style.display === 'none', null, { timeout: 20000 });
+      const duringScan = { disabled: await panel.page.evaluate(() => document.getElementById('previewSpeed').disabled), running: (await readPreview(env))?.running };
+      await panel.page.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent), null, { timeout: 60000 });
+      const afterScan = await panel.page.evaluate(() => document.getElementById('previewSpeed').disabled);
+      await panel.page.evaluate(() => document.getElementById('stopScan').click());
+      await panel.page.waitForFunction(() => document.getElementById('newScanDialog').open, null, { timeout: 10000 });
+      await panel.page.evaluate(() => document.getElementById('confirmNewScan').click());
+      const backToSetup = await panel.page.waitForFunction(() => document.getElementById('setupSection').style.display !== 'none' && !document.getElementById('previewSpeed').disabled, null, { timeout: 10000 }).then(() => true, () => false);
+      await panel.page.close();
+      const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
+      const popup = await openSpeed(env, 'popup/popup.html');
+      await startQuickDelete(env, popup.page);
+      await waitFor(() => state.calls.some(c => c.op === 'DeleteTweet'), { timeout: 30000, interval: 50, label: 'first DeleteTweet' });
+      const duringJob = await popup.page.evaluate(() => ({ disabled: document.getElementById('apiPace').disabled, running: document.body.dataset.running }));
+      const job = await waitFor(() => latestJob(env, before), { timeout: 60000, label: 'delete job to finish' });
+      const afterJob = await popup.page.waitForFunction(() => !document.getElementById('apiPace').disabled, null, { timeout: 10000 }).then(() => true, () => false);
+      await popup.page.close();
+      return [
+        ['disabled while the side panel scan runs', duringScan.disabled === true && duringScan.running === true, duringScan],
+        ['still disabled while the review is on screen', afterScan === true],
+        ['enabled again once the panel is back at the setup', backToSetup],
+        ['disabled in the popup while the job runs', duringJob.disabled === true && duringJob.running === 'true', duringJob],
+        ['the job deleted the 4 posts by API', job.status === 'completed' && job.total === 4 && state.tweets.length === 0, { status: job.status, total: job.total }],
+        ['enabled again in the popup once the job is over', afterJob],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  },
+  {
+    name: 'speed: selected deletion by API finishes right after its last item, with no extra pace',
+    state: { own: 3 },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      await setSpeed(env, 2); // Careful: a pace after the last item would add 5 s or more
+      await recordSleeps(env);
+      const r = await previewAndAct(env, 'tweets');
+      const deletes = state.calls.filter(c => c.op === 'DeleteTweet');
+      const last = deletes.at(-1)?.at;
+      const gaps = deletes.slice(1).map((c, i) => c.at - deletes[i].at);
+      const after = (await recordedSleeps(env)).filter(s => s.at >= last).map(s => s.ms);
+      return [
+        ['the 3 posts deleted by API', r.worker?.mode === 'api' && deletes.length === 3 && state.tweets.length === 0 && r.job.status === 'completed', { mode: r.worker?.mode, deletes: deletes.length, status: r.job.status }],
+        ['a Careful pace of 5 s or more between deletions', gaps.length === 2 && gaps.every(g => g >= 5000), gaps],
+        ['finished within 2 s of its last DeleteTweet', r.job.completedAt - last < 2000, r.job.completedAt - last],
+        ['no sleep asked after its last DeleteTweet', after.length === 0, after],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  },
+  ...[
+    { flow: 'Quick Clean', popup: true },
+    { flow: 'selected deletion', popup: false }
+  ].map(({ flow, popup: fromPopup }) => ({
+    name: `speed: Stop during a Careful pace stops ${flow} promptly, with no further DeleteTweet`,
+    state: { own: 3 },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      await setSpeed(env, 2);
+      const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
+      let page, r;
+      if (fromPopup) {
+        page = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
+        await recordSleeps(env);
+        await startQuickDelete(env, page);
+        r = await stopDuringPace(env, state, before, () => page.evaluate(() => document.getElementById('stopAction').click()));
+      } else {
+        page = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+        await scanPostsByApi(page);
+        await page.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent) && !document.getElementById('deleteSelected').disabled, null, { timeout: 60000 });
+        await recordSleeps(env);
+        await page.evaluate(() => document.getElementById('deleteSelected').click());
+        await page.waitForFunction(() => document.getElementById('deleteDialog')?.open, null, { timeout: 10000 });
+        await page.evaluate(() => document.getElementById('confirmDelete').click());
+        r = await stopDuringPace(env, state, before, () => page.evaluate(() => document.getElementById('stopScan').click()));
+      }
+      await page.close();
+      return [
+        ['Stop pressed during the pace after the first DeleteTweet', r.deletesAtStop === 1, r.deletesAtStop],
+        ['the job record says stopped, with the 1 deletion', r.job.status === 'stopped' && r.job.total === 1, { status: r.job.status, total: r.job.total }],
+        ['no DeleteTweet and no other request after Stop', r.deletes === 1 && r.laterRequests.length === 0, { deletes: r.deletes, later: r.laterRequests }],
+        ['the pace was taken in steps of at most 1 s', r.steps.length > 0 && r.steps.every(ms => ms <= 1000), r.steps],
+        ['the pace ended within about 1 s of Stop', r.lingered !== null && r.lingered <= 1300, r.lingered],
+        ['the other 2 posts are untouched', state.tweets.length === 2, state.tweets.length],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  })),
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 

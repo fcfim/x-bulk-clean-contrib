@@ -71,14 +71,19 @@
   // taken in steps; otherwise a long pause, such as a slowed-down pace, would end after 20 s.
   const sleep = async (ms) => { do { const step = Math.min(ms, 20000); await sleepStep(step); ms -= step; } while (ms > 0); };
 
-  // Sleeps up to `until`, in short steps so a stop request is honored quickly.
-  async function waitUntil(until, isActive) {
+  // Sleeps up to `until`, in steps of at most `step` ms so a stop request is honored quickly.
+  // False when the job was stopped meanwhile.
+  async function waitUntil(until, isActive, step = 15000) {
     while (Date.now() < until) {
       if (isActive && !isActive()) return false;
-      await sleep(Math.min(15000, Math.max(250, until - Date.now())));
+      await sleep(Math.min(step, Math.max(250, until - Date.now())));
     }
     return !isActive || isActive();
   }
+  // The pace between two actions is checked against Stop at least once a second, so a long
+  // pace (Careful speed, or slowed down after X's limits) ends soon after Stop, with no request.
+  const PAUSE_STEP_MS = 1000;
+  const pause = (ms, isActive) => waitUntil(Date.now() + Math.max(0, Number(ms) || 0), isActive, PAUSE_STEP_MS);
 
   const cookie = (name) => {
     const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
@@ -237,7 +242,8 @@
     const settings = await chrome.storage.local.get(['xbcApiCache', 'apiPace']);
     const cache = settings.xbcApiCache || {};
     const stored = { bearer: cache.bearer, ops: trustedOps(cache) };
-    // Production never runs faster than click-like pacing. Tests control their clocks instead.
+    // apiPace is the Speed setting (Normal 1, Careful 2). Production never runs faster than
+    // click-like pacing, whatever is stored. Tests control their clocks instead.
     const configuredPace = Number(settings.apiPace);
     const job = { paceFactor: Number.isFinite(configuredPace) ? Math.max(1, configuredPace) : 1, slowdown: 1, waited: 0, rateRetries: 0 };
     const bundle = await bundleOps();
@@ -634,6 +640,7 @@
     pages,
     parsePage,
     sleep,
+    pause,
     pace: (action) => jitter((PACE_MS[action] || 2500) * state.job.paceFactor * state.job.slowdown),
     // DeleteTweet fails on any error, as in X's app; the others succeed on their data check.
     deleteTweet: (id, options) => mutate('DeleteTweet', { tweet_id: String(id) }, { ...options, okWhen: json => !!json?.data && !json.errors?.length }),

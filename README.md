@@ -13,6 +13,7 @@ Postscrub is a Chrome extension that cleans up your X account in bulk: delete po
 - **Preview & Select** in Chrome's side panel: scan posts, replies, reposts or the accounts you follow, filter by text and date, select exactly what goes.
 - **Quick clean**: delete all posts, clear all likes, remove all reposts, bulk unfollow, follow back followers.
 - **API mode** (default): Postscrub sends the same requests X's own site sends when you click, so jobs are fast and keep running in a background tab. If X refuses them, the job or scan stops and tells you why: start it again to retry the API, or turn API mode off to do it by clicking through the page.
+- **Speed** for API mode, in the popup and side panel settings: Normal (the default) paces actions near the speed of clicking, and Careful waits twice as long between them. There is no faster setting. X publishes no limit for deleting, so neither speed is a promise that X will not limit or lock the account. Stop ends the pause between two actions within a second, and no pause is waited after the last item. Waits for X's rate limits and between list pages still check Stop every 15 seconds.
 - **Works in any language** X is set to.
 - **Safety first**: confirmation with the active account before every run, one job at a time, a stop button on the page, and an automatic stop when X reports a lock, a limit or suspected automation. Rate limits are waited out, not hammered.
 - **Local job history** with every affected post or account, exportable as CSV.

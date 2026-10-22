@@ -8,6 +8,11 @@ let clearHistoryTimer = null;
 let armedHistoryJob = null;
 let armedHistoryTimer = null;
 let previewSessionToEnd = null;
+// API speed: the apiPace factor worker/xapi.js reads when a job or scan starts (it never goes
+// below 1). Only Normal (1) and Careful (2) are offered; anything else stored shows as Normal.
+// The control stays disabled until it shows the stored value.
+let apiPaceLoaded = false;
+const apiPaceChoice = value => (Number(value) === 2 ? '2' : '1');
 
 const ACTION_LABELS = {
   delete: 'Deleting posts',
@@ -921,6 +926,9 @@ function runWorker(action, performanceMode, account, useApi = false) {
     const myId = ready.me.id;
     const isMe = t => t.authorId === myId || (!!me && t.author === me);
     const options = { isActive: active, onWait };
+    // The pace sits between two actions, never after the last one: a job with nothing left to
+    // do ends at once. Stop ends the pace within a second, with no further request.
+    let paced = false;
     let succeeded = 0, failures = 0, settled = false;
     try {
       // Acting on a list while paging through it can make X skip items, so after a pass that
@@ -938,6 +946,8 @@ function runWorker(action, performanceMode, account, useApi = false) {
             if (!active()) return;
             if (X.processed.has(item.key)) continue;
             if (!X.seen?.has(item.key)) { (X.seen ||= new Set()).add(item.key); X.stats[FOUND_KEY[action]]++; }
+            if (paced && !(await api.pause(api.pace(PACE_KEY[action]), active))) return;
+            paced = true;
             const result = await apiAct(api, item, options);
             if (!active() || result.kind === 'stopped') return;
             if (result.kind === 'ok') { X.processed.add(item.key); succeeded++; actedThisPass++; failures = 0; recordApiSuccess(item); }
@@ -946,7 +956,6 @@ function runWorker(action, performanceMode, account, useApi = false) {
             else if (result.kind === 'refused') return fallback(result.message);
             else if (++failures >= 5) { await stopAll(`X API errors: ${result.message || result.kind}`); return; }
             updateJobOverlay();
-            await api.sleep(api.pace(PACE_KEY[action]));
           }
         }
         if (!actedThisPass) { settled = true; break; }
@@ -1356,6 +1365,7 @@ function disableActionButtons(disabled) {
   $('openPreview').disabled = disabled;
   $('performanceMode').disabled = disabled;
   $('apiMode').disabled = disabled;
+  $('apiPace').disabled = disabled || !apiPaceLoaded;
   document.body.dataset.running = disabled ? 'true' : 'false';
   const moreActions = document.querySelector('.more-actions');
   if (moreActions) moreActions.inert = disabled;
@@ -1774,7 +1784,7 @@ async function renderRecentJobs() {
 // === Bootstrap ===
 
 document.addEventListener('DOMContentLoaded', async () => {
-  const settings = await chrome.storage.local.get(['performanceMode', 'apiMode']);
+  const settings = await chrome.storage.local.get(['performanceMode', 'apiMode', 'apiPace']);
   $('performanceMode').checked = settings.performanceMode ?? true;
   $('performanceMode').addEventListener('change', () => {
     chrome.storage.local.set({ performanceMode: $('performanceMode').checked });
@@ -1782,6 +1792,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('apiMode').checked = settings.apiMode ?? true;
   $('apiMode').addEventListener('change', () => {
     chrome.storage.local.set({ apiMode: $('apiMode').checked });
+  });
+  $('apiPace').value = apiPaceChoice(settings.apiPace);
+  apiPaceLoaded = true;
+  $('apiPace').disabled = document.body.dataset.running === 'true';
+  $('apiPace').addEventListener('change', () => {
+    chrome.storage.local.set({ apiPace: Number(apiPaceChoice($('apiPace').value)) });
   });
 
   $('startDelete').addEventListener('click', () => requestAction('delete'));
@@ -1828,6 +1844,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   await renderRecentJobs();
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.jobHistory) renderRecentJobs();
+    // The side panel may change the speed while this popup is open.
+    if (area === 'local' && changes.apiPace) $('apiPace').value = apiPaceChoice(changes.apiPace.newValue);
   });
 
   const stored = await chrome.storage.local.get(['activeAction', 'startTime', 'actionStats']);

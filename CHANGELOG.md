@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- A Speed setting for API mode, in the popup and the side panel: Normal (the default) or Careful, which waits twice as long between actions. There is no faster option, and a stored value below Normal is still paced as Normal.
+
+### Fixed
+
+- Stop during the pause between two API actions ends it within a second, with no further request, and a job no longer waits a pause after its last item.
+
 ## [0.1.0] - Unreleased
 
 First release of Postscrub.
