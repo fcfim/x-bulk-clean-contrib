@@ -13,7 +13,7 @@ Postscrub is a Chrome extension that cleans up your X account in bulk: delete po
 - **Preview & Select** in Chrome's side panel: scan posts, replies, reposts or the accounts you follow, filter by text and date, select exactly what goes. **Export selection (CSV)** saves the selected items, with the columns of the job history's CSV, before anything is deleted; it deletes nothing and keeps the selection as it is.
 - **Quick clean**: delete all posts, clear all likes, remove all reposts, bulk unfollow, follow back followers.
 - **Delete all posts by date**: in its confirmation, choose All posts, only posts before a date (posted before 00:00 that day, in your time zone) or keep the last N days (1 to 3650). Only posts older than that are deleted, and a post whose date cannot be read is skipped, never deleted. The choice is not saved: the popup always opens on All posts.
-- **API mode** (default): Postscrub sends the same requests X's own site sends when you click, so jobs are fast and keep running in a background tab. If X refuses them, the job or scan stops and tells you why: start it again to retry the API, or turn API mode off to do it by clicking through the page.
+- **API mode** (default): Postscrub sends the same requests X's own site sends when you click, so jobs are fast and keep running in a background tab. If X refuses them, the job or scan stops and tells you why: start it again to retry the API, or turn API mode off to do it by clicking through the page. Scanning replies is the exception: X gives that list only to its own page, so the scan reloads your Replies page, reads X's answers to the page's own requests and scrolls it. Keep that tab open and visible while it scans. Deleting the replies you select still works by id, in the background.
 - **Speed** for API mode, in the popup and side panel settings: Normal (the default) paces actions near the speed of clicking, and Careful waits twice as long between them. There is no faster setting. X publishes no limit for deleting, so neither speed is a promise that X will not limit or lock the account. Stop ends the pause between two actions within a second, and no pause is waited after the last item. Waits for X's rate limits and between list pages still check Stop every 15 seconds.
 - **Works in any language** X is set to.
 - **Safety first**: confirmation with the active account before every run, one job at a time, a stop button on the page, and an automatic stop when X reports a lock, a limit or suspected automation. Rate limits are waited out, not hammered.
@@ -32,8 +32,8 @@ Chrome 116 or newer is required.
 
 Postscrub runs in the x.com tab you are signed in to:
 
-- `src/inject/capture.js` records the request formats X's own page uses (operation ids, feature flags), because X changes them with every release.
-- `src/worker/xapi.js` uses them to list and act on your items through X's web API, waiting out rate limits and stopping on anything that signals risk to the account.
+- `src/inject/capture.js` records the request formats X's own page uses (operation ids, feature flags), because X changes them with every release. During a replies scan in API mode it also reads X's answers to the page's own requests for your replies and hands them to the scan ([ADR 0002](docs/adr/0002-replies-list-by-passive-read.md)).
+- `src/worker/xapi.js` uses them to list (all but replies) and act on your items through X's web API, waiting out rate limits and stopping on anything that signals risk to the account.
 - With API mode off, the click-through workers in `src/popup/popup.js` and `src/sidepanel/sidepanel.js` do the work through the page. They never take over from a refused API job on their own.
 
 See [AGENTS.md](AGENTS.md) for the architecture, the X API details and the development workflow.

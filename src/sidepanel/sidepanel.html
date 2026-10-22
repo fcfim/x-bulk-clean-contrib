@@ -50,7 +50,7 @@
       <div id="replyScope" class="reply-scope" aria-label="Reply scan mode"><label><input type="radio" name="replyScope" value="fast" checked><span><strong>Replies only</strong>Clearly identified replies</span></label><label><input type="radio" name="replyScope" value="all"><span><strong>Posts + replies</strong>Everything in one scan</span></label></div>
       <div id="replyScopeNote" class="scope-note">Standalone posts and orphan replies look identical on X. Review your selections carefully before deleting.</div>
       <div class="settings-row"><div><strong>Performance mode</strong><small>Hide media while scanning</small></div><label class="switch"><input id="previewPerformance" type="checkbox" checked><span class="track"></span></label></div>
-      <div class="settings-row"><div><strong>API mode</strong><small>Faster, and keeps running in a background tab</small></div><label class="switch"><input id="previewApi" type="checkbox" checked><span class="track"></span></label></div>
+      <div class="settings-row"><div><strong>API mode</strong><small id="previewApiNote">Faster, and keeps running in a background tab</small></div><label class="switch"><input id="previewApi" type="checkbox" checked><span class="track"></span></label></div>
       <div class="settings-row"><div><label for="previewSpeed"><strong>Speed</strong></label><small id="previewSpeedNote">X publishes no limit for deleting. In API mode, Careful waits twice as long between actions.</small></div><select id="previewSpeed" class="speed-select" aria-describedby="previewSpeedNote" disabled><option value="1">Normal</option><option value="2">Careful</option></select></div>
       <button id="startScan" class="primary" type="button">Start safe scan</button>
     </section>

@@ -46,12 +46,17 @@ export function createState({ own = 12, replies = 0, retweets = 0, likes = 0, fo
 //                               defaults (which equal the extension's built-in ones), as after a
 //                               new X build; the page uses them and any other id gets a 404
 //  state.pageRequest:           { delay } the page asks for its list that many ms after load
-//                               instead of inline, or { skip: true } it never asks; the page's
-//                               own request is then recorded with fromPage: true
+//                               instead of inline, or { skip: true } it never asks (on the
+//                               Replies page it then never asks for more either)
+//  misbehave.responses[op]:     an entry { pass: true } lets that request through unchanged, so a
+//                               later forced response can target a later page
 //  state.misbehave.emptyNotFound: an unknown query id gets a 404 with an empty body, as X answers
 //  post.created:                a date X cannot parse is sent as is, in the API's created_at and in
 //                               the page's time[datetime]
 //  post.timeless:               the page draws the post without its time element
+// Always on, as on x.com: the page's own API requests carry an x-client-transaction-id (a stand-in
+// value here; X's page makes a new one for each request) and are recorded with fromPage: true.
+// X answers UserTweetsAndReplies without that header with a 404 and an empty body.
 const currentIds = (state) => ({ ...QUERY_IDS, ...(state.queryIds || {}) });
 
 // The xbcBundleOps cache entry for the fake page's bundle: X's current operations, without the
@@ -152,7 +157,10 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
     const request = route.request();
     const url = new URL(request.url());
     const call = { method: request.method(), path: url.pathname, at: Date.now() };
-    if (request.headers()['x-fake-page-request']) call.fromPage = true;
+    const transactionId = !!request.headers()['x-client-transaction-id'];
+    if (transactionId || request.headers()['x-fake-page-request']) call.fromPage = true;
+    // Its value, so a test can check that nothing the extension keeps carries it.
+    if (transactionId) call.transaction = request.headers()['x-client-transaction-id'];
     state.calls.push(call);
     if (!authOk(request, ct0)) return json(route, 403, { errors: [{ code: 353, message: 'This request requires a matching csrf cookie and header.' }] });
 
@@ -160,6 +168,11 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
     if (graphql) {
       const [, queryId, op] = graphql;
       call.op = op;
+      // X refuses its replies list without the page's transaction id, before anything else.
+      if (op === 'UserTweetsAndReplies' && !transactionId) {
+        call.refused = true;
+        return route.fulfill({ status: 404, body: '' });
+      }
       if (currentIds(state)[op] !== queryId) {
         if (state.misbehave.emptyNotFound) return route.fulfill({ status: 404, body: '' });
         return json(route, 404, { errors: [{ message: 'Query not found' }] });
@@ -167,8 +180,9 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
       // One-shot synthetic responses, including server deadlines. Tests can enqueue these
       // after the page's discovery request, so they target the extension worker alone.
       const forcedResponse = state.misbehave.responses[op]?.shift();
-      if (forcedResponse) {
-        await forcedResponse.waitFor; // optional test-only barrier for Stop while a page is in flight
+      // Optional test-only barrier: the answer (forced, or the normal one with pass) waits for it.
+      await forcedResponse?.waitFor;
+      if (forcedResponse && !forcedResponse.pass) {
         const headers = { ...(forcedResponse.headers || {}) };
         if (forcedResponse.resetSeconds != null) headers['x-rate-limit-reset'] = String(Math.ceil(Date.now() / 1000) + forcedResponse.resetSeconds);
         return json(route, forcedResponse.status ?? 429, forcedResponse.body || { errors: [{ code: forcedResponse.code ?? 88, message: 'synthetic restriction' }] }, headers);
@@ -307,10 +321,9 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
 function pageHtml(op, dom, state) {
   const { pageRequest } = state;
   // Without state.pageRequest the page asks for its list inline, as it always did.
-  const ask = !pageRequest ? 'if (op) {'
-    : pageRequest.skip ? '// state.pageRequest.skip: this page never asks for its list.\nif (false) {'
-      : `// state.pageRequest.delay: ask for the list ${Number(pageRequest.delay) || 0} ms after load.\nif (op) window.addEventListener('load', () => setTimeout(() => {`;
-  const asked = pageRequest && !pageRequest.skip ? `}, ${Number(pageRequest.delay) || 0}));` : '}';
+  const ask = !pageRequest ? 'if (op) askList();'
+    : pageRequest.skip ? '// state.pageRequest.skip: this page never asks for its list.'
+      : `// state.pageRequest.delay: ask for the list ${Number(pageRequest.delay) || 0} ms after load.\nif (op) window.addEventListener('load', () => setTimeout(askList, ${Number(pageRequest.delay) || 0}));`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <script type="text/plain" src="${BUNDLE_URL}"></script>
 <script>
@@ -324,17 +337,96 @@ delete window.__INITIAL_STATE__;
 <div data-testid="SideNav_AccountSwitcher_Button"><span>${ME.name}</span><span>@${ME.screen}</span></div></nav>
 <main data-testid="primaryColumn"><div id="list"></div></main><div id="layers"></div>
 <script>
-// Like X's web app, ask the API for this page's list on load.
+// Like X's web app, ask the API for this page's list on load. Each request carries a new
+// x-client-transaction-id, as X's page makes one per request (a stand-in value here).
 const op = ${JSON.stringify(op)};
 const ids = ${JSON.stringify(currentIds(state))};
-${ask}
-  const variables = { userId: '${ME.id}', count: 20, includePromotedContent: true, withVoice: true };
-  const features = { rweb_video_screen_enabled: false, responsive_web_graphql_timeline_navigation_enabled: true };
-  const params = new URLSearchParams({ variables: JSON.stringify(variables), features: JSON.stringify(features) });
-  fetch('/i/api/graphql/' + ids[op] + '/' + op + '?' + params, { credentials: 'include', headers: {
+const variables = { userId: '${ME.id}', count: 20, includePromotedContent: true, withVoice: true };
+const features = { rweb_video_screen_enabled: false, responsive_web_graphql_timeline_navigation_enabled: true };
+let transactions = 0;
+function askApi(extra) {
+  const params = new URLSearchParams({ variables: JSON.stringify({ ...variables, ...extra }), features: JSON.stringify(features) });
+  return fetch('/i/api/graphql/' + ids[op] + '/' + op + '?' + params, { credentials: 'include', headers: {
     authorization: 'Bearer ${BEARER}', 'x-csrf-token': (document.cookie.match(/ct0=([^;]+)/) || [])[1] || '',
-    'x-twitter-auth-type': 'OAuth2Session', 'content-type': 'application/json'${pageRequest ? ", 'x-fake-page-request': '1'" : ''} } }).catch(() => {});
-${asked}
+    'x-twitter-auth-type': 'OAuth2Session', 'content-type': 'application/json', 'x-client-transaction-id': 'fake-transaction-' + (++transactions) } });
+}
+// state.dom.xhr ('text' or 'json'): the Replies page asks by XMLHttpRequest with that response
+// type instead of fetch, as X's page may. It resolves like fetch's response.json().
+const xhr = ${JSON.stringify(dom?.xhr || null)};
+function askRepliesXhr(extra) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({ variables: JSON.stringify({ ...variables, ...extra }), features: JSON.stringify(features) });
+    const request = new XMLHttpRequest();
+    request.open('GET', '/i/api/graphql/' + ids[op] + '/' + op + '?' + params);
+    request.setRequestHeader('authorization', 'Bearer ${BEARER}');
+    request.setRequestHeader('x-csrf-token', (document.cookie.match(/ct0=([^;]+)/) || [])[1] || '');
+    request.setRequestHeader('x-twitter-auth-type', 'OAuth2Session');
+    request.setRequestHeader('x-client-transaction-id', 'fake-transaction-' + (++transactions));
+    request.responseType = xhr === 'json' ? 'json' : '';
+    request.onload = () => {
+      // The page's own read, flagged so a test can tell it from anyone else's.
+      window.__fakeXReading = true;
+      let body = null;
+      try { body = xhr === 'json' ? request.response : JSON.parse(request.responseText); } catch (_) {}
+      window.__fakeXReading = false;
+      resolve({ ok: request.status >= 200 && request.status < 300, json: () => Promise.resolve(body) });
+    };
+    request.onerror = request.onabort = () => reject(new Error('xhr failed'));
+    request.send();
+  });
+}
+function askList() {
+  if (op === 'UserTweetsAndReplies') loadReplies();
+  else askApi({}).catch(() => {});
+}
+// The Replies page reads its own responses: it draws each post (a reply after the post it
+// answers) and, when scrolled near the bottom, asks for the next page with the response's
+// cursor, until X ends the timeline or refuses a request.
+const replies = { cursor: null, loading: false, ended: false, started: false };
+async function loadReplies() {
+  if (replies.loading || replies.ended) return;
+  replies.loading = true;
+  replies.started = true;
+  try {
+    const extra = replies.cursor ? { cursor: replies.cursor } : {};
+    const response = await (xhr ? askRepliesXhr(extra) : askApi(extra));
+    // The page's own read, flagged so a test can tell it from anyone else's.
+    window.__fakeXReading = true;
+    const reading = response.json();
+    window.__fakeXReading = false;
+    const body = await reading.catch(() => null);
+    const instructions = body?.data?.user?.result?.timeline?.timeline?.instructions;
+    if (!response.ok || !Array.isArray(instructions)) { replies.ended = true; return; }
+    let next = null;
+    for (const instruction of instructions) {
+      if (instruction.type === 'TimelineTerminateTimeline' && instruction.direction === 'Bottom') replies.ended = true;
+      for (const entry of instruction.entries || []) {
+        const content = entry.content || {};
+        if (content.cursorType === 'Bottom') next = content.value;
+        const items = content.itemContent ? [content.itemContent] : (content.items || []).map(item => item.item?.itemContent);
+        for (const item of items) if (item?.tweet_results?.result) drawPost(item.tweet_results.result);
+      }
+    }
+    if (!next || next === replies.cursor) replies.ended = true;
+    else replies.cursor = next;
+  } catch (_) {
+    replies.ended = true;
+  } finally {
+    replies.loading = false;
+  }
+}
+function drawPost(t) {
+  const screen = t.core.user_results.result.core.screen_name;
+  const when = new Date(t.legacy.created_at);
+  const cell = document.createElement('div'); cell.dataset.testid = 'cellInnerDiv';
+  cell.innerHTML = '<article data-testid="tweet"><div data-testid="User-Name"><a role="link" href="/' + screen + '">' + screen + '</a> <a href="/' + screen + '/status/' + t.rest_id + '"><time datetime="' + (isNaN(when) ? '' : when.toISOString()) + '">t</time></a></div>' +
+    (t.legacy.in_reply_to_status_id_str ? '<div>Replying to @someone</div>' : '') + '<div data-testid="tweetText">' + t.legacy.full_text + '</div></article>';
+  document.getElementById('list').appendChild(cell);
+}
+window.addEventListener('scroll', () => {
+  if (op === 'UserTweetsAndReplies' && replies.started && innerHeight + scrollY >= document.documentElement.scrollHeight - 300) loadReplies();
+});
+${ask}
 // Minimal clickable timeline for click mode: caret, red "Delete" item, confirmation.
 async function render() {
   if (op !== 'UserTweets') return;
@@ -393,6 +485,10 @@ render();
 //  loginAfter:      after that many deletions X shows its login form, without changing the address
 //  switchedAccount: on your profile pages the profile link names this other account, as if the
 //                   tab switched accounts after the extension read it elsewhere
+//  repliesMovedTo:  your Replies page moves its address to this path once loaded (as a redirect
+//                   to another profile would), keeping what it drew and asked for
+//  xhr:             'text' or 'json': the Replies page asks for its list by XMLHttpRequest with
+//                   that response type, not fetch
 // Every action is recorded with the pathname it happened on and where its button was.
 function domScript(dom) {
   return `<script>
@@ -467,6 +563,7 @@ function domScript(dom) {
   if (dom.noProfileLink) profileLink.remove();
   if (dom.switchedAccount && location.pathname.split('/')[1] === '${ME.screen}') profileLink.setAttribute('href', '/' + dom.switchedAccount);
   if (dom.lang) document.documentElement.lang = dom.lang;
+  if (dom.repliesMovedTo && location.pathname === '/${ME.screen}/with_replies') history.replaceState({}, '', dom.repliesMovedTo);
   if (dom.deleteMenu) {
     const { label, red, confirm } = dom.deleteMenu;
     const record = (event, id) => realFetch('/__fake/menu?event=' + event + '&id=' + id);

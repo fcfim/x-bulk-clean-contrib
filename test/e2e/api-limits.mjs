@@ -76,6 +76,51 @@ export async function scan(h, { useApi = true, type = 'tweets', whileRunning } =
   return result;
 }
 
+// A passive replies scan (VER-899) against a synthetic X Replies page, with the real scan worker.
+// `responses` are what X's page receives, in order: the first on load, each next one after a
+// scroll; an entry may be an array of responses that arrive together. The document's drain
+// listener plays inject/capture.js: while the tab is armed it hands over what the page received.
+export async function passiveScan(h, { replyScope = 'fast', responses = [], route = '/synthetic_me/with_replies', armed = true, capturePresent = true, hidden = false, whileRunning } = {}) {
+  const stored = new Map();
+  const sessionStorage = { getItem: key => (stored.has(key) ? stored.get(key) : null), setItem: (key, value) => { stored.set(key, String(value)); }, removeItem: key => { stored.delete(key); } };
+  if (armed) sessionStorage.setItem('xbcPassiveScan', JSON.stringify({ id: 'synthetic-arm', until: h.clock.now + 60000 }));
+  const isArmed = () => { try { const arm = JSON.parse(sessionStorage.getItem('xbcPassiveScan') || 'null'); return !!arm && arm.until > h.clock.now; } catch (_) { return false; } };
+  const page = { queue: [], served: 0, scrolls: 0, drains: 0 };
+  const deliver = () => { if (page.served < responses.length) page.queue.push(...[].concat(responses[page.served++])); };
+  const document = new EventTarget();
+  Object.assign(document, {
+    cookie: h.document.cookie, hidden, visibilityState: hidden ? 'hidden' : 'visible',
+    documentElement: { scrollHeight: 10, dataset: capturePresent ? { xbcCapture: '2' } : {} },
+    querySelector: selector => selector.includes('AppTabBar_Profile_Link') ? { getAttribute: () => '/synthetic_me' } : selector.includes('primaryColumn') ? {} : null,
+    querySelectorAll: () => []
+  });
+  document.addEventListener('xbc:passive-drain', () => {
+    page.drains++;
+    const queued = page.queue.splice(0);
+    if (!isArmed()) return;
+    for (const record of queued) document.dispatchEvent(new CustomEvent('xbc:passive-record', { detail: JSON.stringify(record) }));
+  });
+  const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() { page.scrolls++; }, dispatchEvent(event) { if (event?.type === 'scroll') deliver(); } };
+  deliver();
+  h.infos = [];
+  const globals = { window, document, sessionStorage, location: { pathname: route }, __xbcApi: h.api, Date: h.Date, setTimeout: h.schedule, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, Event, CustomEvent,
+    console: { warn() {}, info: (...args) => h.infos.push(clone(args)) }, chrome: { runtime: h.runtime, storage: h.storage } };
+  const definitions = vm.createContext({ ...globals });
+  vm.runInContext(panelSource, definitions);
+  const context = vm.createContext({ ...globals });
+  vm.runInContext('globalThis.worker = ' + definitions.startPreviewScanner.toString(), context);
+  const settle = async (done, budget = 400000) => { for (let i = 0; i < budget && !done(); i++) await Promise.resolve(); return done(); };
+  const started = h.clock.now;
+  context.worker('replies', { username: 'synthetic_me' }, false, replyScope, true);
+  if (whileRunning) await whileRunning({ P: window.__xbcPreview, window, page, document, sessionStorage, settle });
+  await settle(() => !window.__xbcPreview?.interval);
+  const P = window.__xbcPreview;
+  const result = { mode: P.mode, done: P.done, issue: P.issue, hint: P.hint, running: !!P.interval, otherRecords: P.otherRecords || 0, ids: clone(P.items.map(i => i.id).sort()), items: clone(P.items),
+    scrolls: page.scrolls, drains: page.drains, served: page.served, arm: sessionStorage.getItem('xbcPassiveScan'), elapsed: h.clock.now - started };
+  if (P.interval) window.__xbcPreviewStop();
+  return result;
+}
+
 // Execute the complete real workers; synthetic DOM nodes only support rendering overlays.
 export async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets', whileRunning, items = [{ id: 'synthetic-selected', text: 'synthetic post' }], dateFilter } = {}) {
   const node = () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, remove() {}, appendChild() {}, setAttribute() {},
@@ -453,64 +498,67 @@ export async function testApiLimits() {
   });
   // Query ids for lists (VER-624). An id that did not come from this page load or the loaded
   // bundle may be stale, so the first request of a list waits a little for the page's own one.
-  const FALLBACK_UTR = 'bnsYxFljT6y98rFwiGr3fw'; // the built-in UserTweetsAndReplies id
+  // Likes and Followers stand for any list the client requests: the replies list is never
+  // requested since VER-899 (see 'passive:' below).
+  const FALLBACK_LIKES = 'mu4us66Q6RRNOywVQhGtRg'; // the built-in Likes id
+  const FALLBACK_FOLLOWERS = 'stpzFPAIZ2qv8s2lRzPOnQ'; // the built-in Followers id
   const empty404 = { status: 404, body: undefined }; // X's answer to an unknown id: no body at all
-  const repliesPage = { body: timeline(null) };
+  const listPage = { body: timeline(null) };
   const listError = async iterator => { try { for await (const _ of iterator) { /* consume */ } } catch (error) { return error; } return null; };
   const cachedOps = store => store.xbcApiCache?.ops || {};
   await check('list ids: a fallback list id waits for the page request and uses its id', async () => {
-    let h; const late = { UserTweets: { queryId: 'synthetic-id' }, UserTweetsAndReplies: { queryId: 'page-utr' } };
-    h = await harness([repliesPage], { onSleep: () => { if (h && h.clock.now - START >= 1000) h.document.documentElement.dataset.xbcApi = JSON.stringify({ viewerId: '42', ops: late }); } });
-    assert.equal(h.api.sources().UserTweetsAndReplies, 'fallback');
-    assert.equal(await listError(h.api.pages('UserTweetsAndReplies')), null);
-    assert.equal(h.calls.length, 1); assert.equal(h.calls[0].queryId, 'page-utr'); assert.equal(h.api.sources().UserTweetsAndReplies, 'page');
+    let h; const late = { UserTweets: { queryId: 'synthetic-id' }, Likes: { queryId: 'page-likes' } };
+    h = await harness([listPage], { onSleep: () => { if (h && h.clock.now - START >= 1000) h.document.documentElement.dataset.xbcApi = JSON.stringify({ viewerId: '42', ops: late }); } });
+    assert.equal(h.api.sources().Likes, 'fallback');
+    assert.equal(await listError(h.api.pages('Likes')), null);
+    assert.equal(h.calls.length, 1); assert.equal(h.calls[0].queryId, 'page-likes'); assert.equal(h.api.sources().Likes, 'page');
     assert(h.calls[0].at - START >= 1000 && h.calls[0].at - START < 1500, `request ${h.calls[0].at - START} ms after start, as soon as the page asked`);
   });
   await check('list ids: a page or bundle list id is used at once, with no wait', async () => {
-    const page = await harness([repliesPage]);
+    const page = await harness([listPage]);
     assert.equal(await listError(page.api.pages('UserTweets')), null);
     assert.equal(page.calls[0].at, START); assert.equal(page.calls[0].queryId, 'synthetic-id');
-    const bundle = await harness([repliesPage], { bundle: { ops: { UserTweetsAndReplies: { queryId: 'bundle-utr', featureSwitches: [], fieldToggles: [] } } } });
-    assert.equal(bundle.api.sources().UserTweetsAndReplies, 'bundle');
-    assert.equal(await listError(bundle.api.pages('UserTweetsAndReplies')), null);
-    assert.equal(bundle.calls[0].at, START); assert.equal(bundle.calls[0].queryId, 'bundle-utr');
+    const bundle = await harness([listPage], { bundle: { ops: { Likes: { queryId: 'bundle-likes', featureSwitches: [], fieldToggles: [] } } } });
+    assert.equal(bundle.api.sources().Likes, 'bundle');
+    assert.equal(await listError(bundle.api.pages('Likes')), null);
+    assert.equal(bundle.calls[0].at, START); assert.equal(bundle.calls[0].queryId, 'bundle-likes');
   });
   await check('list ids: without the page request the wait ends after 8 s and keeps the id it had', async () => {
-    const h = await harness([repliesPage]);
-    assert.equal(await listError(h.api.pages('UserTweetsAndReplies')), null);
-    assert.equal(h.calls.length, 1); assert.equal(h.calls[0].queryId, FALLBACK_UTR); assert.equal(h.api.sources().UserTweetsAndReplies, 'fallback');
+    const h = await harness([listPage]);
+    assert.equal(await listError(h.api.pages('Likes')), null);
+    assert.equal(h.calls.length, 1); assert.equal(h.calls[0].queryId, FALLBACK_LIKES); assert.equal(h.api.sources().Likes, 'fallback');
     assert(h.calls[0].at - START >= 8000 && h.calls[0].at - START <= 8250, `request ${h.calls[0].at - START} ms after start`);
   });
   await check('list ids: Stop during the wait cancels without a request', async () => {
     let active = true;
     const h = await harness([], { onSleep: () => { active = false; } });
-    const error = await listError(h.api.pages('UserTweetsAndReplies', { isActive: () => active }));
+    const error = await listError(h.api.pages('Likes', { isActive: () => active }));
     assert.equal(error?.result?.reason, 'cancelled'); assert.equal(error.result.kind, 'stopped'); assert.equal(h.calls.length, 0);
     assert(h.clock.now - START < 1000, `the wait ends at the Stop, not after 8 s (${h.clock.now - START} ms)`);
   });
   await check('cache: fallback ids are never cached', async () => {
-    const h = await harness([repliesPage]);
+    const h = await harness([listPage]);
     assert.deepEqual(Object.keys(cachedOps(h.store)).sort(), ['DeleteTweet', 'UserTweets']);
     assert(Object.values(cachedOps(h.store)).every(op => op.source === 'page'), 'each entry records its source');
-    await listError(h.api.pages('UserTweetsAndReplies'));
-    assert.equal(h.calls[0].queryId, FALLBACK_UTR);
-    assert(!('UserTweetsAndReplies' in cachedOps(h.store)), 'the fallback id used after the wait is not cached');
+    await listError(h.api.pages('Likes'));
+    assert.equal(h.calls[0].queryId, FALLBACK_LIKES);
+    assert(!('Likes' in cachedOps(h.store)), 'the fallback id used after the wait is not cached');
   });
   await check('cache: entries are merged and record their source, and a page id found while waiting is saved', async () => {
     const store = { xbcApiCache: { ops: { Likes: { queryId: 'cached-likes', source: 'bundle' } } } };
-    let h; const late = { UserTweets: { queryId: 'synthetic-id' }, UserTweetsAndReplies: { queryId: 'page-utr' } };
-    h = await harness([repliesPage], { store, bundle: { ops: { Following: { queryId: 'bundle-following', featureSwitches: [] } } }, onSleep: () => { if (h) h.document.documentElement.dataset.xbcApi = JSON.stringify({ viewerId: '42', ops: late }); } });
+    let h; const late = { UserTweets: { queryId: 'synthetic-id' }, Followers: { queryId: 'page-followers' } };
+    h = await harness([listPage], { store, bundle: { ops: { Following: { queryId: 'bundle-following', featureSwitches: [] } } }, onSleep: () => { if (h) h.document.documentElement.dataset.xbcApi = JSON.stringify({ viewerId: '42', ops: late }); } });
     assert.equal(h.api.sources().Likes, 'stored');
     assert.deepEqual(cachedOps(store).Likes, { queryId: 'cached-likes', source: 'bundle' }, 'an entry not resolved from the page or bundle is kept as it was');
     assert.equal(cachedOps(store).Following?.source, 'bundle'); assert.equal(cachedOps(store).UserTweets?.source, 'page');
-    assert.equal(await listError(h.api.pages('UserTweetsAndReplies')), null);
-    assert.equal(cachedOps(store).UserTweetsAndReplies?.queryId, 'page-utr'); assert.equal(cachedOps(store).UserTweetsAndReplies?.source, 'page');
+    assert.equal(await listError(h.api.pages('Followers')), null);
+    assert.equal(cachedOps(store).Followers?.queryId, 'page-followers'); assert.equal(cachedOps(store).Followers?.source, 'page');
   });
   await check('cache: an entry saved without its source is not trusted as stored', async () => {
-    const store = { xbcApiCache: { ops: { UserTweetsAndReplies: { queryId: FALLBACK_UTR }, Likes: { queryId: 'legacy-likes' } } } };
+    const store = { xbcApiCache: { ops: { Followers: { queryId: FALLBACK_FOLLOWERS }, Likes: { queryId: 'legacy-likes' } } } };
     const h = await harness([], { store });
-    assert.equal(h.api.sources().UserTweetsAndReplies, 'fallback'); assert.equal(h.api.sources().Likes, 'fallback');
-    assert(!('UserTweetsAndReplies' in cachedOps(store)) && !('Likes' in cachedOps(store)), 'entries of unknown origin are dropped');
+    assert.equal(h.api.sources().Followers, 'fallback'); assert.equal(h.api.sources().Likes, 'fallback');
+    assert(!('Followers' in cachedOps(store)) && !('Likes' in cachedOps(store)), 'entries of unknown origin are dropped');
   });
   await check('cache: a 404 on a stored list id removes it from the cache', async () => {
     const store = { xbcApiCache: { ops: { Likes: { queryId: 'stale-likes', source: 'page' } } } };
@@ -528,21 +576,21 @@ export async function testApiLimits() {
   });
   await check('errors: a refused list request names the operation, the HTTP status and the id source', async () => {
     const h = await harness([empty404]);
-    const error = await listError(h.api.pages('UserTweetsAndReplies'));
-    assert.deepEqual({ ...error?.result }, { kind: 'refused', message: 'HTTP 404', operation: 'UserTweetsAndReplies', status: 404, source: 'fallback' });
-    const scanned = await scan(await harness([empty404]), { type: 'replies' });
-    assert.equal(scanned.issue, 'Scan interrupted after 0 items: X did not accept the request for UserTweetsAndReplies (HTTP 404, id source: fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.');
+    const error = await listError(h.api.pages('Likes'));
+    assert.deepEqual({ ...error?.result }, { kind: 'refused', message: 'HTTP 404', operation: 'Likes', status: 404, source: 'fallback' });
+    const scanned = await scan(await harness([empty404]), { type: 'unfollow' });
+    assert.equal(scanned.issue, 'Scan interrupted after 0 items: X did not accept the request for Following (HTTP 404, id source: fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.');
     assert.equal(scanned.mode, 'api'); assert.equal(scanned.domStarted, false);
   });
   await check('errors: a list request that gets no answer from X says so, instead of saying X refused it', async () => {
     const offline = () => { throw new TypeError('Failed to fetch'); };
-    const scanned = await scan(await harness(offline), { type: 'replies' });
-    assert.match(scanned.issue, /^Scan interrupted after 0 items: The request for UserTweetsAndReplies got no answer from X \(network error, id source: fallback\)/);
+    const scanned = await scan(await harness(offline), { type: 'unfollow' });
+    assert.match(scanned.issue, /^Scan interrupted after 0 items: The request for Following got no answer from X \(network error, id source: fallback\)/);
     assert.doesNotMatch(scanned.issue, /did not accept/);
     assert.equal(scanned.mode, 'api'); assert.equal(scanned.domStarted, false);
   });
   await check('logs: an API scan logs its operation sources once, without secrets', async () => {
-    const h = await harness([repliesPage]);
+    const h = await harness([listPage]);
     await scan(h);
     const logged = h.infos.filter(args => args[0] === '[Postscrub] API mode, operation sources:');
     assert.equal(logged.length, 1, 'logged once per scan');
@@ -550,6 +598,137 @@ export async function testApiLimits() {
     assert(sources && Object.entries(sources).every(([name, source]) => /^\w+$/.test(name) && ['page', 'bundle', 'stored', 'fallback'].includes(source)), 'only operation names and their sources');
     const text = JSON.stringify(h.infos);
     for (const secret of ['ct0', 'twid', 'synthetic-id', 'AAAAAAAA', '"42"', 'Bearer']) assert(!text.includes(secret), `the log holds no ${secret}`);
+  });
+  // Replies list by passive read (VER-899): in API mode the scan reads only the responses to X's
+  // own page requests, sends no list request, and says "Scan complete" only when X ended the list.
+  const post = (id, { replyTo = null, author = '42' } = {}) => ({ content: { itemContent: { tweet_results: { result: { __typename: 'Tweet', rest_id: id, legacy: { full_text: `synthetic ${id}`, user_id_str: author, ...(replyTo ? { in_reply_to_status_id_str: replyTo } : {}) } } } } } });
+  const repliesTimeline = (entries, { cursor = null, end = false, errors, extra = [] } = {}) => ({ ...(errors ? { errors } : {}), data: { user: { result: { timeline: { timeline: { instructions: [
+    { type: 'TimelineAddEntries', entries: [...entries, ...(cursor ? [{ content: { cursorType: 'Bottom', value: cursor } }] : [])] }, ...extra,
+    ...(end ? [{ type: 'TimelineTerminateTimeline', direction: 'Bottom' }] : [])] } } } } } });
+  const response = (json, cursor = null, extra = {}) => ({ status: 200, userId: '42', cursor, body: json === undefined ? '' : JSON.stringify(json), rateReset: null, rateRemaining: null, ...extra });
+  const first = response(repliesTimeline([post('901'), post('701', { author: '500' }), post('801', { replyTo: '701' })], { cursor: 'c1' }));
+  const second = response(repliesTimeline([post('802', { replyTo: '702' }), post('803', { replyTo: '703' })], { cursor: 'c2' }), 'c1');
+  const last = response(repliesTimeline([post('804', { replyTo: '704' })], { end: true }), 'c2');
+  const cooldownKeys = store => Object.keys(store).filter(key => key.startsWith('xbcApiCooldown:'));
+  await check('passive: replies come only from X\'s page responses, across pages, with no request of their own', async () => {
+    const h = await harness([]);
+    const r = await passiveScan(h, { responses: [first, second, last] });
+    assert.equal(r.issue, 'Scan complete'); assert.equal(r.done, true); assert.equal(r.mode, 'api');
+    assert.deepEqual(r.ids, ['801', '802', '803', '804']);
+    assert(r.items.every(i => i.classification === 'definite' && i.type === 'reply'), 'every item is a reply');
+    assert.equal(h.calls.length, 0, 'no request at all');
+    assert(r.scrolls >= 2, `the scan scrolled the page for each next page (${r.scrolls})`);
+    assert.equal(r.served, 3); assert.equal(r.arm, null, 'the arm is removed when the scan ends');
+    const all = await passiveScan(await harness([]), { replyScope: 'all', responses: [first, second, last] });
+    assert.deepEqual(all.ids, ['801', '802', '803', '804', '901']); assert.equal(all.items.find(i => i.id === '901').classification, 'standalone');
+  });
+  await check('passive: another account\'s responses are ignored and never end the scan', async () => {
+    const other = response(repliesTimeline([post('899', { replyTo: '799' })], { end: true }), null, { userId: '77' });
+    const r = await passiveScan(await harness([]), { responses: [[other, first], second, last] });
+    assert.equal(r.issue, 'Scan complete'); assert.deepEqual(r.ids, ['801', '802', '803', '804']); assert.equal(r.otherRecords, 1);
+  });
+  await check('passive: when X\'s page stops asking after a page that still had posts, the scan is not complete', async () => {
+    const r = await passiveScan(await harness([]), { responses: [first] });
+    assert.equal(r.done, false); assert.deepEqual(r.ids, ['801']);
+    assert.equal(r.issue, 'Scan stopped after 1 item: X\'s page stopped loading replies before the end of the list. Start a new scan, or turn off API mode to scan by clicking');
+  });
+  await check('passive: a last page without posts, then no further request at the bottom, is the end', async () => {
+    const empty = response(repliesTimeline([], { cursor: 'c2' }), 'c1');
+    const r = await passiveScan(await harness([]), { responses: [first, empty] });
+    assert.equal(r.issue, 'Scan complete'); assert.equal(r.done, true); assert.deepEqual(r.ids, ['801']);
+  });
+  await check('passive: errors[] or an unknown instruction keeps the replies but never ends as complete', async () => {
+    for (const json of [repliesTimeline([post('805', { replyTo: '705' })], { end: true, errors: [{ code: 131, message: 'synthetic partial' }] }),
+      repliesTimeline([post('805', { replyTo: '705' })], { end: true, extra: [{ type: 'TimelineShowAlert' }] })]) {
+      const r = await passiveScan(await harness([]), { responses: [response(json)] });
+      assert.equal(r.done, false); assert.deepEqual(r.ids, ['805']); assert.match(r.issue, /^Scan finished with gaps after 1 item: /);
+    }
+  });
+  await check('passive: a list read without its first page ends with gaps, not complete', async () => {
+    const r = await passiveScan(await harness([]), { responses: [second, last] });
+    assert.equal(r.done, false); assert.deepEqual(r.ids, ['802', '803', '804']);
+    assert.equal(r.issue, 'Scan finished with gaps after 3 items: the first page of your replies was not read, so some may be missing. Review the list, or start a new scan.');
+  });
+  await check('passive: a refused page response stops with its status and writes no cooldown', async () => {
+    const h = await harness([]);
+    const refused = await passiveScan(h, { responses: [response(undefined, null, { status: 404 })] });
+    assert.equal(refused.issue, 'Scan stopped after 0 items: X refused its own request for your replies (HTTP 404)'); assert.equal(refused.done, false);
+    const limited = await passiveScan(h, { responses: [first, response({ errors: [{ code: 88, message: 'Rate limit exceeded' }] }, 'c1', { status: 429, rateReset: START / 1000 + 600 })] });
+    assert.match(limited.issue, /^Scan stopped after 1 item: X's rate limit stopped X's page from loading your replies; X allows more after \d/); assert.equal(limited.done, false);
+    assert.deepEqual(cooldownKeys(h.store), []); assert.equal(h.calls.length, 0);
+  });
+  await check('passive: no answer from X\'s page within 20 s stops the scan, not complete', async () => {
+    const r = await passiveScan(await harness([]), { responses: [] });
+    assert.equal(r.done, false); assert.match(r.issue, /^Scan stopped after 0 items: X's page did not load your replies within 20 s/);
+    assert(r.elapsed >= 20000 && r.elapsed < 30000, `stopped after ${r.elapsed} ms`);
+  });
+  await check('passive: a hidden tab is neither scrolled nor taken as the end, and the scan asks to keep it visible', async () => {
+    const h = await harness([]);
+    const r = await passiveScan(h, { hidden: true, responses: [first, last], whileRunning: async ({ P, settle, window }) => {
+      await settle(() => window.__xbcPreview.items.length > 0, 100000);
+      const at = h.clock.now;
+      for (let i = 0; i < 60; i++) await settle(() => false, 2000);
+      assert.equal(!!P.interval, true, 'still running'); assert.match(P.hint || '', /Keep the X tab visible/);
+      assert(h.clock.now - at >= 60000, `a minute of hidden steps (${h.clock.now - at} ms)`);
+      window.__xbcPreviewStop();
+    } });
+    assert.equal(r.scrolls, 0); assert.equal(r.served, 1); assert.deepEqual(r.ids, ['801']); assert.equal(r.issue, 'Scan stopped by user');
+  });
+  await check('passive: Pause stops scrolling but keeps reading what the page already asked for', async () => {
+    const h = await harness([]);
+    const r = await passiveScan(h, { responses: [first, second, last], whileRunning: async ({ P, settle, page }) => {
+      await settle(() => P.items.length > 0, 100000);
+      P.paused = true;
+      const at = h.clock.now;
+      const scrolls = page.scrolls;
+      page.queue.push(second); page.served = 2;
+      await settle(() => P.items.length >= 3, 100000);
+      for (let i = 0; i < 20; i++) await settle(() => false, 2000);
+      assert.equal(page.scrolls, scrolls, 'no scroll while paused'); assert.equal(!!P.interval, true);
+      assert(h.clock.now - at >= 20000, `paused for ${h.clock.now - at} ms, past the end rules`);
+      P.paused = false;
+    } });
+    assert.equal(r.issue, 'Scan complete'); assert.deepEqual(r.ids, ['801', '802', '803', '804']);
+  });
+  await check('passive: Stop removes the arm and late responses are not added', async () => {
+    const h = await harness([]);
+    const r = await passiveScan(h, { responses: [first, second, last], whileRunning: async ({ P, settle, window, page, document, sessionStorage }) => {
+      await settle(() => P.items.length > 0, 100000);
+      window.__xbcPreviewStop();
+      assert.equal(sessionStorage.getItem('xbcPassiveScan'), null, 'disarmed at once');
+      // Even if the tab were armed again, a late response reaches no listener of this scan.
+      sessionStorage.setItem('xbcPassiveScan', JSON.stringify({ id: 'other', until: h.clock.now + 60000 }));
+      const heard = [];
+      document.addEventListener('xbc:passive-record', event => heard.push(event.detail));
+      page.queue.push(second);
+      document.dispatchEvent(new CustomEvent('xbc:passive-drain'));
+      assert.equal(heard.length, 1, 'the late response was handed over');
+      for (let i = 0; i < 20; i++) await settle(() => false, 2000);
+      sessionStorage.removeItem('xbcPassiveScan');
+    } });
+    assert.equal(r.issue, 'Scan stopped by user'); assert.deepEqual(r.ids, ['801']); assert.equal(r.done, false);
+  });
+  await check('passive: the scan stops before listing when the tab was not armed, cannot be read, or is not your Replies page', async () => {
+    const cases = [
+      [{ armed: false }, "Scan stopped: the scan was not ready when X's page loaded, so its first replies could be missing. Start a new scan."],
+      [{ capturePresent: false }, 'Scan stopped: Postscrub cannot read this X tab yet. Reload the X tab, then start a new scan.'],
+      [{ route: '/someone/with_replies' }, 'Scan stopped: this is not your Replies page (@synthetic_me), so nothing was listed']
+    ];
+    for (const [options, issue] of cases) {
+      const r = await passiveScan(await harness([]), { responses: [first, last], ...options });
+      assert.equal(r.issue, issue); assert.deepEqual(r.ids, []); assert.equal(r.drains, 0); assert.equal(r.done, false); assert.equal(r.arm, null);
+    }
+  });
+  await check('passive: responses the page lost before the scan read them stop the scan', async () => {
+    const r = await passiveScan(await harness([]), { responses: [[first, { overflow: 2 }], last] });
+    assert.equal(r.done, false); assert.match(r.issue, /^Scan stopped after 1 item: X's page loaded replies faster than Postscrub could read them \(2 missed\)/);
+  });
+  await check('passive: the API client refuses to request the replies list, before any wait or request', async () => {
+    const h = await harness([listPage], { capture: { UserTweets: { queryId: 'synthetic-id' }, UserTweetsAndReplies: { queryId: 'page-utr' } }, bundle: { ops: { UserTweetsAndReplies: { queryId: 'bundle-utr', featureSwitches: [], fieldToggles: [] } } } });
+    const at = h.clock.now;
+    const error = await listError(h.api.pages('UserTweetsAndReplies'));
+    assert.equal(error?.result?.reason, 'passive_only'); assert.equal(error.result.kind, 'refused');
+    assert.equal(h.calls.length, 0); assert.equal(h.clock.now, at, 'no wait either');
   });
   // API speed (VER-635): Careful doubles the pace between two actions, a stored factor below 1 is
   // floored to Normal, and the pace is a Stop-aware wait taken in steps of at most 1 s, never

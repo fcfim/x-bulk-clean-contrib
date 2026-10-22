@@ -111,10 +111,13 @@ function updateSetupOptions() {
   $('replyScope').classList.toggle('visible', replies);
   $('replyScopeNote').classList.toggle('visible', all);
   document.querySelectorAll('.date-filter').forEach(filter => { filter.hidden = type === 'unfollow'; });
+  // Replies in API mode are read from X's own Replies page, which the scan scrolls (VER-899).
+  const passive = replies && $('previewApi').checked;
+  const passiveNote = passive ? ' In API mode the scan reads X\'s own Replies page and scrolls it: keep the X tab open and visible.' : '';
   const copy = type === 'tweets'
     ? { title: 'Post cleanup', body: 'Review posts from your profile before you delete them.', tone: 'danger', start: 'Scan posts' }
     : type === 'replies'
-      ? { title: all ? 'Posts + replies' : 'Replies only', body: all ? 'One pass through your Replies page. Review every selected item carefully.' : 'Scan clearly identified replies from your Replies page.', tone: all ? 'danger' : 'blue', start: 'Scan replies' }
+      ? { title: all ? 'Posts + replies' : 'Replies only', body: (all ? 'One pass through your Replies page. Review every selected item carefully.' : 'Scan clearly identified replies from your Replies page.') + passiveNote, tone: all ? 'danger' : 'blue', start: 'Scan replies' }
       : type === 'reposts'
         ? { title: 'Repost cleanup', body: 'Review reposts from your timeline before removing them.', tone: 'blue', start: 'Scan reposts' }
         : { title: 'Following cleanup', body: 'Review accounts from your Following page before you unfollow them.', tone: 'danger', start: 'Scan following' };
@@ -122,22 +125,43 @@ function updateSetupOptions() {
   $('modeSummary').querySelector('strong').textContent = copy.title;
   $('modeSummary').querySelector('span').textContent = copy.body;
   $('startScan').textContent = copy.start;
+  $('previewApiNote').textContent = passive
+    ? 'Replies: reads X\'s own Replies page while scrolling it; keep the X tab visible'
+    : 'Faster, and keeps running in a background tab';
 }
 
 function typeLabel(type = selectedType()) {
   return type === 'unfollow' ? 'following accounts' : type === 'reposts' ? 'reposts' : type === 'replies' ? 'replies' : 'posts';
 }
 
-async function ensurePreviewPage(type) {
+// Arms the tab for a passive replies scan (VER-899): from now on, and across the page load that
+// follows, inject/capture.js reads the responses to X's own replies requests in this tab. Runs in
+// the tab. The arm lapses by itself unless the scan keeps it alive.
+function armPassiveScan(id, ms) {
+  try {
+    sessionStorage.setItem('xbcPassiveScan', JSON.stringify({ id, until: Date.now() + ms }));
+    return true;
+  } catch (_) { return false; }
+}
+
+// Opens the page the scan reads. `passive` (replies in API mode) arms the tab first and always
+// loads the Replies page again, even when the tab already shows it, so that X's request for the
+// first page comes after the arm and is read too.
+async function ensurePreviewPage(type, { passive = false } = {}) {
   activeTab = await findActiveXTab();
   if (!activeTab || !activeAccount?.username) return null;
   const domain = activeTab.url.includes('twitter.com') ? 'twitter.com' : 'x.com';
   const path = type === 'replies' ? '/with_replies' : type === 'unfollow' ? '/following' : '';
   const target = `https://${domain}/${activeAccount.username}${path}`;
   const current = (activeTab.url || '').replace(/[?#].*$/, '').replace(/\/$/, '');
-  if (current !== target) {
+  if (passive) {
+    const [armed] = await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, func: armPassiveScan, args: [crypto.randomUUID(), 60000] });
+    if (!armed?.result) throw new Error('Could not prepare the X tab for the scan.');
+  }
+  if (passive || current !== target) {
     const loaded = waitForTabLoad(activeTab.id);
-    await chrome.tabs.update(activeTab.id, { url: target, active: true });
+    if (current === target) await chrome.tabs.reload(activeTab.id);
+    else await chrome.tabs.update(activeTab.id, { url: target, active: true });
     await loaded;
   }
   return chrome.tabs.get(activeTab.id);
@@ -148,6 +172,7 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
   const previous = window.__xbcPreview;
   if (previous) previous.interval = null;
   if (previous?.style) previous.style.remove();
+  try { previous?.onFinish?.(); } catch (_) {}
 
   const P = window.__xbcPreview = {
     type, replyScope,
@@ -236,8 +261,13 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     P.paused = false;
     P.done = done;
     P.issue = reason || null;
+    P.hint = null;
     P.style?.remove();
     P.style = null;
+    // A passive replies scan disarms the tab's capture and stops listening (startPassiveScan).
+    const cleanup = P.onFinish;
+    P.onFinish = null;
+    try { cleanup?.(); } catch (_) {}
   };
   window.__xbcPreviewStop = () => finish('Scan stopped by user', false);
 
@@ -351,7 +381,8 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
 
   // API scan: lists the account's items through X's web API (worker/xapi.js), which also tells
   // replies apart exactly instead of guessing from the thread line. When X refuses the API, the
-  // scan stops and says why; it never switches to scrolling the page on its own.
+  // scan stops and says why; it never switches to scrolling the page on its own. Replies are the
+  // exception: they are read from X's own page (startPassiveScan below), never requested.
   const LIST_OP = { tweets: 'UserTweets', reposts: 'UserTweets', replies: 'UserTweetsAndReplies', unfollow: 'Following' };
   const tweetItem = (t, itemType, classification) => ({ id: t.id, type: itemType, classification, text: t.text, date: t.date, author: t.author, url: t.url, hasMedia: t.hasMedia, selected: true });
   const toItems = (page, myId) => {
@@ -420,6 +451,141 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     }
   };
 
+  // Passive replies scan (VER-899, ADR 0002). X accepts UserTweetsAndReplies only with an
+  // x-client-transaction-id its own page makes, so in API mode the replies list comes only from
+  // the responses to X's own page requests at /<me>/with_replies. The side panel armed the tab
+  // (sessionStorage xbcPassiveScan) before loading that page; inject/capture.js reads those
+  // responses while armed and hands them over on each xbc:passive-drain. This scan keeps the arm
+  // alive, parses each response with the API client's parser, and scrolls the page like the click
+  // scan so that X's page asks for the next one. It never sends a list request itself, and it
+  // says "Scan complete" only when X ended the list. Refusals write no cooldown: the request was
+  // the page's, not Postscrub's.
+  const PASSIVE_KEY = 'xbcPassiveScan';
+  const PASSIVE_TICK_MS = 1500;
+  const PASSIVE_FIRST_WAIT_MS = 20000;
+  const PASSIVE_BOTTOM_CYCLES = 6;
+  const startPassiveScan = async (api) => {
+    const token = P.interval = { passive: true };
+    const active = () => P.interval === token;
+    P.mode = 'api';
+    P.passive = true;
+    P.route = routeKey();
+    P.otherRecords = 0;
+    let arm = null;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(PASSIVE_KEY) || 'null');
+      if (saved && typeof saved.id === 'string' && Number(saved.until) > Date.now()) arm = saved;
+    } catch (_) {}
+    // Records are taken only while this scan asks for them, and never after it ends.
+    const received = [];
+    let draining = false;
+    const onRecord = event => { if (draining && typeof event.detail === 'string') received.push(event.detail); };
+    document.addEventListener('xbc:passive-record', onRecord);
+    P.onFinish = () => {
+      document.removeEventListener('xbc:passive-record', onRecord);
+      try { sessionStorage.removeItem(PASSIVE_KEY); } catch (_) {}
+    };
+    const n = () => `${P.items.length} ${P.items.length === 1 ? 'item' : 'items'}`;
+    const stop = reason => finish(`Scan stopped after ${n()}: ${reason}`, false);
+    if (accountIssue) return finish(accountIssue, false);
+    if (P.route !== `/${me}/with_replies`) return finish(`Scan stopped: this is not your Replies page (@${me}), so nothing was listed`, false);
+    if (document.documentElement?.dataset?.xbcCapture !== '2') return finish('Scan stopped: Postscrub cannot read this X tab yet. Reload the X tab, then start a new scan.', false);
+    if (!arm) return finish("Scan stopped: the scan was not ready when X's page loaded, so its first replies could be missing. Start a new scan.", false);
+
+    const ready = await api.init(account);
+    if (!active()) return;
+    if (!ready.ok) return stop(ready.reason || 'could not read the signed-in account');
+    const myId = String(ready.me.id);
+    console.info('[Postscrub] API mode, replies read from X\'s own page');
+
+    let sawFirst = false, terminated = false, lastHadPosts = null, gaps = false, any = false;
+    let bottomCycles = 0, visibleWait = 0, last = Date.now();
+    const time = at => at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const complete = () => {
+      if (!sawFirst) return finish(`Scan finished with gaps after ${n()}: the first page of your replies was not read, so some may be missing. Review the list, or start a new scan.`, false);
+      if (gaps) return finish(`Scan finished with gaps after ${n()}: X's page sent parts of your replies Postscrub could not read, so some may be missing. Review the list, or start a new scan.`, false);
+      finish('Scan complete', true);
+    };
+    // One response of X's page. False when it ended the scan.
+    const take = raw => {
+      let record;
+      try { record = JSON.parse(raw); } catch (_) { stop("X's page answered with something Postscrub could not read"); return false; }
+      if (record?.overflow) { stop(`X's page loaded replies faster than Postscrub could read them (${record.overflow} missed). Start a new scan`); return false; }
+      // Another account's list (the page showed someone else's replies) never counts for this one.
+      if (record?.userId == null || String(record.userId) !== myId) { P.otherRecords++; return true; }
+      any = true;
+      if (record.unreadable || typeof record.body !== 'string') { stop("Postscrub could not read X's answer for your replies"); return false; }
+      let json = null;
+      try { json = JSON.parse(record.body); } catch (_) {}
+      const codes = (Array.isArray(json?.errors) ? json.errors : []).map(e => Number(e?.code ?? e?.extensions?.code)).filter(Number.isFinite);
+      if (record.status === 429 || codes.includes(88) || codes.includes(143)) {
+        const reset = Number(record.rateReset) > 0 ? new Date(Number(record.rateReset) * 1000) : null;
+        stop(`X's rate limit stopped X's page from loading your replies${reset && !isNaN(reset) ? `; X allows more after ${time(reset)}` : ''}. Start a new scan after that`);
+        return false;
+      }
+      const code = codes.length ? `, X code ${codes.join(', ')}` : '';
+      if (record.status !== 200) { stop(`X refused its own request for your replies (${record.status ? `HTTP ${record.status}` : 'no answer'}${code})`); return false; }
+      if (!json?.data) { stop(`X's page got no replies in its answer (HTTP 200 without data${code})`); return false; }
+      const page = api.parsePage(json);
+      if (!page.recognized) { stop("X's page got a list of replies Postscrub does not recognize"); return false; }
+      if (page.partial) gaps = true;
+      if (!record.cursor) sawFirst = true;
+      if (page.terminated) terminated = true;
+      lastHadPosts = page.tweets.length > 0;
+      for (const item of toItems(page, myId)) {
+        if (!P.seen.has(item.id)) { P.seen.add(item.id); P.items.push(item); }
+      }
+      return true;
+    };
+    const tick = () => {
+      if (routeKey() !== P.route) return finish('The page changed — scan stopped', false);
+      // Keeps the tab armed while this scan runs; a scan that died lets it lapse.
+      try { sessionStorage.setItem(PASSIVE_KEY, JSON.stringify({ id: arm.id, until: Date.now() + 30000 })); } catch (_) {}
+      draining = true;
+      try { document.dispatchEvent(new CustomEvent('xbc:passive-drain')); } finally { draining = false; }
+      const batch = received.splice(0);
+      const now = Date.now(), elapsed = now - last;
+      last = now;
+      const before = P.otherRecords;
+      for (const raw of batch) if (!take(raw) || !active()) return;
+      const own = batch.length - (P.otherRecords - before);
+      if (terminated) return complete();
+      if (P.paused) return;
+      // A hidden tab is not rendered and X's page asks for nothing more there: no scrolling, and
+      // the waiting does not count towards an end.
+      if (hidden()) { P.hint = 'Keep the X tab visible: X loads more replies only while its page is shown.'; return; }
+      P.hint = null;
+      if (own) { bottomCycles = 0; return; }
+      if (!any) {
+        visibleWait += elapsed;
+        if (visibleWait >= PASSIVE_FIRST_WAIT_MS) return stop(`X's page did not load your replies within ${PASSIVE_FIRST_WAIT_MS / 1000} s. Reload the X tab and start a new scan, or turn off API mode to scan by clicking`);
+      } else if (scopeRoot() && atBottom()) {
+        if (++bottomCycles >= PASSIVE_BOTTOM_CYCLES) {
+          // X's last page holds no posts; a page that still had some means X's page stopped early.
+          if (lastHadPosts === false) return complete();
+          return stop(`X's page stopped loading replies before the end of the list. Start a new scan, or turn off API mode to scan by clicking`);
+        }
+      } else bottomCycles = 0;
+      window.scrollBy(0, Math.max(520, window.innerHeight * .78));
+      window.dispatchEvent(new Event('scroll'));
+    };
+    let failures = 0;
+    while (active()) {
+      try {
+        tick();
+        failures = 0;
+      } catch (error) {
+        console.warn('[Postscrub] scan step failed:', error);
+        if (++failures >= 3 && active()) {
+          finish(`Scan stopped after ${failures} errors in a row: ${String(error?.message || error).slice(0, 200)}`, false);
+          break;
+        }
+      }
+      if (!active()) break;
+      await sleep(PASSIVE_TICK_MS);
+    }
+  };
+
   // Kept inside this serialized worker: DOM mode may run without xapi injected.
   async function domCooldown(operations) {
     const raw = (document.cookie || '').match(/(?:^|;\s*)twid=([^;]*)/)?.[1] || '';
@@ -439,7 +605,8 @@ function startPreviewScanner(type, account, performanceMode, replyScope = 'fast'
     return until ? `X API cooldown. Job suspended; try again after ${new Date(until).toISOString()}.` : null;
   }
   const api = useApi ? globalThis.__xbcApi : null;
-  if (api) startApiScan(api).catch(error => { if (P.interval) finish(`Scan stopped: ${error?.message || error}`, false); });
+  if (api && type === 'replies') startPassiveScan(api).catch(error => { if (P.interval) finish(`Scan stopped: ${error?.message || error}`, false); });
+  else if (api) startApiScan(api).catch(error => { if (P.interval) finish(`Scan stopped: ${error?.message || error}`, false); });
   else {
     const token = P.interval = { cooldown: true };
     // Only a failed cooldown read is reported as one; an error starting the scan says what it was.
@@ -468,6 +635,8 @@ function readPreviewState(includeItems = false) {
     done: !!P.done,
     issue: P.issue,
     waitUntil: P.waitUntil || null,
+    passive: !!P.passive,
+    hint: P.interval ? P.hint || null : null,
     count: P.items.length,
     selectedCount: P.items.filter(item => item.selected).length,
     items: includeItems ? P.items : undefined
@@ -482,6 +651,8 @@ function controlPreviewScanner(command) {
   if (command === 'stop') window.__xbcPreviewStop?.();
   if (command === 'reset') {
     P.interval = null;
+    try { P.onFinish?.(); } catch (_) {}
+    P.onFinish = null;
     P.style?.remove();
     delete window.__xbcPreview;
     return null;
@@ -516,6 +687,7 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
   if (window.__xCleaner?.interval || window.__xCleaner?.finishing > 0) return { ok: false, error: 'Another cleanup is already running.' };
   if (window.__xbcPreview) window.__xbcPreview.interval = null;
   window.__xbcPreview?.style?.remove();
+  try { window.__xbcPreview?.onFinish?.(); } catch (_) {}
   const action = type === 'replies' ? 'deleteReplies' : type === 'reposts' ? 'unrepost' : type === 'unfollow' ? 'bulkUnfollow' : 'delete';
   const selected = new Map((selectedItems || []).map(item => [item.id, item]));
   const X = window.__xCleaner = {
@@ -971,9 +1143,10 @@ async function startScan() {
   renderAccount(activeAccount);
   if (!activeTab || !activeAccount) { showError('Open X and sign in before scanning.'); return; }
   const type = selectedType();
-  await ensurePreviewPage(type);
-  activeTab = await findActiveXTab();
   const useApi = $('previewApi').checked;
+  try { await ensurePreviewPage(type, { passive: useApi && type === 'replies' }); }
+  catch (error) { showError(`Could not start the scan: ${error?.message || error}`); return; }
+  activeTab = await findActiveXTab();
   if (useApi) await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['worker/xapi.js'] });
   const result = await executeInTab(startPreviewScanner, [type, activeAccount, $('previewPerformance').checked, selectedReplyScope(), useApi]);
   if (!result?.ok) { showError(result?.error || 'Could not start the scan.'); return; }
@@ -1034,7 +1207,7 @@ async function pollPreview() {
     const waiting = state.running && !state.paused && state.waitUntil > Date.now();
     $('scanState').textContent = state.done ? 'Scan complete' : state.paused ? 'Scan paused' : waiting
       ? `X rate limit · resuming at ${new Date(state.waitUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-      : state.running ? `Scanning ${typeLabel(state.type)}` : state.issue || 'Scan stopped';
+      : state.running ? `Scanning ${typeLabel(state.type)}${state.hint ? ` · ${state.hint}` : ''}` : state.issue || 'Scan stopped';
     $('pauseScan').textContent = state.done ? 'Scan complete' : state.paused ? 'Resume scan' : 'Pause & review';
     $('pauseScan').disabled = !!state.done || (!state.running && !state.paused);
     $('stopScan').textContent = state.running ? 'Stop scan' : 'New scan';
@@ -1331,7 +1504,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('loadMore').addEventListener('click',()=>{shownItems+=PAGE_SIZE;renderReview()}); $('deleteSelected').addEventListener('click',openDeleteDialog); $('exportSelection').addEventListener('click',exportSelection); $('cancelDelete').addEventListener('click',()=>$('deleteDialog').close()); $('confirmDelete').addEventListener('click',beginSelectedDelete);
   $('cancelNewScan').addEventListener('click',()=>$('newScanDialog').close()); $('confirmNewScan').addEventListener('click',resetPreview);
   $('openHistory').addEventListener('click',()=>chrome.runtime.openOptionsPage());
-  $('previewApi').addEventListener('change',()=>chrome.storage.local.set({ apiMode: $('previewApi').checked }));
+  $('previewApi').addEventListener('change',()=>{ chrome.storage.local.set({ apiMode: $('previewApi').checked }); updateSetupOptions(); });
   $('previewSpeed').addEventListener('change',()=>chrome.storage.local.set({ apiPace: Number(speedChoice($('previewSpeed').value)) }));
   // The popup may change the speed while this panel is open.
   chrome.storage.onChanged.addListener((changes, area) => { if (area === 'local' && changes.apiPace) $('previewSpeed').value = speedChoice(changes.apiPace.newValue); });
