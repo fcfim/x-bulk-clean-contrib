@@ -347,6 +347,31 @@ function askApi(extra) {
     authorization: 'Bearer ${BEARER}', 'x-csrf-token': (document.cookie.match(/ct0=([^;]+)/) || [])[1] || '',
     'x-twitter-auth-type': 'OAuth2Session', 'content-type': 'application/json', 'x-client-transaction-id': 'fake-transaction-' + (++transactions) } });
 }
+// state.dom.xhr ('text' or 'json'): the Replies page asks by XMLHttpRequest with that response
+// type instead of fetch, as X's page may. It resolves like fetch's response.json().
+const xhr = ${JSON.stringify(dom?.xhr || null)};
+function askRepliesXhr(extra) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({ variables: JSON.stringify({ ...variables, ...extra }), features: JSON.stringify(features) });
+    const request = new XMLHttpRequest();
+    request.open('GET', '/i/api/graphql/' + ids[op] + '/' + op + '?' + params);
+    request.setRequestHeader('authorization', 'Bearer ${BEARER}');
+    request.setRequestHeader('x-csrf-token', (document.cookie.match(/ct0=([^;]+)/) || [])[1] || '');
+    request.setRequestHeader('x-twitter-auth-type', 'OAuth2Session');
+    request.setRequestHeader('x-client-transaction-id', 'fake-transaction-' + (++transactions));
+    request.responseType = xhr === 'json' ? 'json' : '';
+    request.onload = () => {
+      // The page's own read, flagged so a test can tell it from anyone else's.
+      window.__fakeXReading = true;
+      let body = null;
+      try { body = xhr === 'json' ? request.response : JSON.parse(request.responseText); } catch (_) {}
+      window.__fakeXReading = false;
+      resolve({ ok: request.status >= 200 && request.status < 300, json: () => Promise.resolve(body) });
+    };
+    request.onerror = request.onabort = () => reject(new Error('xhr failed'));
+    request.send();
+  });
+}
 function askList() {
   if (op === 'UserTweetsAndReplies') loadReplies();
   else askApi({}).catch(() => {});
@@ -360,8 +385,13 @@ async function loadReplies() {
   replies.loading = true;
   replies.started = true;
   try {
-    const response = await askApi(replies.cursor ? { cursor: replies.cursor } : {});
-    const body = await response.json().catch(() => null);
+    const extra = replies.cursor ? { cursor: replies.cursor } : {};
+    const response = await (xhr ? askRepliesXhr(extra) : askApi(extra));
+    // The page's own read, flagged so a test can tell it from anyone else's.
+    window.__fakeXReading = true;
+    const reading = response.json();
+    window.__fakeXReading = false;
+    const body = await reading.catch(() => null);
     const instructions = body?.data?.user?.result?.timeline?.timeline?.instructions;
     if (!response.ok || !Array.isArray(instructions)) { replies.ended = true; return; }
     let next = null;
@@ -454,6 +484,8 @@ render();
 //                   tab switched accounts after the extension read it elsewhere
 //  repliesMovedTo:  your Replies page moves its address to this path once loaded (as a redirect
 //                   to another profile would), keeping what it drew and asked for
+//  xhr:             'text' or 'json': the Replies page asks for its list by XMLHttpRequest with
+//                   that response type, not fetch
 // Every action is recorded with the pathname it happened on and where its button was.
 function domScript(dom) {
   return `<script>

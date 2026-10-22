@@ -2035,37 +2035,86 @@ const SCENARIOS = [
       ];
     }
   },
-  {
-    name: 'replies passive: without an armed scan, the Replies page\'s responses are not read',
-    state: { own: 0, replies: 6, pageSize: 2 },
+  // Once with the page asking by fetch, and once for each XMLHttpRequest response type capture.js reads.
+  ...['fetch', 'text', 'json'].map(transport => ({
+    name: `replies passive: without an armed scan, the Replies page's responses are not read (${transport === 'fetch' ? 'fetch' : `XHR, ${transport}`})`,
+    state: { own: 0, replies: 12, pageSize: 2 },
+    setup: transport === 'fetch' ? undefined : (state) => { state.dom = { xhr: transport }; },
     async run(env, state) {
       const page = xPage(env);
+      const ARM = JSON.stringify({ id: 'test', until: Date.now() + 600000 });
+      const posts = () => page.evaluate(() => document.querySelectorAll('article[data-testid="tweet"]').length);
+      const settle = () => new Promise(resolve => setTimeout(resolve, 400));
+      // Scrolls to the bottom and waits until the page asked for its next page and drew it.
+      const nextPage = async () => {
+        const asked = pageReplies(state).length, drawn = await posts();
+        await scrollPage(env);
+        await waitFor(() => pageReplies(state).length > asked, { timeout: 10000, interval: 50, label: 'the next page request' });
+        await waitFor(async () => (await posts()) > drawn, { timeout: 10000, interval: 50, label: 'the next page drawn' });
+        await settle();
+      };
       await page.goto('https://x.com/me/with_replies');
       await page.waitForFunction(() => document.querySelectorAll('article[data-testid="tweet"]').length >= 4, null, { timeout: 15000 });
-      const unarmed = await drainCapture(env);
+      await settle();
+      // The first page came unarmed. Armed only now, with no new response, a drain must hand
+      // nothing over: this does not rely on the drain's own check of the arm (an unarmed queue
+      // would be dropped only 5 s after its first response).
+      const armedAfter = await page.evaluate(ARM => {
+        sessionStorage.setItem('xbcPassiveScan', ARM);
+        const got = [];
+        const listen = event => got.push(JSON.parse(event.detail));
+        document.addEventListener('xbc:passive-record', listen);
+        document.dispatchEvent(new CustomEvent('xbc:passive-drain'));
+        document.removeEventListener('xbc:passive-record', listen);
+        sessionStorage.removeItem('xbcPassiveScan');
+        return got;
+      }, ARM);
       const marker = await page.evaluate(() => ({ capture: document.documentElement.dataset.xbcCapture, api: document.documentElement.dataset.xbcApi || '' }));
+      // In the page's own world, count every read of a UserTweetsAndReplies response body other
+      // than the page's own (the fake page flags those): cloning or reading a fetch Response, and
+      // the XMLHttpRequest body getters. capture.js looks all of these up when it calls them.
+      await page.evaluate(() => {
+        const reads = window.__xbcTestReads = { fetch: 0, xhr: 0 };
+        const replies = url => /\/UserTweetsAndReplies\?/.test(String(url || ''));
+        for (const name of ['clone', 'text', 'json', 'arrayBuffer', 'blob', 'formData', 'bytes']) {
+          const original = Response.prototype[name];
+          if (typeof original !== 'function') continue;
+          Response.prototype[name] = function () { if (!window.__fakeXReading && replies(this.url)) reads.fetch++; return original.apply(this, arguments); };
+        }
+        const body = Object.getOwnPropertyDescriptor(Response.prototype, 'body');
+        Object.defineProperty(Response.prototype, 'body', { ...body, get() { if (!window.__fakeXReading && replies(this.url)) reads.fetch++; return body.get.call(this); } });
+        for (const name of ['responseText', 'response', 'responseXML']) {
+          const d = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, name);
+          Object.defineProperty(XMLHttpRequest.prototype, name, { ...d, get() { if (!window.__fakeXReading && replies(this.responseURL)) reads.xhr++; return d.get.call(this); } });
+        }
+      });
+      const reads = () => page.evaluate(() => ({ ...window.__xbcTestReads }));
+      const total = r => r.fetch + r.xhr;
+      // Unarmed: the page loads its next page; nobody but the page touches the response.
+      await nextPage();
+      const unarmedReads = await reads();
+      const unarmed = await drainCapture(env);
       // Control: armed by hand in the page, the next page's response is read and handed over.
-      await page.evaluate(() => sessionStorage.setItem('xbcPassiveScan', JSON.stringify({ id: 'test', until: Date.now() + 60000 })));
-      let count = pageReplies(state).length;
-      await scrollPage(env);
-      await waitFor(() => pageReplies(state).length > count, { timeout: 10000, label: 'the next page request' });
+      await page.evaluate(ARM => sessionStorage.setItem('xbcPassiveScan', ARM), ARM);
+      await nextPage();
       const armed = await waitFor(async () => { const got = await drainCapture(env); return got.length ? got : null; }, { timeout: 10000, label: 'an armed read' }).catch(() => []);
+      const armedReads = await reads();
       // Disarmed again: the following response is not read.
       await page.evaluate(() => sessionStorage.removeItem('xbcPassiveScan'));
-      count = pageReplies(state).length;
-      await scrollPage(env);
-      await waitFor(() => pageReplies(state).length > count, { timeout: 10000, label: 'another page request' });
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      await nextPage();
       const disarmed = await drainCapture(env);
+      const disarmedReads = await reads();
       return [
         ['capture.js marks the tab', marker.capture === '2', marker.capture],
-        ['unarmed: nothing read from the page\'s responses', unarmed.length === 0 && !/my reply/.test(marker.api), { unarmed: unarmed.length }],
-        ['armed: the page\'s own response is handed over, for this account, with its status and cursor', armed.length === 1 && armed[0].status === 200 && armed[0].userId === ME.id && armed[0].cursor && /my reply/.test(armed[0].body) && !('headers' in armed[0]), armed.map(a => ({ ...a, body: a.body?.length }))],
-        ['disarmed again: nothing read', disarmed.length === 0, disarmed.length],
-        ['no request of the extension', extensionReplies(state).length === 0]
+        ['the page asked by ' + (transport === 'fetch' ? 'fetch' : 'XMLHttpRequest') + ' for each of its 4 pages', pageReplies(state).length === 4 && extensionReplies(state).length === 0, repliesRequests(state)],
+        ['unarmed: no response body cloned or read by anyone but the page', total(unarmedReads) === 0 && !/my reply/.test(marker.api), unarmedReads],
+        ['unarmed, then armed with no new response: a drain hands over nothing', armedAfter.length === 0 && unarmed.length === 0, { armedAfter: armedAfter.length, unarmed: unarmed.length }],
+        ['armed: the page\'s own response is handed over, for this account, with its status and cursor', armed.length === 1 && armed[0].status === 200 && armed[0].userId === ME.id && armed[0].cursor && /my reply/.test(armed[0].body) && !('headers' in armed[0]) && !armed[0].unreadable, armed.map(a => ({ ...a, body: a.body?.length }))],
+        ['armed: the read is seen by the counters (so they would see an unarmed one)', (transport === 'fetch' ? armedReads.fetch : armedReads.xhr) > 0, armedReads],
+        ['disarmed again: nothing read or handed over', disarmed.length === 0 && total(disarmedReads) === total(armedReads), { disarmed: disarmed.length, armedReads, disarmedReads }]
       ];
     }
-  },
+  })),
   {
     name: 'replies passive: an X tab signed in to another account stops before listing',
     state: { own: 0, replies: 5, pageSize: 3 },
