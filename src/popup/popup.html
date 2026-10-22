@@ -56,7 +56,7 @@
       transition: opacity 160ms ease;
     }
 
-    button, input { font: inherit; }
+    button, input, select { font: inherit; }
     .icon {
       width: 18px;
       height: 18px;
@@ -436,6 +436,21 @@
     @media (hover: hover) and (pointer: fine) {
       .info:hover::after { opacity: 1; transform: translateY(0) scale(1); }
     }
+
+    .speed-select {
+      flex: 0 0 auto;
+      height: 30px;
+      padding: 0 6px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--bg);
+      color: var(--ink);
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    .speed-select:focus-visible { outline: 3px solid rgba(40, 120, 200, 0.16); }
+    .speed-select:disabled { opacity: 0.5; cursor: not-allowed; }
 
     .switch { position: relative; width: 40px; height: 24px; flex: 0 0 40px; cursor: pointer; }
     .switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
@@ -826,6 +841,17 @@
         <input id="apiMode" type="checkbox" />
         <span class="switch-track" aria-hidden="true"></span>
       </label>
+    </div>
+
+    <div class="preference">
+      <div class="preference-copy">
+        <label class="preference-title" for="apiPace">Speed</label>
+        <span id="apiPaceNote" class="preference-description">X publishes no limit for deleting. In API mode, Careful waits twice as long between actions.</span>
+      </div>
+      <select id="apiPace" class="speed-select" aria-describedby="apiPaceNote" disabled>
+        <option value="1">Normal</option>
+        <option value="2">Careful</option>
+      </select>
     </div>
 
     <section id="stats" aria-live="polite">

@@ -12,10 +12,21 @@ let pollGeneration = 0;
 let pollBusy = false;
 let pollPending = false;
 let selectionQueue = Promise.resolve();
+// API speed: the apiPace factor worker/xapi.js reads when a scan or job starts (it never goes
+// below 1). Only Normal (1) and Careful (2) are offered; anything else stored shows as Normal.
+// The control stays disabled until it shows the stored value.
+let speedLoaded = false;
 
 const $ = (id) => document.getElementById(id);
+const speedChoice = value => (Number(value) === 2 ? '2' : '1');
 const selectedType = () => document.querySelector('input[name="previewType"]:checked')?.value || 'tweets';
 const selectedReplyScope = () => document.querySelector('input[name="replyScope"]:checked')?.value || 'fast';
+
+// The setup and its speed control are in use only while no scan or job runs in this panel.
+function showSetup(visible) {
+  $('setupSection').style.display = visible ? 'block' : 'none';
+  $('previewSpeed').disabled = !visible || !speedLoaded;
+}
 
 async function findActiveXTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -968,7 +979,7 @@ async function startScan() {
   if (!result?.ok) { showError(result?.error || 'Could not start the scan.'); return; }
   await chrome.storage.local.set({ activePreviewSession: { tabId: activeTab.id, type, replyScope: selectedReplyScope(), account: activeAccount, startedAt: Date.now() } });
   previewItems = []; shownItems = PAGE_SIZE; previewSnapshot = null;
-  $('setupSection').style.display = 'none'; $('scanCard').style.display = 'block'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
+  showSetup(false); $('scanCard').style.display = 'block'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
   $('pauseScan').style.display = 'block'; $('pauseScan').disabled = false; $('stopScan').textContent = 'Stop scan'; $('stopScan').disabled = false;
   startPolling();
 }
@@ -1076,7 +1087,7 @@ async function leavePreview() {
   const { activePreviewSession } = await chrome.storage.local.get(['activePreviewSession']);
   if (!activePreviewSession || activePreviewSession.tabId === activeTab?.id) await chrome.storage.local.remove(['activePreviewSession']);
   previewItems = []; shownItems = PAGE_SIZE; previewSnapshot = null;
-  $('setupSection').style.display = 'block'; $('scanCard').style.display = 'none'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
+  showSetup(true); $('scanCard').style.display = 'none'; $('reviewSection').style.display = 'none'; $('stickyBar').style.display = 'none';
 }
 
 // The X tab no longer holds the scan the panel was following (it reloaded, left the page, or the
@@ -1245,6 +1256,14 @@ async function beginSelectedDelete() {
   cleanupRunning = true; $('reviewSection').style.display='none'; $('stickyBar').style.display='none'; $('scanCard').style.display='block'; $('scanCard').classList.remove('paused','done'); $('scanState').textContent=action==='bulkUnfollow'?'Unfollowing selected':action==='unrepost'?'Removing selected':'Deleting selected'; $('scanCount').textContent='0'; $('pauseScan').style.display='none'; $('stopScan').textContent=action==='bulkUnfollow'?'Stop unfollowing':action==='unrepost'?'Stop removal':'Stop deletion'; $('stopScan').disabled=false; startPolling();
 }
 
+// Read on its own, so a slow or failed account check cannot leave the control without its value.
+async function loadSpeed() {
+  const { apiPace } = await chrome.storage.local.get(['apiPace']);
+  $('previewSpeed').value = speedChoice(apiPace);
+  speedLoaded = true;
+  $('previewSpeed').disabled = $('setupSection').style.display === 'none';
+}
+
 async function initialize() {
   activeTab = await findActiveXTab();
   activeAccount = await detectAccount(activeTab);
@@ -1261,7 +1280,7 @@ async function initialize() {
   if (settings.activeAction && activeTab) {
     const cleanup = await executeInTab(readCleanupState);
     if (cleanup?.running || (!cleanup?.historyPersisted && cleanup?.issue)) {
-      cleanupRunning = true; $('setupSection').style.display='none'; $('scanCard').style.display='block'; $('scanState').textContent='Cleanup running'; startPolling(); return;
+      cleanupRunning = true; showSetup(false); $('scanCard').style.display='block'; $('scanState').textContent='Cleanup running'; startPolling(); return;
     }
     await chrome.storage.local.remove(['activeAction','activeTabId','startTime','actionStats']);
   }
@@ -1272,7 +1291,7 @@ async function initialize() {
       previewItems = state.items || []; document.querySelector(`input[name="previewType"][value="${state.type}"]`).checked=true;
       if (state.replyScope) document.querySelector(`input[name="replyScope"][value="${state.replyScope}"]`).checked=true;
       updateSetupOptions();
-      $('setupSection').style.display='none'; $('scanCard').style.display='block'; startPolling(); if(state.paused||state.done||!state.running)renderReview();
+      showSetup(false); $('scanCard').style.display='block'; startPolling(); if(state.paused||state.done||!state.running)renderReview();
     } else {
       // This tab's scan was lost while the panel was closed: end its session and say why.
       const { activePreviewSession } = await chrome.storage.local.get(['activePreviewSession']);
@@ -1292,7 +1311,11 @@ document.addEventListener('DOMContentLoaded', () => {
   $('cancelNewScan').addEventListener('click',()=>$('newScanDialog').close()); $('confirmNewScan').addEventListener('click',resetPreview);
   $('openHistory').addEventListener('click',()=>chrome.runtime.openOptionsPage());
   $('previewApi').addEventListener('change',()=>chrome.storage.local.set({ apiMode: $('previewApi').checked }));
+  $('previewSpeed').addEventListener('change',()=>chrome.storage.local.set({ apiPace: Number(speedChoice($('previewSpeed').value)) }));
+  // The popup may change the speed while this panel is open.
+  chrome.storage.onChanged.addListener((changes, area) => { if (area === 'local' && changes.apiPace) $('previewSpeed').value = speedChoice(changes.apiPace.newValue); });
   document.querySelectorAll('input[name="previewType"],input[name="replyScope"]').forEach(input => input.addEventListener('change', updateSetupOptions));
   updateSetupOptions();
+  loadSpeed();
   initialize();
 });

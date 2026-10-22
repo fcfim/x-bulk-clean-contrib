@@ -8,6 +8,11 @@ let clearHistoryTimer = null;
 let armedHistoryJob = null;
 let armedHistoryTimer = null;
 let previewSessionToEnd = null;
+// API speed: the apiPace factor worker/xapi.js reads when a job or scan starts (it never goes
+// below 1). Only Normal (1) and Careful (2) are offered; anything else stored shows as Normal.
+// The control stays disabled until it shows the stored value.
+let apiPaceLoaded = false;
+const apiPaceChoice = value => (Number(value) === 2 ? '2' : '1');
 
 const ACTION_LABELS = {
   delete: 'Deleting posts',
@@ -1360,6 +1365,7 @@ function disableActionButtons(disabled) {
   $('openPreview').disabled = disabled;
   $('performanceMode').disabled = disabled;
   $('apiMode').disabled = disabled;
+  $('apiPace').disabled = disabled || !apiPaceLoaded;
   document.body.dataset.running = disabled ? 'true' : 'false';
   const moreActions = document.querySelector('.more-actions');
   if (moreActions) moreActions.inert = disabled;
@@ -1778,7 +1784,7 @@ async function renderRecentJobs() {
 // === Bootstrap ===
 
 document.addEventListener('DOMContentLoaded', async () => {
-  const settings = await chrome.storage.local.get(['performanceMode', 'apiMode']);
+  const settings = await chrome.storage.local.get(['performanceMode', 'apiMode', 'apiPace']);
   $('performanceMode').checked = settings.performanceMode ?? true;
   $('performanceMode').addEventListener('change', () => {
     chrome.storage.local.set({ performanceMode: $('performanceMode').checked });
@@ -1786,6 +1792,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('apiMode').checked = settings.apiMode ?? true;
   $('apiMode').addEventListener('change', () => {
     chrome.storage.local.set({ apiMode: $('apiMode').checked });
+  });
+  $('apiPace').value = apiPaceChoice(settings.apiPace);
+  apiPaceLoaded = true;
+  $('apiPace').disabled = document.body.dataset.running === 'true';
+  $('apiPace').addEventListener('change', () => {
+    chrome.storage.local.set({ apiPace: Number(apiPaceChoice($('apiPace').value)) });
   });
 
   $('startDelete').addEventListener('click', () => requestAction('delete'));
@@ -1832,6 +1844,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   await renderRecentJobs();
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.jobHistory) renderRecentJobs();
+    // The side panel may change the speed while this popup is open.
+    if (area === 'local' && changes.apiPace) $('apiPace').value = apiPaceChoice(changes.apiPace.newValue);
   });
 
   const stored = await chrome.storage.local.get(['activeAction', 'startTime', 'actionStats']);

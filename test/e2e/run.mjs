@@ -376,6 +376,18 @@ async function recordSleeps(env) {
   });
 }
 const recordedSleeps = env => env.worker.evaluate(() => globalThis.__speedSleeps || []);
+// Opens the popup or the side panel and reads its speed control once it shows the stored value
+// (the control is disabled until then).
+async function openSpeed(env, path) {
+  const id = path.startsWith('popup') ? 'apiPace' : 'previewSpeed';
+  const page = await openExtensionPage(env.context, env.extensionId, path);
+  await page.waitForFunction(id => !document.getElementById(id).disabled, id, { timeout: 20000 });
+  const shown = await page.evaluate(id => {
+    const select = document.getElementById(id);
+    return { value: select.value, options: [...select.options].map(o => `${o.value} ${o.textContent}`), note: document.getElementById(select.getAttribute('aria-describedby'))?.textContent || '' };
+  }, id);
+  return { page, shown };
+}
 const latestJob = async (env, before) => {
   const history = (await storage(env.worker, ['jobHistory'])).jobHistory || [];
   return history.length > before && history[0]?.status !== 'running' ? history[0] : null;
@@ -1876,6 +1888,84 @@ const SCENARIOS = [
         ['one request, with the fallback id; the page sent none', sent.length === 1 && sent[0].id === 'fallback' && sent.length === requests.length, requests],
         ['no click scan and no deletion', r.scan?.mode === 'api' && !r.scan.done && !r.scan.running && !state.calls.some(c => /^dom-/.test(c.op || '') || c.method === 'POST') && state.tweets.length === tweets, { mode: r.scan?.mode, done: r.scan?.done, tweets: state.tweets.length }],
         ['no fallback-sourced UserTweetsAndReplies cached', !r.cached || (r.cached.source !== 'fallback' && r.cached.id !== 'fallback'), r.cached]
+      ];
+    }
+  },
+  {
+    name: 'speed: the setting persists between popup openings and the side panel shows the same value',
+    state: { own: 0 },
+    async run(env) {
+      const stored = async () => (await storage(env.worker, ['apiPace'])).apiPace;
+      await env.worker.evaluate(() => chrome.storage.local.remove(['apiPace']));
+      const fresh = await openSpeed(env, 'popup/popup.html');
+      await fresh.page.selectOption('#apiPace', '2');
+      const savedCareful = await waitFor(async () => (await stored()) === 2, { timeout: 5000, label: 'Careful saved' }).then(() => true, () => false);
+      await fresh.page.close();
+      const reopened = await openSpeed(env, 'popup/popup.html');
+      await reopened.page.close();
+      const panel = await openSpeed(env, 'sidepanel/sidepanel.html');
+      // With both open, a change in one shows in the other.
+      const popup = await openSpeed(env, 'popup/popup.html');
+      await panel.page.selectOption('#previewSpeed', '1');
+      const savedNormal = await waitFor(async () => (await stored()) === 1, { timeout: 5000, label: 'Normal saved' }).then(() => true, () => false);
+      const popupFollowed = await popup.page.waitForFunction(() => document.getElementById('apiPace').value === '1', null, { timeout: 5000 }).then(() => true, () => false);
+      await popup.page.selectOption('#apiPace', '2');
+      const panelFollowed = await panel.page.waitForFunction(() => document.getElementById('previewSpeed').value === '2', null, { timeout: 5000 }).then(() => true, () => false);
+      await panel.page.close(); await popup.page.close();
+      // Values written by hand: shown as Normal, left as they are (the worker floors them at 1).
+      const handWritten = [];
+      for (const value of [0.6, 3, 'fast']) {
+        await setSpeed(env, value);
+        const inPopup = await openSpeed(env, 'popup/popup.html'), inPanel = await openSpeed(env, 'sidepanel/sidepanel.html');
+        handWritten.push({ value, popup: inPopup.shown.value, panel: inPanel.shown.value, stored: await stored() });
+        await inPopup.page.close(); await inPanel.page.close();
+      }
+      const notes = [fresh.shown.note, panel.shown.note];
+      return [
+        ['a missing setting shows Normal', fresh.shown.value === '1', fresh.shown],
+        ['only Normal and Careful, no Fast, in both views', [fresh.shown, panel.shown].every(v => JSON.stringify(v.options) === '["1 Normal","2 Careful"]'), [fresh.shown.options, panel.shown.options]],
+        ['the note says X publishes no limit and what Careful does, with no promise of safety', notes.every(n => /X publishes no limit for deleting/.test(n) && /Careful waits twice as long/.test(n) && !/\bsafe/i.test(n)), notes],
+        ['choosing Careful in the popup saves apiPace 2', savedCareful],
+        ['a reopened popup shows Careful', reopened.shown.value === '2', reopened.shown.value],
+        ['the side panel shows the same Careful', panel.shown.value === '2', panel.shown.value],
+        ['Normal chosen in the side panel saves apiPace 1 and shows in the open popup', savedNormal && popupFollowed, { savedNormal, popupFollowed }],
+        ['a choice in the popup shows in the open side panel', panelFollowed],
+        ['hand-written values show as Normal and stay as stored', handWritten.every(h => h.popup === '1' && h.panel === '1' && h.stored === h.value), handWritten]
+      ];
+    }
+  },
+  {
+    name: 'speed: the control is disabled while a scan or a job runs, and enabled again after',
+    state: { own: 4, pageSize: 1 },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      const panel = await openSpeed(env, 'sidepanel/sidepanel.html');
+      await scanPostsByApi(panel.page);
+      await panel.page.waitForFunction(() => document.getElementById('setupSection').style.display === 'none', null, { timeout: 20000 });
+      const duringScan = { disabled: await panel.page.evaluate(() => document.getElementById('previewSpeed').disabled), running: (await readPreview(env))?.running };
+      await panel.page.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent), null, { timeout: 60000 });
+      const afterScan = await panel.page.evaluate(() => document.getElementById('previewSpeed').disabled);
+      await panel.page.evaluate(() => document.getElementById('stopScan').click());
+      await panel.page.waitForFunction(() => document.getElementById('newScanDialog').open, null, { timeout: 10000 });
+      await panel.page.evaluate(() => document.getElementById('confirmNewScan').click());
+      const backToSetup = await panel.page.waitForFunction(() => document.getElementById('setupSection').style.display !== 'none' && !document.getElementById('previewSpeed').disabled, null, { timeout: 10000 }).then(() => true, () => false);
+      await panel.page.close();
+      const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
+      const popup = await openSpeed(env, 'popup/popup.html');
+      await startQuickDelete(env, popup.page);
+      await waitFor(() => state.calls.some(c => c.op === 'DeleteTweet'), { timeout: 30000, interval: 50, label: 'first DeleteTweet' });
+      const duringJob = await popup.page.evaluate(() => ({ disabled: document.getElementById('apiPace').disabled, running: document.body.dataset.running }));
+      const job = await waitFor(() => latestJob(env, before), { timeout: 60000, label: 'delete job to finish' });
+      const afterJob = await popup.page.waitForFunction(() => !document.getElementById('apiPace').disabled, null, { timeout: 10000 }).then(() => true, () => false);
+      await popup.page.close();
+      return [
+        ['disabled while the side panel scan runs', duringScan.disabled === true && duringScan.running === true, duringScan],
+        ['still disabled while the review is on screen', afterScan === true],
+        ['enabled again once the panel is back at the setup', backToSetup],
+        ['disabled in the popup while the job runs', duringJob.disabled === true && duringJob.running === 'true', duringJob],
+        ['the job deleted the 4 posts by API', job.status === 'completed' && job.total === 4 && state.tweets.length === 0, { status: job.status, total: job.total }],
+        ['enabled again in the popup once the job is over', afterJob],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
       ];
     }
   },

@@ -242,7 +242,8 @@
     const settings = await chrome.storage.local.get(['xbcApiCache', 'apiPace']);
     const cache = settings.xbcApiCache || {};
     const stored = { bearer: cache.bearer, ops: trustedOps(cache) };
-    // Production never runs faster than click-like pacing. Tests control their clocks instead.
+    // apiPace is the Speed setting (Normal 1, Careful 2). Production never runs faster than
+    // click-like pacing, whatever is stored. Tests control their clocks instead.
     const configuredPace = Number(settings.apiPace);
     const job = { paceFactor: Number.isFinite(configuredPace) ? Math.max(1, configuredPace) : 1, slowdown: 1, waited: 0, rateRetries: 0 };
     const bundle = await bundleOps();
