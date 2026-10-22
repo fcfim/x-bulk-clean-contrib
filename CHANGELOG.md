@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Stop during the pause between two API actions ends it within a second, with no further request, and a job no longer waits a pause after its last item.
+
 ## [0.1.0] - Unreleased
 
 First release of Postscrub.

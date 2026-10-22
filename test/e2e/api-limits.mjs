@@ -77,7 +77,7 @@ export async function scan(h, { useApi = true, type = 'tweets', whileRunning } =
 }
 
 // Execute the complete real workers; synthetic DOM nodes only support rendering overlays.
-export async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets', whileRunning } = {}) {
+export async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets', whileRunning, items = [{ id: 'synthetic-selected', text: 'synthetic post' }] } = {}) {
   const node = () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, remove() {}, appendChild() {}, setAttribute() {},
     querySelector: () => node(), getElementById: () => node(), attachShadow: () => node() });
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
@@ -91,7 +91,7 @@ export async function deletion(h, selected = false, { useApi = true, action = 'd
   const serialized = selected ? definitions.runSelectedDelete : definitions.runWorker;
   vm.runInContext('globalThis.worker = ' + serialized.toString(), context);
   h.workerWindow = window;
-  if (selected) context.worker(type, [{ id: 'synthetic-selected', text: 'synthetic post' }], { username: 'synthetic_me' }, false, useApi);
+  if (selected) context.worker(type, items, { username: 'synthetic_me' }, false, useApi);
   else context.worker(action, false, { username: 'synthetic_me' }, useApi);
   for (let i = 0; i < 20000; i++) {
     await Promise.resolve();
@@ -550,6 +550,70 @@ export async function testApiLimits() {
     assert(sources && Object.entries(sources).every(([name, source]) => /^\w+$/.test(name) && ['page', 'bundle', 'stored', 'fallback'].includes(source)), 'only operation names and their sources');
     const text = JSON.stringify(h.infos);
     for (const secret of ['ct0', 'twid', 'synthetic-id', 'AAAAAAAA', '"42"', 'Bearer']) assert(!text.includes(secret), `the log holds no ${secret}`);
+  });
+  // API speed (VER-635): Careful doubles the pace between two actions, a stored factor below 1 is
+  // floored to Normal, and the pace is a Stop-aware wait taken in steps of at most 1 s, never
+  // waited after the last item. Both API job loops: Quick Clean and selected deletion.
+  const speedPosts = ids => ({ data: { timeline: { instructions: [
+    { type: 'TimelineAddEntries', entries: ids.map(id => ({ content: { itemContent: { tweet_results: { result: { __typename: 'Tweet', rest_id: id, legacy: { full_text: 'synthetic', user_id_str: '42' } } } } } })) },
+    { type: 'TimelineTerminateTimeline', direction: 'Bottom' }
+  ] } } });
+  const speedFlows = [{ name: 'Quick Clean', selected: false }, { name: 'selected deletion', selected: true }];
+  // Deletes two posts. `stopAfter`: ms after the first DeleteTweet at which Stop is pressed.
+  const pacedRun = async (flow, { apiPace, stopAfter } = {}) => {
+    let lists = 0, stoppedAt = null;
+    // The first list holds the two posts; the check pass after them finds nothing left.
+    const h = await harness((index, url) => url.pathname.endsWith('/UserTweets') ? { body: speedPosts(lists++ ? [] : ['p1', 'p2']) } : ok,
+      { store: apiPace === undefined ? {} : { apiPace } });
+    const steps = [], send = h.runtime.sendMessage;
+    h.runtime.sendMessage = (message, callback) => {
+      if (message.type === 'xbc:sleep') {
+        // The synthetic clock moves when a step's timer is set, so this step spans [now - ms, now).
+        steps.push({ ms: message.ms, end: h.clock.now });
+        const first = h.calls.find(c => c.operation === 'DeleteTweet');
+        const at = first && first.at + stopAfter;
+        if (stopAfter != null && stoppedAt == null && first && h.clock.now - message.ms <= at && at < h.clock.now) {
+          stoppedAt = at;
+          h.workerWindow.__xCleanerStop();
+        }
+      }
+      return send(message, callback);
+    };
+    const result = await deletion(h, flow.selected, { items: [{ id: 'p1', text: 'synthetic post' }, { id: 'p2', text: 'synthetic post' }] });
+    for (let i = 0; i < 2000; i++) await Promise.resolve(); // lets the job's own loop end after its record
+    const deletes = h.calls.filter(c => c.operation === 'DeleteTweet');
+    const between = deletes.length > 1 ? steps.filter(s => s.end > deletes[0].at && s.end <= deletes[1].at).map(s => s.ms) : [];
+    return { h, result, steps, between, stoppedAt, deletes, job: h.store.jobHistory?.[0] };
+  };
+  for (const flow of speedFlows) await check(`speed: Careful doubles the pace between two DeleteTweet calls in ${flow.name}, waited in steps of at most 1 s`, async () => {
+    const normal = await pacedRun(flow, { apiPace: 1 }), careful = await pacedRun(flow, { apiPace: 2 });
+    assert.equal(normal.deletes.length, 2); assert.equal(careful.deletes.length, 2);
+    assert.equal(normal.deletes[1].at - normal.deletes[0].at, 2500, 'Normal pace');
+    assert.equal(careful.deletes[1].at - careful.deletes[0].at, 5000, 'Careful pace, twice Normal');
+    assert.deepEqual(normal.between, [1000, 1000, 500]); assert.deepEqual(careful.between, [1000, 1000, 1000, 1000, 1000]);
+  });
+  for (const flow of speedFlows) await check(`speed: a stored apiPace of 0.6 still waits the Normal pace in ${flow.name}, in steps of at most 1 s`, async () => {
+    const run = await pacedRun(flow, { apiPace: 0.6 });
+    assert.equal(run.deletes.length, 2);
+    assert.equal(run.deletes[1].at - run.deletes[0].at, 2500, 'floored to the Normal pace');
+    assert.deepEqual(run.between, [1000, 1000, 500]);
+  });
+  for (const flow of speedFlows) await check(`speed: Stop during a Careful pace in ${flow.name} ends the pace within 1 s, with no further request`, async () => {
+    const run = await pacedRun(flow, { apiPace: 2, stopAfter: 1001 });
+    assert.equal(run.stoppedAt, run.deletes[0]?.at + 1001, 'Stop was pressed during the pace');
+    assert.equal(run.deletes.length, 1, 'no DeleteTweet after Stop');
+    assert.deepEqual(run.h.calls.map(c => c.operation), flow.selected ? ['DeleteTweet'] : ['UserTweets', 'DeleteTweet'], 'no request after Stop');
+    const ended = Math.max(...run.steps.map(s => s.end));
+    assert(ended - run.stoppedAt <= 1000, `the pace ended ${ended - run.stoppedAt} ms after Stop`);
+    assert.equal(run.job?.status, 'stopped'); assert.equal(run.job?.total, 1);
+  });
+  for (const flow of speedFlows) await check(`speed: ${flow.name} waits no pace after its last item and finishes at once`, async () => {
+    const run = await pacedRun(flow, { apiPace: 2 });
+    assert.equal(run.deletes.length, 2);
+    const last = run.deletes.at(-1).at;
+    assert.deepEqual(run.steps.filter(s => s.end > last).map(s => s.ms), [], 'no wait after the last DeleteTweet');
+    assert.equal(run.job?.status, 'completed'); assert.equal(run.job?.total, 2);
+    assert.equal(run.job.completedAt, last, 'finished when its last item was done');
   });
   console.log(`${passed}/${passed + failures.length} synthetic API limit checks passed (not browser e2e)`);
   assert.equal(failures.length, 0, `${failures.length} synthetic API limit checks failed`);

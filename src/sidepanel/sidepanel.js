@@ -873,10 +873,14 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
     if(!active())return;
     if(!ready.ok)return fallback(ready.reason);
     const pace=type==='unfollow'?'unfollow':type==='reposts'?'unrepost':'delete';
-    let failures=0,gone=0;
+    // The pace sits between two actions, never after the last one: with nothing left the job
+    // ends at once. Stop ends the pace within a second, with no further request.
+    let failures=0,gone=0,paced=false;
     for(const [id,snap] of selected){
       if(!active())return;
       if(X.processed.has(id))continue;
+      if(paced&&!(await api.pause(api.pace(pace),active)))return;
+      paced=true;
       const result=type==='unfollow'?await api.unfollow({id:snap.userId,username:snap.username||id},options)
         :type==='reposts'?await api.deleteRetweet(id,options):await api.deleteTweet(id,options);
       if(!active()||result.kind==='stopped')return;
@@ -885,7 +889,6 @@ function runSelectedDelete(type, selectedItems, account, performanceMode, useApi
       else if(result.kind==='stop'){await stop(result.message);return}
       else if(result.kind==='refused')return fallback(result.message);
       else if(++failures>=5){await stop(`X API errors: ${result.message||result.kind}`);return}
-      await api.sleep(api.pace(pace));
     }
     const verb=type==='unfollow'?'unfollowed':type==='reposts'?'removed':'deleted';
     if(active())await stop(`Finished — ${X.successCount} selected items ${verb}${gone?`, ${gone} already gone`:''}`);

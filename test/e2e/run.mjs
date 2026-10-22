@@ -357,6 +357,64 @@ async function scanRepliesByApi(env, state) {
     await panel.close();
   }
 }
+// API speed (VER-635). Each scenario seeds the web bundle cache, so no request reaches X's CDN.
+async function seedSpeedBundle(env, state) {
+  const seeded = seededBundle(state);
+  await env.worker.evaluate(bundle => chrome.storage.local.set({ xbcBundleOps: bundle }), seeded);
+  return seeded;
+}
+const bundleKept = async (env, seeded) => (await storage(env.worker, ['xbcBundleOps'])).xbcBundleOps?.at === seeded.at;
+const setSpeed = (env, value) => env.worker.evaluate(v => chrome.storage.local.set({ apiPace: v }), value);
+// The service worker times every sleep a job asks for. Recording the requests there (only their
+// length) shows when a pace ends, without touching the page.
+async function recordSleeps(env) {
+  await env.worker.evaluate(() => {
+    globalThis.__speedSleeps = [];
+    chrome.runtime.onMessage.addListener(message => {
+      if (message?.type === 'xbc:sleep') globalThis.__speedSleeps.push({ at: Date.now(), ms: Math.min(Math.max(Number(message.ms) || 0, 0), 20000) });
+    });
+  });
+}
+const recordedSleeps = env => env.worker.evaluate(() => globalThis.__speedSleeps || []);
+const latestJob = async (env, before) => {
+  const history = (await storage(env.worker, ['jobHistory'])).jobHistory || [];
+  return history.length > before && history[0]?.status !== 'running' ? history[0] : null;
+};
+async function startQuickDelete(env, popup) {
+  await popup.waitForFunction(() => document.getElementById('accountCard')?.dataset.state === 'ready', null, { timeout: 20000 });
+  await popup.evaluate(() => { const box = document.getElementById('apiMode'); if (!box.checked) box.click(); document.getElementById('startDelete').click(); });
+  await popup.waitForFunction(() => document.getElementById('confirmDialog')?.open, null, { timeout: 10000 });
+  await popup.evaluate(() => document.getElementById('confirmStart').click());
+}
+async function scanPostsByApi(panel) {
+  await panel.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
+  await panel.evaluate(() => {
+    document.querySelector('input[name="previewType"][value="tweets"]').click();
+    const box = document.getElementById('previewApi');
+    if (!box.checked) box.click();
+    document.getElementById('startScan').click();
+  });
+}
+// Stops a job by its own Stop button about 1.2 s into the Careful pace after its first
+// DeleteTweet, then waits past the time a full pace would have ended.
+async function stopDuringPace(env, state, before, pressStop) {
+  const first = await waitFor(() => state.calls.find(c => c.op === 'DeleteTweet'), { timeout: 60000, interval: 50, label: 'first DeleteTweet' });
+  await waitFor(() => Date.now() >= first.at + 1200, { interval: 50, label: 'into the pace' });
+  const deletesAtStop = state.calls.filter(c => c.op === 'DeleteTweet').length;
+  await pressStop();
+  const job = await waitFor(() => latestJob(env, before), { timeout: 10000, label: 'stopped job record' });
+  // A Careful pace lasts 5 to 7.5 s: a pace Stop did not end would still be running before this.
+  await waitFor(() => Date.now() >= first.at + 8500, { interval: 100, label: 'past a full Careful pace' });
+  const sleeps = (await recordedSleeps(env)).filter(s => s.at >= first.at);
+  return {
+    job, deletesAtStop,
+    deletes: state.calls.filter(c => c.op === 'DeleteTweet').length,
+    laterRequests: state.calls.filter(c => c.at > job.completedAt && !c.fromPage && c.method !== 'DOM').map(c => c.op || c.path),
+    steps: sleeps.map(s => s.ms),
+    // How long after the job stopped its last pace step ended.
+    lingered: sleeps.length ? Math.max(...sleeps.map(s => s.at + s.ms)) - job.completedAt : null
+  };
+}
 const repliesRequests = state => state.calls.filter(c => c.op === 'UserTweetsAndReplies').map(c => ({ at: c.at, fromPage: !!c.fromPage, id: idLabel(c.path.split('/').at(-2)) }));
 
 const SCENARIOS = [
@@ -1821,6 +1879,65 @@ const SCENARIOS = [
       ];
     }
   },
+  {
+    name: 'speed: selected deletion by API finishes right after its last item, with no extra pace',
+    state: { own: 3 },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      await setSpeed(env, 2); // Careful: a pace after the last item would add 5 s or more
+      await recordSleeps(env);
+      const r = await previewAndAct(env, 'tweets');
+      const deletes = state.calls.filter(c => c.op === 'DeleteTweet');
+      const last = deletes.at(-1)?.at;
+      const gaps = deletes.slice(1).map((c, i) => c.at - deletes[i].at);
+      const after = (await recordedSleeps(env)).filter(s => s.at >= last).map(s => s.ms);
+      return [
+        ['the 3 posts deleted by API', r.worker?.mode === 'api' && deletes.length === 3 && state.tweets.length === 0 && r.job.status === 'completed', { mode: r.worker?.mode, deletes: deletes.length, status: r.job.status }],
+        ['a Careful pace of 5 s or more between deletions', gaps.length === 2 && gaps.every(g => g >= 5000), gaps],
+        ['finished within 2 s of its last DeleteTweet', r.job.completedAt - last < 2000, r.job.completedAt - last],
+        ['no sleep asked after its last DeleteTweet', after.length === 0, after],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  },
+  ...[
+    { flow: 'Quick Clean', popup: true },
+    { flow: 'selected deletion', popup: false }
+  ].map(({ flow, popup: fromPopup }) => ({
+    name: `speed: Stop during a Careful pace stops ${flow} promptly, with no further DeleteTweet`,
+    state: { own: 3 },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      await setSpeed(env, 2);
+      const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
+      let page, r;
+      if (fromPopup) {
+        page = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
+        await recordSleeps(env);
+        await startQuickDelete(env, page);
+        r = await stopDuringPace(env, state, before, () => page.evaluate(() => document.getElementById('stopAction').click()));
+      } else {
+        page = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+        await scanPostsByApi(page);
+        await page.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent) && !document.getElementById('deleteSelected').disabled, null, { timeout: 60000 });
+        await recordSleeps(env);
+        await page.evaluate(() => document.getElementById('deleteSelected').click());
+        await page.waitForFunction(() => document.getElementById('deleteDialog')?.open, null, { timeout: 10000 });
+        await page.evaluate(() => document.getElementById('confirmDelete').click());
+        r = await stopDuringPace(env, state, before, () => page.evaluate(() => document.getElementById('stopScan').click()));
+      }
+      await page.close();
+      return [
+        ['Stop pressed during the pace after the first DeleteTweet', r.deletesAtStop === 1, r.deletesAtStop],
+        ['the job record says stopped, with the 1 deletion', r.job.status === 'stopped' && r.job.total === 1, { status: r.job.status, total: r.job.total }],
+        ['no DeleteTweet and no other request after Stop', r.deletes === 1 && r.laterRequests.length === 0, { deletes: r.deletes, later: r.laterRequests }],
+        ['the pace was taken in steps of at most 1 s', r.steps.length > 0 && r.steps.every(ms => ms <= 1000), r.steps],
+        ['the pace ended within about 1 s of Stop', r.lingered !== null && r.lingered <= 1300, r.lingered],
+        ['the other 2 posts are untouched', state.tweets.length === 2, state.tweets.length],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  })),
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 
