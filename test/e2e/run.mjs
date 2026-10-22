@@ -2155,6 +2155,47 @@ const SCENARIOS = [
     }
   })),
   {
+    // capture.js keeps at most 40 responses between two drains; past that it only counts them, and
+    // the next drain says how many it dropped, so the scan stops instead of missing pages unseen.
+    name: 'replies passive: armed with no scan draining, more page responses than the queue holds are handed over as 40 records and an overflow count',
+    state: { own: 0, replies: 3, pageSize: 3 },
+    async run(env, state) {
+      const page = xPage(env);
+      const ARM = JSON.stringify({ id: 'test', until: Date.now() + 600000 });
+      const settle = () => new Promise(resolve => setTimeout(resolve, 500));
+      // The Replies page asks `count` more times, with its own request (and transaction id), and
+      // reads each answer as it always does.
+      const ask = count => page.evaluate(async count => {
+        for (let i = 0; i < count; i++) await (await askApi({})).text();
+      }, count);
+      await page.goto('https://x.com/me/with_replies');
+      await page.waitForFunction(() => document.querySelectorAll('article[data-testid="tweet"]').length >= 3, null, { timeout: 15000 });
+      await settle();
+      const before = pageReplies(state).length;
+      await page.evaluate(ARM => sessionStorage.setItem('xbcPassiveScan', ARM), ARM);
+      await ask(45);
+      await settle();
+      const asked = pageReplies(state).length - before;
+      const first = await drainCapture(env);
+      const records = first.filter(r => !('overflow' in r));
+      const overflow = first.filter(r => 'overflow' in r);
+      const again = await drainCapture(env);
+      // After the drain the queue and the count start over.
+      await ask(2);
+      await settle();
+      const later = await drainCapture(env);
+      await page.evaluate(() => sessionStorage.removeItem('xbcPassiveScan'));
+      return [
+        ['the page asked 45 times while armed, each with its transaction id', asked === 45 && pageReplies(state).slice(before).every(c => !c.refused), { asked }],
+        ['the drain hands over 40 records, the first 40 answers, for this account', records.length === 40 && records.every((r, i) => r.status === 200 && r.userId === ME.id && /my reply/.test(r.body || '') && (i === 0 || r.seq === records[i - 1].seq + 1)), records.map(r => ({ seq: r.seq, status: r.status }))],
+        ['then one overflow record with the 5 it dropped, last', overflow.length === 1 && JSON.stringify(overflow[0]) === '{"overflow":5}' && first.at(-1) === overflow[0], overflow],
+        ['a second drain hands over nothing', again.length === 0, again.length],
+        ['after the drain, the queue starts over: 2 answers, no overflow', later.length === 2 && later.every(r => r.status === 200 && !('overflow' in r)), later.map(r => Object.keys(r))],
+        ['no request of the extension', extensionReplies(state).length === 0, extensionReplies(state)]
+      ];
+    }
+  },
+  {
     name: 'replies passive: an X tab signed in to another account stops before listing',
     state: { own: 0, replies: 5, pageSize: 3 },
     setup: (state) => { state.dom = { switchedAccount: 'other' }; },
