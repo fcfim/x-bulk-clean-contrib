@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Preview & Select reads your replies, in API mode, from X's own Replies page instead of asking X for them: the scan loads that page again, reads X's answers to the page's own requests and scrolls it so X loads the rest. Keep the X tab open and visible while it scans; in a hidden tab it waits and says so. It says "Scan complete" only when X ended the list. Otherwise it stops with the reason (X refused or rate limited the page's request, the page stopped loading, or parts could not be read), and what it found can still be reviewed. Deleting the selected replies is unchanged.
+
 ### Added
 
 - A Speed setting for API mode, in the popup and the side panel: Normal (the default) or Careful, which waits twice as long between actions. There is no faster option, and a stored value below Normal is still paced as Normal.
@@ -10,6 +14,7 @@
 
 ### Fixed
 
+- Scanning replies in API mode no longer stops at once with "HTTP 404". X now refuses that list unless its own page asks for it, with a header only its page makes; Postscrub does not make or copy that header.
 - Stop during the pause between two API actions ends it within a second, with no further request, and a job no longer waits a pause after its last item.
 - A Quick Clean run by API that found items but completed none of them (each attempt failed, or the item was already gone) now stops as interrupted with "N found, none deleted" instead of "No matching items returned by API".
 
