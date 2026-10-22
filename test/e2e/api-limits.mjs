@@ -77,7 +77,7 @@ export async function scan(h, { useApi = true, type = 'tweets', whileRunning } =
 }
 
 // Execute the complete real workers; synthetic DOM nodes only support rendering overlays.
-export async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets', whileRunning, items = [{ id: 'synthetic-selected', text: 'synthetic post' }] } = {}) {
+export async function deletion(h, selected = false, { useApi = true, action = 'delete', type = 'tweets', whileRunning, items = [{ id: 'synthetic-selected', text: 'synthetic post' }], dateFilter } = {}) {
   const node = () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, remove() {}, appendChild() {}, setAttribute() {},
     querySelector: () => node(), getElementById: () => node(), attachShadow: () => node() });
   const window = { innerHeight: 800, scrollY: 0, scrollTo() {}, scrollBy() {}, dispatchEvent() {} };
@@ -92,7 +92,7 @@ export async function deletion(h, selected = false, { useApi = true, action = 'd
   vm.runInContext('globalThis.worker = ' + serialized.toString(), context);
   h.workerWindow = window;
   if (selected) context.worker(type, items, { username: 'synthetic_me' }, false, useApi);
-  else context.worker(action, false, { username: 'synthetic_me' }, useApi);
+  else context.worker(action, false, { username: 'synthetic_me' }, useApi, dateFilter);
   for (let i = 0; i < 20000; i++) {
     await Promise.resolve();
     if (window.__xCleaner?.historyPersisted || window.__xCleaner?.apiFallback || (!useApi && window.__xCleaner?.interval?.loop)) break;
@@ -100,7 +100,7 @@ export async function deletion(h, selected = false, { useApi = true, action = 'd
   const x = window.__xCleaner;
   assert(x.historyPersisted || x.apiFallback || (!useApi && x.interval?.loop), 'worker settled or entered DOM');
   if (whileRunning) await whileRunning(x);
-  const result = { domStarted: !!x.interval?.loop, mode: x.mode, apiFallback: x.apiFallback || null, issue: x.issue, historyPersisted: x.historyPersisted, successCount: x.successCount };
+  const result = { domStarted: !!x.interval?.loop, mode: x.mode, apiFallback: x.apiFallback || null, issue: x.issue, historyPersisted: x.historyPersisted, successCount: x.successCount, stats: clone(x.stats) };
   if (x.interval) await window.__xCleanerStop();
   return result;
 }
@@ -614,6 +614,57 @@ export async function testApiLimits() {
     assert.deepEqual(run.steps.filter(s => s.end > last).map(s => s.ms), [], 'no wait after the last DeleteTweet');
     assert.equal(run.job?.status, 'completed'); assert.equal(run.job?.total, 2);
     assert.equal(run.job.completedAt, last, 'finished when its last item was done');
+  });
+  // "Delete all posts" by date (VER-636), in Quick Clean by API: only posts strictly older than the
+  // cutoff are deleted, a post without a readable date is skipped, and a cutoff the worker cannot
+  // read stops the job before any request.
+  const CUTOFF = { mode: 'before', date: '2024-01-01', before: '2024-01-01T00:00:00.000Z', label: 'posts before 1 Jan 2024' };
+  const datedPosts = posts => ({ data: { timeline: { instructions: [
+    { type: 'TimelineAddEntries', entries: posts.map(([id, created]) => ({ content: { itemContent: { tweet_results: { result: { __typename: 'Tweet', rest_id: id, legacy: { full_text: 'synthetic', user_id_str: '42', ...(created ? { created_at: created } : {}) } } } } } })) },
+    { type: 'TimelineTerminateTimeline', direction: 'Bottom' }
+  ] } } });
+  // Lists the posts that are left; each DeleteTweet removes its post.
+  const datedRun = async (posts, dateFilter, action = 'delete') => {
+    const left = new Map(posts.map(post => [post[0], post])), deleted = [];
+    const h = await harness((index, url, options) => {
+      if (url.pathname.endsWith('/UserTweets')) return { body: datedPosts([...left.values()]) };
+      const id = JSON.parse(options.body).variables.tweet_id;
+      deleted.push(id); left.delete(id);
+      return ok;
+    });
+    const result = await deletion(h, false, { action, dateFilter });
+    for (let i = 0; i < 2000; i++) await Promise.resolve();
+    return { h, result, deleted, job: h.store.jobHistory?.[0], record: h.store[`job_${h.store.jobHistory?.[0]?.id}`] };
+  };
+  await check('date filter: Quick Clean by API deletes only the posts before the cutoff and skips those without a readable date', async () => {
+    const run = await datedRun([
+      ['old1', 'Fri Mar 01 12:00:00 +0000 2019'], ['new1', 'Sat Feb 01 12:00:00 +0000 2025'], ['undated', null],
+      ['old2', 'Sun Dec 31 23:59:59 +0000 2023'], ['edge', 'Mon Jan 01 00:00:00 +0000 2024'], ['garbled', 'not a date']
+    ], CUTOFF);
+    assert.deepEqual(run.deleted, ['old1', 'old2'], 'only the posts strictly older than the cutoff');
+    assert.equal(run.result.stats.found, 2, 'posts outside the range are not counted as found');
+    assert.equal(run.result.stats.deleted, 2);
+    assert.equal(run.job.status, 'completed'); assert.equal(run.job.total, 2);
+    assert.deepEqual({ ...run.job.dateFilter }, { ...CUTOFF, kept: 2, unreadable: 2 }, 'the filter and what it left are on the job');
+    assert.match(run.job.statusText, /2 newer posts kept, 2 without a readable date skipped/);
+    assert.deepEqual(run.record.backup.tweets.map(t => t.id), ['old1', 'old2']);
+  });
+  await check('date filter: Quick Clean by API with no post before the cutoff deletes nothing and says so', async () => {
+    const run = await datedRun([['new1', 'Sat Feb 01 12:00:00 +0000 2025'], ['undated', null]], CUTOFF);
+    assert.deepEqual(run.deleted, []);
+    assert.deepEqual(run.h.calls.map(c => c.operation), ['UserTweets'], 'listed once, nothing else');
+    assert.equal(run.result.stats.found, 0); assert.equal(run.job.total, 0);
+    assert.match(run.job.statusText, /^Finished — no posts in the date range, nothing deleted; 1 newer post kept, 1 without a readable date skipped$/);
+  });
+  for (const [label, dateFilter, action] of [
+    ['an unreadable cutoff', { ...CUTOFF, before: 'not a date' }, 'delete'],
+    ['a cutoff that is not an ISO time', { ...CUTOFF, before: '1' }, 'delete'],
+    ['a filter given to another action', CUTOFF, 'unlike']
+  ]) await check(`date filter: ${label} stops Quick Clean before any request`, async () => {
+    const run = await datedRun([['old1', 'Fri Mar 01 12:00:00 +0000 2019']], dateFilter, action);
+    assert.equal(run.h.calls.length, 0, 'no list and no deletion');
+    assert.match(run.result.issue, /date range could not be read/);
+    assert.equal(run.job.status, 'interrupted'); assert.equal(run.job.total, 0);
   });
   console.log(`${passed}/${passed + failures.length} synthetic API limit checks passed (not browser e2e)`);
   assert.equal(failures.length, 0, `${failures.length} synthetic API limit checks failed`);
