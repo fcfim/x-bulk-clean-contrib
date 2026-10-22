@@ -77,6 +77,71 @@ const ACTION_CONFIRMATIONS = {
 const X_URL = /^https:\/\/(twitter\.com|x\.com)\//;
 const $ = (id) => document.getElementById(id);
 
+// === Date choice of "Delete all posts" ===
+// All posts, only posts before a date (its 00:00 local time), or keep the last N days (now minus
+// N days). Never saved: every popup opens on All posts. An incomplete or out-of-range choice
+// blocks the start; it never falls back to All posts.
+const DAY_MS = 86400000;
+const MAX_KEEP_DAYS = 3650;
+const DATE_LABEL = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+const dateScopeMode = () => document.querySelector('input[name="dateScope"]:checked')?.value || 'all';
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+function readDateScope(now = Date.now()) {
+  const mode = dateScopeMode();
+  if (mode === 'all') return { ok: true, filter: null };
+  if (mode === 'before') {
+    const value = $('dateScopeDate').value;
+    const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    const day = parts && new Date(+parts[1], +parts[2] - 1, +parts[3]);
+    if (!day || day.getFullYear() !== +parts[1] || day.getMonth() !== +parts[2] - 1 || day.getDate() !== +parts[3]) {
+      return { ok: false, error: 'Choose a date first. Nothing was started.' };
+    }
+    return { ok: true, filter: { mode: 'before', date: value, before: day.toISOString(), label: `posts before ${DATE_LABEL.format(day)}` } };
+  }
+  if (mode === 'days') {
+    const value = $('dateScopeDays').value.trim();
+    const days = /^\d{1,4}$/.test(value) ? Number(value) : NaN;
+    if (!(days >= 1 && days <= MAX_KEEP_DAYS)) {
+      return { ok: false, error: `Enter a number of days from 1 to ${MAX_KEEP_DAYS}. Nothing was started.` };
+    }
+    return { ok: true, filter: { mode: 'days', days, before: new Date(now - days * DAY_MS).toISOString(), label: `posts older than ${plural(days, 'day')}` } };
+  }
+  return { ok: false, error: 'Choose which posts to delete. Nothing was started.' };
+}
+
+// The confirmation names the range in plain words; with All posts it is unchanged.
+function dateScopeDescription(config) {
+  const mode = dateScopeMode();
+  if (mode === 'all') return config.description;
+  const scope = readDateScope();
+  if (!scope.ok) {
+    return mode === 'before'
+      ? 'Choose a date: only posts before it will be deleted.'
+      : `Enter how many days of posts to keep, from 1 to ${MAX_KEEP_DAYS}: only older posts will be deleted.`;
+  }
+  const { filter } = scope;
+  const kept = filter.mode === 'before' ? 'Newer posts stay on your profile.' : `Posts from the last ${plural(filter.days, 'day')} stay on your profile.`;
+  return `Only ${filter.label} will be deleted. ${kept} A record of each deleted post is saved locally.`;
+}
+
+function renderConfirmText() {
+  const config = ACTION_CONFIRMATIONS[pendingAction];
+  if (!config) return;
+  const dated = pendingAction === 'delete' && dateScopeMode() !== 'all';
+  const description = pendingAction === 'delete' ? dateScopeDescription(config) : config.description;
+  $('confirmTitle').textContent = dated ? 'Delete your older posts?' : config.title;
+  $('confirmDescription').textContent = previewSessionToEnd
+    ? `${description} Your current Preview & Select scan will end when this action starts.`
+    : description;
+  $('confirmStart').textContent = dated ? 'Delete older posts' : config.button;
+}
+
+function showDateScopeError(message) {
+  $('dateScopeError').textContent = message || '';
+  $('dateScopeError').hidden = !message;
+}
+
 // === Tab helpers ===
 
 async function findXTab() {
@@ -255,7 +320,7 @@ async function ensureProfilePage(action) {
 
 // === Worker (runs in the tab via chrome.scripting.executeScript) ===
 
-function runWorker(action, performanceMode, account, useApi = false) {
+function runWorker(action, performanceMode, account, useApi = false, dateFilter = null) {
 
   const prior = window.__xCleaner;
   if (prior?.interval || prior?.finishing > 0) return;
@@ -415,7 +480,9 @@ function runWorker(action, performanceMode, account, useApi = false) {
         <button id="jobStop" type="button">Stop current action</button>
       </section>`;
 
-    shadow.getElementById('jobTitle').textContent = labels[action] || 'Running cleanup';
+    shadow.getElementById('jobTitle').textContent = action === 'delete' && dateFilter
+      ? `Deleting ${typeof dateFilter.label === 'string' && dateFilter.label ? dateFilter.label.slice(0, 60) : 'posts by date'}`
+      : labels[action] || 'Running cleanup';
     shadow.getElementById('jobName').textContent = account?.displayName || account?.username || 'Active account';
     shadow.getElementById('jobHandle').textContent = account?.username ? `@${account.username}` : '';
     shadow.getElementById('jobFallback').textContent = (account?.displayName || account?.username || 'X').trim().slice(0, 2);
@@ -553,6 +620,38 @@ function runWorker(action, performanceMode, account, useApi = false) {
     };
   }
 
+  // Delete all posts by date (dateFilter, from the popup): only posts strictly older than
+  // dateFilter.before are deleted. A date is read only in the ISO form X's page and API give, so a
+  // post whose date cannot be read is skipped, never deleted. Posts outside the range are not
+  // counted as found. A filter that cannot be read, or one given to another action, stops the job
+  // before anything is done: it never widens to every post.
+  const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+  const readTime = value => (typeof value === 'string' && ISO_TIME.test(value) ? Date.parse(value) : NaN);
+  const cutoff = dateFilter ? readTime(dateFilter.before) : NaN;
+  const filterIssue = dateFilter && (action !== 'delete' || typeof dateFilter !== 'object' || !Number.isFinite(cutoff))
+    ? 'The date range could not be read — job stopped before deleting anything'
+    : null;
+  const dateKept = new Set(), dateUnreadable = new Set();
+  function inDateRange(id, date) {
+    if (!dateFilter) return true;
+    const time = readTime(date);
+    if (!Number.isFinite(time)) { dateUnreadable.add(id); return false; }
+    dateUnreadable.delete(id);
+    if (time < cutoff) return true;
+    dateKept.add(id);
+    return false;
+  }
+  // The date of the post itself: the time inside the link to its own status, not a quoted post's.
+  function postDate(article, id) {
+    for (const time of article.querySelectorAll('a[href*="/status/"] time[datetime]')) {
+      if (time.closest('a')?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1] === id) return time.getAttribute('datetime') || '';
+    }
+    return '';
+  }
+  const dateNote = () => (dateFilter
+    ? `; ${dateKept.size} newer ${dateKept.size === 1 ? 'post' : 'posts'} kept${dateUnreadable.size ? `, ${dateUnreadable.size} without a readable date skipped` : ''}`
+    : '');
+
   function userSnap(cell) {
     const link = cell.querySelector('a[role="link"][href^="/"]');
     const username = link?.getAttribute('href')?.replace(/^\//, '').split('/')[0] || '';
@@ -621,7 +720,8 @@ function runWorker(action, performanceMode, account, useApi = false) {
       status,
       statusText,
       total,
-      counts
+      counts,
+      ...(dateFilter && !filterIssue ? { dateFilter: { ...dateFilter, kept: dateKept.size, unreadable: dateUnreadable.size } } : {})
     };
   }
 
@@ -834,7 +934,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
     if (found === 0 && atBottom()) {
       X.emptyCycles++;
       // Without X's main column there was nothing to look at, which is not the end of the list.
-      if (X.emptyCycles >= 5) stopAll(scopeRoot() ? 'Finished — no more items found' : "X's main column was not found — job stopped");
+      if (X.emptyCycles >= 5) stopAll(scopeRoot() ? `Finished — no more items found${dateNote()}` : "X's main column was not found — job stopped");
     } else {
       X.emptyCycles = 0;
     }
@@ -875,7 +975,7 @@ function runWorker(action, performanceMode, account, useApi = false) {
 
   function apiItems(page, isMe, myId) {
     const tweets = page.tweets || [], users = page.users || [];
-    if (action === 'delete') return tweets.filter(t => isMe(t) && !t.retweetOf).map(t => ({ key: t.id, tweet: t }));
+    if (action === 'delete') return tweets.filter(t => isMe(t) && !t.retweetOf && inDateRange(t.id, t.date)).map(t => ({ key: t.id, tweet: t }));
     if (action === 'unrepost') return tweets.filter(t => isMe(t) && t.retweetOf).map(t => ({ key: t.retweetOf.id, tweet: t.retweetOf }));
     if (action === 'unlike') return tweets.map(t => ({ key: t.id, tweet: t }));
     if (action === 'followVerified' || action === 'followAll') {
@@ -970,8 +1070,15 @@ function runWorker(action, performanceMode, account, useApi = false) {
     }
     if (active()) {
       if (!settled) return fallback('API pass safety limit reached');
-      if (!succeeded) return fallback('No matching items returned by API');
-      await stopAll(`Finished — ${succeeded} ${DONE_VERB[action]} via API`);
+      if (!succeeded) {
+        const found = X.stats[FOUND_KEY[action]] || 0;
+        // Posts were listed, but every one with a readable date was newer than the range.
+        if (dateKept.size && !found) { await stopAll(`Finished — no posts in the date range, nothing deleted${dateNote()}`); return; }
+        // Items were found but none was done (each failed or was already gone): say so, not "none found".
+        if (found) return fallback(`${found} found, none ${DONE_VERB[action]}${dateNote()}`);
+        return fallback(`No matching items returned by API${dateUnreadable.size ? ` (${dateUnreadable.size} without a readable date skipped)` : ''}`);
+      }
+      await stopAll(`Finished — ${succeeded} ${DONE_VERB[action]} via API${dateNote()}`);
     }
   }
 
@@ -1005,6 +1112,12 @@ function runWorker(action, performanceMode, account, useApi = false) {
               const id = tweetId(a);
               if (!id || X.processed.has(id)) continue;
               if (!isMine(a)) { X.processed.add(id); continue; }
+              if (!inDateRange(id, postDate(a, id))) {
+                // A newer post is left for good; one without a readable date is looked at again
+                // next cycle, and is never a candidate while its date cannot be read.
+                if (dateKept.has(id)) X.processed.add(id);
+                continue;
+              }
               const caret = a.querySelector('[data-testid="caret"]');
               if (caret) candidates.push({ article: a, control: caret, id, kind: 'caret' });
             }
@@ -1297,7 +1410,9 @@ function runWorker(action, performanceMode, account, useApi = false) {
     return until ? `X API cooldown. Job suspended; try again after ${new Date(until).toISOString()}.` : null;
   }
   const api = useApi ? globalThis.__xbcApi : null;
-  if (api) {
+  if (filterIssue) {
+    stopAll(filterIssue);
+  } else if (api) {
     runApiJob(api).catch(error => { if (X.interval) stopAll(`Error: ${error?.message || error}`); });
   } else {
     const token = X.interval = { cooldown: true };
@@ -1497,18 +1612,17 @@ async function requestAction(action) {
     previewSessionToEnd = null;
     return;
   }
-  $('confirmTitle').textContent = config.title;
-  $('confirmDescription').textContent = previewSessionToEnd
-    ? `${config.description} Your current Preview & Select scan will end when this action starts.`
-    : config.description;
+  // Only "Delete all posts" offers the date choice.
+  $('dateScope').hidden = action !== 'delete';
+  showDateScopeError('');
+  renderConfirmText();
   $('confirmAccount').textContent = `@${account.username}`;
-  $('confirmStart').textContent = config.button;
   $('confirmStart').classList.toggle('danger', !!config.danger);
   $('confirmIconUse').setAttribute('href', `#${config.icon}`);
   $('confirmDialog').showModal();
 }
 
-async function startAction(action, previewSession = null) {
+async function startAction(action, previewSession = null, dateFilter = null) {
   if (!action || currentAction || isStarting) return;
   isStarting = true;
 
@@ -1576,7 +1690,7 @@ async function startAction(action, previewSession = null) {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: runWorker,
-      args: [action, performanceMode, currentAccount || null, useApi]
+      args: [action, performanceMode, currentAccount || null, useApi, action === 'delete' ? dateFilter : null]
     });
     window.close();
   } catch (e) {
@@ -1813,11 +1927,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('confirmCancel').addEventListener('click', () => $('confirmDialog').close());
   $('confirmStart').addEventListener('click', () => {
     const action = pendingAction;
+    let dateFilter = null;
+    if (action === 'delete') {
+      const scope = readDateScope();
+      // An incomplete date choice keeps the dialog open and starts nothing.
+      if (!scope.ok) {
+        showDateScopeError(scope.error);
+        (dateScopeMode() === 'days' ? $('dateScopeDays') : $('dateScopeDate')).focus();
+        return;
+      }
+      dateFilter = scope.filter;
+    }
     const previewSession = previewSessionToEnd;
     pendingAction = null;
     previewSessionToEnd = null;
     $('confirmDialog').close();
-    startAction(action, previewSession);
+    startAction(action, previewSession, dateFilter);
+  });
+  // Every popup opens on All posts. Typing a date or a number of days picks its option.
+  document.querySelector('input[name="dateScope"][value="all"]').checked = true;
+  $('dateScopeDate').value = '';
+  $('dateScopeDays').value = '';
+  const pickDateScope = (mode) => {
+    if (mode) document.querySelector(`input[name="dateScope"][value="${mode}"]`).checked = true;
+    showDateScopeError('');
+    renderConfirmText();
+  };
+  document.querySelectorAll('input[name="dateScope"]').forEach(input => input.addEventListener('change', () => pickDateScope()));
+  ['input', 'change'].forEach(type => {
+    $('dateScopeDate').addEventListener(type, () => pickDateScope('before'));
+    $('dateScopeDays').addEventListener(type, () => pickDateScope('days'));
   });
   $('confirmDialog').addEventListener('close', () => { pendingAction = null; previewSessionToEnd = null; });
 

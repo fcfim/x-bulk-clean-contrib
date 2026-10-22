@@ -1,7 +1,7 @@
 // End-to-end tests: the real unpacked extension in Chromium, driven through its popup, against
 // the fake x.com in fake-x.mjs. Usage: node test/e2e/run.mjs [scenario-name-filter]
 import { launch, openExtensionPage, storage, waitFor } from './launch.mjs';
-import { createState, installFakeX, fakeQueryIds, ME, scriptedTimeline, seededBundle } from './fake-x.mjs';
+import { createState, installFakeX, fakeQueryIds, ME, scriptedTimeline, seededBundle, xCreatedAt } from './fake-x.mjs';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
@@ -428,6 +428,61 @@ async function stopDuringPace(env, state, before, pressStop) {
   };
 }
 const repliesRequests = state => state.calls.filter(c => c.op === 'UserTweetsAndReplies').map(c => ({ at: c.at, fromPage: !!c.fromPage, id: idLabel(c.path.split('/').at(-2)) }));
+
+// Date choice of "Delete all posts" (VER-636). Posts are dated far from the cutoff, so the
+// browser's time zone cannot move one across it. `dates` gives the first posts their dates.
+const DAY_MS = 86400000;
+const datePosts = (state, dates) => dates.forEach((date, i) => { state.tweets[i].created = typeof date === 'string' && !/^\d{4}-/.test(date) ? date : xCreatedAt(date); });
+const ids = list => list.map(t => t.id).sort().join(',');
+async function readConfirm(popup) {
+  return popup.evaluate(() => {
+    const error = document.getElementById('dateScopeError');
+    return {
+      open: document.getElementById('confirmDialog').open,
+      title: document.getElementById('confirmTitle').textContent,
+      description: document.getElementById('confirmDescription').textContent,
+      button: document.getElementById('confirmStart').textContent,
+      scopeShown: !document.getElementById('dateScope').hidden,
+      choice: document.querySelector('input[name="dateScope"]:checked')?.value || null,
+      error: error.hidden ? '' : error.textContent
+    };
+  });
+}
+// Opens the popup, starts "Delete all posts", reads the dialog on All posts, then picks the date
+// choice. Returns the open popup with both readings; the caller confirms or not.
+async function openDeleteByDate(env, { apiMode = true, mode, date, days } = {}) {
+  const popup = await openExtensionPage(env.context, env.extensionId, 'popup/popup.html');
+  await popup.waitForFunction(() => document.getElementById('accountCard')?.dataset.state === 'ready', null, { timeout: 20000 });
+  await waitFor(async () => !(await storage(env.worker, ['activeAction'])).activeAction, { label: 'previous action state to clear' });
+  await popup.evaluate(on => { const box = document.getElementById('apiMode'); if (box.checked !== on) box.click(); }, apiMode);
+  await popup.evaluate(() => document.getElementById('startDelete').click());
+  await popup.waitForFunction(() => document.getElementById('confirmDialog')?.open, null, { timeout: 10000 });
+  const allPosts = await readConfirm(popup);
+  if (mode === 'before') { await popup.locator('#dateScopeBefore').check(); if (date != null) await popup.locator('#dateScopeDate').fill(date); }
+  if (mode === 'days') { await popup.locator('#dateScopeKeep').check(); if (days != null) await popup.locator('#dateScopeDays').fill(String(days)); }
+  return { popup, allPosts, chosen: await readConfirm(popup) };
+}
+async function deleteByDate(env, options) {
+  const before = (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0;
+  const opened = await openDeleteByDate(env, options);
+  const clickedAt = Date.now();
+  await opened.popup.locator('#confirmStart').click();
+  const job = await waitFor(() => latestJob(env, before), { timeout: 120000, label: 'dated delete job to finish' });
+  const worker = await env.worker.evaluate(async () => {
+    const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+    const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { const X = window.__xCleaner; return X && { mode: X.mode, stats: X.stats, issue: X.issue }; } });
+    return r?.result;
+  });
+  const localMidnight = await opened.popup.evaluate(date => { const [y, m, d] = (date || '2000-01-01').split('-').map(Number); return new Date(y, m - 1, d).toISOString(); }, options.date);
+  await opened.popup.close();
+  return { ...opened, job, worker, clickedAt, localMidnight };
+}
+const xTabHasJob = env => env.worker.evaluate(async () => {
+  const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+  const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => !!window.__xCleaner });
+  return r?.result;
+});
+const ALL_POSTS = 'Every post on your profile will be permanently deleted. A record of each one is saved locally.';
 
 const SCENARIOS = [
   ...[
@@ -2028,6 +2083,169 @@ const SCENARIOS = [
       ];
     }
   })),
+  // "Delete all posts" by date (VER-636): only posts strictly older than the cutoff are deleted,
+  // in API mode and in click mode; a post whose date cannot be read is never deleted; an
+  // incomplete choice starts nothing. API scenarios seed the web bundle cache.
+  {
+    name: 'date filter: API mode deletes only posts before the date, and the dialog names the range',
+    state: { own: 6 },
+    setup: state => datePosts(state, ['2019-03-01T12:00:00Z', '2020-06-15T12:00:00Z', '2021-09-30T12:00:00Z', '2025-02-01T12:00:00Z', '2026-05-20T12:00:00Z', 'not a date']),
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      const [old, newer, undated] = [state.tweets.slice(0, 3), state.tweets.slice(3, 5), state.tweets.slice(5)];
+      const r = await deleteByDate(env, { mode: 'before', date: '2024-01-01' });
+      const deleted = state.calls.filter(c => c.op === 'DeleteTweet').map(c => c.body.variables.tweet_id).sort().join(',');
+      const history = await openExtensionPage(env.context, env.extensionId, 'history/history.html');
+      await history.click('details.job summary', { timeout: 10000 });
+      const facts = await history.locator('.job-facts').textContent({ timeout: 10000 });
+      await history.close();
+      return [
+        ['with All posts the dialog is unchanged', r.allPosts.scopeShown && r.allPosts.choice === 'all' && r.allPosts.title === 'Delete all your posts?' && r.allPosts.description === ALL_POSTS && r.allPosts.button === 'Delete all posts', r.allPosts],
+        ['the dialog names the range in plain words', r.chosen.description.startsWith('Only posts before 1 Jan 2024 will be deleted.') && r.chosen.title === 'Delete your older posts?' && r.chosen.button === 'Delete older posts', r.chosen],
+        ['only the 3 older posts were deleted, by API', r.worker?.mode === 'api' && deleted === ids(old), deleted],
+        ['the newer posts and the one without a readable date are untouched', ids(state.tweets) === ids([...newer, ...undated]), ids(state.tweets)],
+        ['found and deleted count only the posts in the range', r.worker?.stats.found === 3 && r.worker?.stats.deleted === 3, r.worker?.stats],
+        ['history: completed with 3 records, naming what was kept', r.job.status === 'completed' && r.job.total === 3 && /2 newer posts kept, 1 without a readable date skipped/.test(r.job.statusText), { status: r.job.status, total: r.job.total, text: r.job.statusText }],
+        ['the job records the filter: before local midnight of the date', r.job.dateFilter?.mode === 'before' && r.job.dateFilter.date === '2024-01-01' && r.job.dateFilter.before === r.localMidnight && r.job.dateFilter.kept === 2 && r.job.dateFilter.unreadable === 1, r.job.dateFilter],
+        ['the history entry shows the range', /Date range: Only posts before 1 Jan 2024/.test(facts) && /Newer posts kept: 2/.test(facts) && /Skipped, no readable date: 1/.test(facts), facts],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  },
+  {
+    name: 'date filter: click mode deletes only posts before the date, and never one without a readable date',
+    state: { own: 7 },
+    setup: state => {
+      datePosts(state, ['2019-03-01T12:00:00Z', '2020-06-15T12:00:00Z', '2021-09-30T12:00:00Z', '2025-02-01T12:00:00Z', '2026-05-20T12:00:00Z', '2018-01-10T12:00:00Z', 'not a date']);
+      state.tweets[5].timeless = true; // dated 2018, but the page draws no time for it
+    },
+    async run(env, state) {
+      const [old, kept] = [state.tweets.slice(0, 3), state.tweets.slice(3)];
+      const r = await deleteByDate(env, { apiMode: false, mode: 'before', date: '2024-01-01' });
+      const clicked = state.calls.filter(c => c.op === 'dom-delete').map(c => c.id).sort().join(',');
+      return [
+        ['the dialog names the range', r.chosen.description.startsWith('Only posts before 1 Jan 2024 will be deleted.'), r.chosen.description],
+        ['only the 3 older posts were deleted, by clicking', r.worker?.mode === 'dom' && clicked === ids(old) && !state.calls.some(c => c.op === 'DeleteTweet'), clicked],
+        ['newer posts, the post without a time and the one with an unreadable time are untouched', ids(state.tweets) === ids(kept), ids(state.tweets)],
+        ['found and deleted count only the posts in the range', r.worker?.stats.found === 3 && r.worker?.stats.deleted === 3, r.worker?.stats],
+        ['history: completed with 3 records', r.job.status === 'completed' && r.job.total === 3, { status: r.job.status, total: r.job.total, text: r.job.statusText }],
+        ['the job records the filter and what it left', r.job.dateFilter?.mode === 'before' && r.job.dateFilter.kept === 2 && r.job.dateFilter.unreadable === 2, r.job.dateFilter]
+      ];
+    }
+  },
+  {
+    name: 'date filter: keep the last N days deletes only older posts',
+    state: { own: 4 },
+    setup: state => datePosts(state, [Date.now() - 2 * DAY_MS, Date.now() - 5 * DAY_MS, Date.now() - 20 * DAY_MS, Date.now() - 400 * DAY_MS]),
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      const [recent, old] = [state.tweets.slice(0, 2), state.tweets.slice(2)];
+      const r = await deleteByDate(env, { mode: 'days', days: 10 });
+      const deleted = state.calls.filter(c => c.op === 'DeleteTweet').map(c => c.body.variables.tweet_id).sort().join(',');
+      const cutoff = Date.parse(r.job.dateFilter?.before);
+      return [
+        ['the dialog names the range in plain words', r.chosen.description.startsWith('Only posts older than 10 days will be deleted. Posts from the last 10 days stay on your profile.'), r.chosen.description],
+        ['only the 2 posts older than 10 days were deleted', r.worker?.mode === 'api' && deleted === ids(old), deleted],
+        ['the 2 recent posts are untouched', ids(state.tweets) === ids(recent), ids(state.tweets)],
+        ['found and deleted count only the older posts', r.worker?.stats.found === 2 && r.worker?.stats.deleted === 2, r.worker?.stats],
+        ['the cutoff is the start time minus 10 days', r.job.dateFilter?.mode === 'days' && r.job.dateFilter.days === 10 && Math.abs(cutoff - (r.clickedAt - 10 * DAY_MS)) < 60000, r.job.dateFilter],
+        ['history: completed with 2 records', r.job.status === 'completed' && r.job.total === 2 && r.job.dateFilter.kept === 2, { status: r.job.status, total: r.job.total }],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  },
+  {
+    name: 'date filter: an incomplete choice blocks the start and never falls back to all posts',
+    state: { own: 3 },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      const { popup } = await openDeleteByDate(env, { mode: 'before' });
+      const attempts = [];
+      // Stops at the first attempt that closed the dialog: a job may have started, and later
+      // attempts could not reach the date inputs.
+      const attempt = async (label, choose) => {
+        if (attempts.length && !attempts.at(-1).open) return;
+        await choose();
+        await popup.locator('#confirmStart').click();
+        await popup.waitForTimeout(300);
+        const confirm = await readConfirm(popup);
+        // A closed dialog may be a job starting: give it time to record activeAction before reading it.
+        if (!confirm.open) await popup.waitForTimeout(1500);
+        attempts.push({ label, ...confirm, activeAction: (await storage(env.worker, ['activeAction'])).activeAction || null });
+      };
+      await attempt('no date', async () => {});
+      for (const days of ['', '0', '3651', '2.5']) await attempt(`${days || 'no'} days`, async () => { await popup.locator('#dateScopeKeep').check(); await popup.locator('#dateScopeDays').fill(days); });
+      await popup.waitForTimeout(1500);
+      const started = { activeAction: (await storage(env.worker, ['activeAction'])).activeAction || null, history: (await storage(env.worker, ['jobHistory'])).jobHistory?.length || 0, job: await xTabHasJob(env) };
+      await popup.close();
+      const [noDate, ...badDays] = attempts;
+      return [
+        ['all five attempts were made', attempts.length === 5, attempts.map(a => a.label)],
+        ['no attempt started a job', attempts.every(a => !a.activeAction), attempts.map(a => ({ label: a.label, activeAction: a.activeAction }))],
+        ['each attempt kept the dialog open on its date choice, with a message', attempts.every(a => a.open && a.choice !== 'all' && a.error), attempts],
+        ['without a date it asks for one', noDate.choice === 'before' && noDate.error === 'Choose a date first. Nothing was started.', noDate],
+        ['an empty, zero, too large or fractional number of days asks for 1 to 3650', badDays.every(a => a.choice === 'days' && a.error === 'Enter a number of days from 1 to 3650. Nothing was started.'), badDays],
+        ['no job started', !started.activeAction && started.history === 0 && !started.job, started],
+        ['nothing listed, deleted or clicked', state.tweets.length === 3 && !state.calls.some(c => c.op === 'UserTweets' || c.method === 'POST' || c.method === 'DOM'), state.calls.map(c => c.op || c.path)],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  },
+  // Export of the selection before deleting (VER-636): the selected rows only, with the columns of
+  // the history CSV, a byte order mark and formulas kept as text; nothing deleted, selection kept.
+  {
+    name: 'export selection: downloads exactly the selected rows as CSV and deletes nothing',
+    state: { own: 4 },
+    setup: state => { state.tweets[0].text = '=HYPERLINK("http://example.com","x")'; },
+    async run(env, state) {
+      const seeded = await seedSpeedBundle(env, state);
+      const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+      await scanPostsByApi(panel);
+      await panel.waitForFunction(() => /Scan complete/.test(document.getElementById('scanState').textContent) && !document.getElementById('deleteSelected').disabled, null, { timeout: 60000 });
+      const enabled = () => panel.evaluate(() => !document.getElementById('exportSelection').disabled);
+      const allSelected = await enabled();
+      await panel.locator('#selectNone').click();
+      const noneSelected = await enabled();
+      await panel.locator('#selectAll').click();
+      const unselected = state.tweets[2].id;
+      await panel.locator(`.result[data-id="${unselected}"] input`).uncheck();
+      await panel.waitForFunction(() => document.getElementById('selectedCount').textContent === '3 selected', null, { timeout: 5000 });
+      const selection = async () => ({
+        panel: await panel.evaluate(() => document.getElementById('selectedCount').textContent),
+        tab: await env.worker.evaluate(async () => {
+          const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+          const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => window.__xbcPreview.items.map(i => `${i.id}:${i.selected}`).join(',') });
+          return r?.result;
+        })
+      });
+      await waitFor(async () => (await selection()).tab?.includes(`${unselected}:false`), { timeout: 5000, label: 'selection saved in the tab' });
+      const before = await selection();
+      const callsBefore = state.calls.length;
+      const [file] = await Promise.all([panel.waitForEvent('download', { timeout: 10000 }), panel.locator('#exportSelection').click()]);
+      const bytes = fs.readFileSync(await file.path());
+      await panel.waitForTimeout(1000);
+      const after = await selection();
+      const dialogOpen = await panel.evaluate(() => document.getElementById('deleteDialog').open);
+      await panel.close();
+      const text = bytes.toString('utf8').replace(/^﻿/, '');
+      const [header, ...rows] = text.split('\n');
+      const rowIds = rows.map(row => row.match(/\/status\/(\d+),/)?.[1]).join(',');
+      const expected = state.tweets.filter(t => t.id !== unselected);
+      return [
+        ['the button is enabled with a selection and disabled without one', allSelected && !noneSelected, { allSelected, noneSelected }],
+        ['the file name says it is the selection', /^postscrub_selection_tweets_\d{4}-\d{2}-\d{2}\.csv$/.test(file.suggestedFilename()), file.suggestedFilename()],
+        ['the file starts with one UTF-8 byte order mark', bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf && !text.includes('﻿'), [...bytes.subarray(0, 6)]],
+        ['the columns are those of the history CSV', header === 'Type,Date,Content,Author/Username,Display Name,URL,Action,Action Date', header],
+        ['exactly the 3 selected posts, in order, and not the unselected one', rows.length === 3 && rowIds === expected.map(t => t.id).join(','), rows],
+        ['each row has its type, date, author, link and the action "selected"', rows.every((row, i) => row.startsWith(`Post,${new Date(expected[i].created).toISOString()},`) && row.includes(`,me,,https://x.com/me/status/${expected[i].id},selected,`)), rows],
+        ['a formula is kept as text', rows[0].includes(`"'=HYPERLINK(""http://example.com"",""x"")"`), rows[0]],
+        ['the selection is unchanged, in the panel and in the tab', JSON.stringify(after) === JSON.stringify(before) && before.panel === '3 selected', { before, after }],
+        ['nothing deleted and no request to X', state.tweets.length === 4 && state.calls.length === callsBefore && !dialogOpen, { posts: state.tweets.length, calls: state.calls.slice(callsBefore).map(c => c.op || c.path), dialogOpen }],
+        ['no job started', !(await storage(env.worker, ['activeAction'])).activeAction && !((await storage(env.worker, ['jobHistory'])).jobHistory || []).length],
+        ['the web bundle came from the seeded cache, not from X', await bundleKept(env, seeded)]
+      ];
+    }
+  },
   ...(await import('./checkpoint.mjs')).checkpointScenarios()
 ];
 

@@ -5,10 +5,13 @@
 ### Added
 
 - A Speed setting for API mode, in the popup and the side panel: Normal (the default) or Careful, which waits twice as long between actions. There is no faster option, and a stored value below Normal is still paced as Normal.
+- Delete all posts can be limited by date: only posts before a chosen date, or keep the last N days. Only older posts are deleted and counted, in API and click mode; a post whose date cannot be read is skipped, never deleted. The confirmation names the range, an incomplete choice starts nothing, and the job history shows the range and how many newer posts were kept.
+- Export selection (CSV) in Preview & Select: saves the selected items only, with the columns of the job history's CSV, a byte order mark and formulas kept as text. It deletes nothing and leaves the selection as it is.
 
 ### Fixed
 
 - Stop during the pause between two API actions ends it within a second, with no further request, and a job no longer waits a pause after its last item.
+- A Quick Clean run by API that found items but completed none of them (each attempt failed, or the item was already gone) now stops as interrupted with "N found, none deleted" instead of "No matching items returned by API".
 
 ## [0.1.0] - Unreleased
 

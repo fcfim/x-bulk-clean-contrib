@@ -16,7 +16,9 @@ export const ME = { id: '42', screen: 'me', name: 'Test Account' };
 // the xbcBundleOps cache when the URL matches, so a test can seed it instead of fetching it.
 export const BUNDLE_URL = 'https://abs.twimg.com/responsive-web/client-web/main.b09082b07a640734a.js';
 
-const twitterDate = (i) => new Date(Date.UTC(2024, 0, 1 + i, 12)).toUTCString().replace(/^(\w+), (\d+) (\w+) (\d+) ([\d:]+) GMT$/, '$1 $3 $2 $5 +0000 $4');
+// A date as X's API writes created_at ("Mon Jan 01 12:00:00 +0000 2024").
+export const xCreatedAt = (date) => new Date(date).toUTCString().replace(/^(\w+), (\d+) (\w+) (\d+) ([\d:]+) GMT$/, '$1 $3 $2 $5 +0000 $4');
+const twitterDate = (i) => xCreatedAt(Date.UTC(2024, 0, 1 + i, 12));
 
 export function createState({ own = 12, replies = 0, retweets = 0, likes = 0, following = 0, followers = 0, followedBack = 0, pageSize = 7 } = {}) {
   const users = (n, prefix, extra = () => ({})) => Array.from({ length: n }, (_, i) => ({ id: `${prefix}${100 + i}`, screen: `${prefix}${i}`, name: `${prefix.toUpperCase()} ${i}`, ...extra(i) }));
@@ -47,6 +49,9 @@ export function createState({ own = 12, replies = 0, retweets = 0, likes = 0, fo
 //                               instead of inline, or { skip: true } it never asks; the page's
 //                               own request is then recorded with fromPage: true
 //  state.misbehave.emptyNotFound: an unknown query id gets a 404 with an empty body, as X answers
+//  post.created:                a date X cannot parse is sent as is, in the API's created_at and in
+//                               the page's time[datetime]
+//  post.timeless:               the page draws the post without its time element
 const currentIds = (state) => ({ ...QUERY_IDS, ...(state.queryIds || {}) });
 
 // The xbcBundleOps cache entry for the fake page's bundle: X's current operations, without the
@@ -341,7 +346,11 @@ async function render() {
     const mine = !t.retweetOf;
     const author = mine ? '${ME.screen}' : t.retweetOf.screen;
     const id = mine ? t.id : t.retweetOf.id;
-    cell.innerHTML = '<article data-testid="tweet"><div data-testid="User-Name"><a role="link" href="/' + author + '">' + author + '</a> <a href="/' + author + '/status/' + id + '">t</a></div><div data-testid="tweetText">' + (mine ? t.text : t.retweetOf.text) + '</div><button data-testid="caret">…</button></article>';
+    // Like X, the post's time sits in the link to its own status, as an ISO datetime.
+    const created = mine ? t.created : t.retweetOf.created;
+    const when = new Date(created);
+    const stamp = t.timeless || !created ? 't' : '<time datetime="' + (isNaN(when) ? created : when.toISOString()) + '">t</time>';
+    cell.innerHTML = '<article data-testid="tweet"><div data-testid="User-Name"><a role="link" href="/' + author + '">' + author + '</a> <a href="/' + author + '/status/' + id + '">' + stamp + '</a></div><div data-testid="tweetText">' + (mine ? t.text : t.retweetOf.text) + '</div><button data-testid="caret">…</button></article>';
     cell.querySelector('[data-testid="caret"]').onclick = () => openMenu(id, mine);
     list.appendChild(cell);
   }

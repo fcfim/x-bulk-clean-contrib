@@ -147,6 +147,15 @@ async function renderJobDetail(summary, container) {
   ];
   if (Number.isFinite(job.selectedTotal)) factValues.push(['Selected', `${job.selectedTotal}`]);
   if (Number.isFinite(job.skipped)) factValues.push(['Not found', `${job.skipped}`]);
+  // "Delete all posts" limited by date: the range, the newer posts it kept and the posts it
+  // skipped because their date could not be read.
+  const range = job.dateFilter && typeof job.dateFilter === 'object' ? job.dateFilter : null;
+  if (range) {
+    const label = typeof range.label === 'string' && range.label ? range.label : 'posts in the date range';
+    factValues.push(['Date range', range.mode === 'days' ? `Only ${label} (before ${formatDate(range.before)})` : `Only ${label}`]);
+    if (Number.isFinite(range.kept)) factValues.push(['Newer posts kept', `${range.kept}`]);
+    if (range.unreadable > 0) factValues.push(['Skipped, no readable date', `${range.unreadable}`]);
+  }
   factValues.forEach(([label, value]) => {
     const fact = document.createElement('span');
     fact.className = 'fact';

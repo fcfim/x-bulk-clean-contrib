@@ -679,6 +679,51 @@
     }
     .confirm-account .icon { width: 14px; height: 14px; }
     .confirm-account strong { color: var(--ink); font-weight: 700; }
+    .date-scope {
+      min-width: 0;
+      margin: 12px 0 0;
+      padding: 8px 10px 9px;
+      display: grid;
+      gap: 6px;
+      border: 0;
+      border-radius: var(--radius-md);
+      background: var(--surface);
+    }
+    .date-scope[hidden] { display: none; }
+    .date-scope legend {
+      float: left;
+      width: 100%;
+      padding: 0;
+      color: var(--ink-tertiary);
+      font-size: 9px;
+      font-weight: 750;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+    }
+    .date-option {
+      min-height: 28px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--ink);
+      font-size: 12px;
+    }
+    .date-option input[type="radio"] { margin: 0; accent-color: var(--red); }
+    .date-option input[type="date"], .date-option input[type="number"] {
+      height: 28px;
+      min-width: 0;
+      padding: 0 6px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--bg);
+      color: var(--ink);
+      font-size: 11.5px;
+    }
+    .date-option input[type="date"] { flex: 1; }
+    .date-option input.days { width: 64px; }
+    .date-option input:focus-visible { outline: 3px solid rgba(40, 120, 200, 0.16); }
+    .date-scope-error[hidden] { display: none; }
+    .confirm-dialog .date-scope-error { color: var(--red); font-size: 11px; font-weight: 600; }
     .confirm-actions {
       margin-top: 16px;
       display: grid;
@@ -885,6 +930,13 @@
       <div class="confirm-icon" aria-hidden="true"><svg class="icon"><use id="confirmIconUse" href="#icon-trash"/></svg></div>
       <h2 id="confirmTitle">Start this cleanup?</h2>
       <p id="confirmDescription">This action will run automatically until it finishes or you stop it.</p>
+      <fieldset id="dateScope" class="date-scope" hidden>
+        <legend>Posts to delete</legend>
+        <div class="date-option"><input id="dateScopeAll" type="radio" name="dateScope" value="all" autocomplete="off" checked><label for="dateScopeAll">All posts</label></div>
+        <div class="date-option"><input id="dateScopeBefore" type="radio" name="dateScope" value="before" autocomplete="off"><label for="dateScopeBefore">Only posts before</label><input id="dateScopeDate" type="date" autocomplete="off" aria-label="Only posts before this date are deleted"></div>
+        <div class="date-option"><input id="dateScopeKeep" type="radio" name="dateScope" value="days" autocomplete="off"><label for="dateScopeKeep">Keep the last</label><input id="dateScopeDays" class="days" type="number" min="1" max="3650" step="1" inputmode="numeric" autocomplete="off" aria-label="Days of posts to keep, from 1 to 3650"><span>days</span></div>
+        <p id="dateScopeError" class="date-scope-error" role="alert" hidden></p>
+      </fieldset>
       <div class="confirm-account"><svg class="icon" aria-hidden="true"><use href="#icon-user"/></svg><span>Active account: <strong id="confirmAccount">@username</strong></span></div>
       <div class="confirm-actions">
         <button id="confirmCancel" type="button">Cancel</button>
