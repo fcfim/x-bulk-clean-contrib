@@ -656,6 +656,20 @@ export async function testApiLimits() {
     assert.equal(run.result.stats.found, 0); assert.equal(run.job.total, 0);
     assert.match(run.job.statusText, /^Finished — no posts in the date range, nothing deleted; 1 newer post kept, 1 without a readable date skipped$/);
   });
+  await check('date filter: Quick Clean by API whose in-range deletions all fail is not reported as an empty range', async () => {
+    const left = new Map([['old1', 'Fri Mar 01 12:00:00 +0000 2019'], ['new1', 'Sat Feb 01 12:00:00 +0000 2025']]);
+    const h = await harness((index, url) => url.pathname.endsWith('/UserTweets')
+      ? { body: datedPosts([...left.entries()]) }
+      : { status: 500, body: { errors: [{ code: 131, message: 'synthetic internal error' }] } });
+    const result = await deletion(h, false, { action: 'delete', dateFilter: CUTOFF });
+    for (let i = 0; i < 2000; i++) await Promise.resolve();
+    const job = h.store.jobHistory?.[0];
+    assert(h.calls.some(c => c.operation === 'DeleteTweet'), 'the in-range post was tried');
+    assert.equal(result.stats.found, 1); assert.equal(result.stats.deleted || 0, 0);
+    assert.notEqual(job?.status, 'completed', 'a run that deleted nothing it found is not completed');
+    assert.doesNotMatch(job?.statusText || result.issue || '', /no posts in the date range/);
+    assert.match(job?.statusText || result.issue || '', /1 found, none deleted/);
+  });
   for (const [label, dateFilter, action] of [
     ['an unreadable cutoff', { ...CUTOFF, before: 'not a date' }, 'delete'],
     ['a cutoff that is not an ISO time', { ...CUTOFF, before: '1' }, 'delete'],

@@ -2161,11 +2161,14 @@ const SCENARIOS = [
       const seeded = await seedSpeedBundle(env, state);
       const { popup } = await openDeleteByDate(env, { mode: 'before' });
       const attempts = [];
+      // Stops at the first attempt that closed the dialog: a job may have started, and later
+      // attempts could not reach the date inputs.
       const attempt = async (label, choose) => {
+        if (attempts.length && !attempts.at(-1).open) return;
         await choose();
         await popup.locator('#confirmStart').click();
         await popup.waitForTimeout(300);
-        attempts.push({ label, ...(await readConfirm(popup)) });
+        attempts.push({ label, ...(await readConfirm(popup)), activeAction: (await storage(env.worker, ['activeAction'])).activeAction || null });
       };
       await attempt('no date', async () => {});
       for (const days of ['', '0', '3651', '2.5']) await attempt(`${days || 'no'} days`, async () => { await popup.locator('#dateScopeKeep').check(); await popup.locator('#dateScopeDays').fill(days); });
@@ -2174,6 +2177,8 @@ const SCENARIOS = [
       await popup.close();
       const [noDate, ...badDays] = attempts;
       return [
+        ['all five attempts were made', attempts.length === 5, attempts.map(a => a.label)],
+        ['no attempt started a job', attempts.every(a => !a.activeAction), attempts.map(a => ({ label: a.label, activeAction: a.activeAction }))],
         ['each attempt kept the dialog open on its date choice, with a message', attempts.every(a => a.open && a.choice !== 'all' && a.error), attempts],
         ['without a date it asks for one', noDate.choice === 'before' && noDate.error === 'Choose a date first. Nothing was started.', noDate],
         ['an empty, zero, too large or fractional number of days asks for 1 to 3650', badDays.every(a => a.choice === 'days' && a.error === 'Enter a number of days from 1 to 3650. Nothing was started.'), badDays],

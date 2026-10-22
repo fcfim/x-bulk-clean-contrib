@@ -1071,8 +1071,11 @@ function runWorker(action, performanceMode, account, useApi = false, dateFilter 
     if (active()) {
       if (!settled) return fallback('API pass safety limit reached');
       if (!succeeded) {
+        const found = X.stats[FOUND_KEY[action]] || 0;
         // Posts were listed, but every one with a readable date was newer than the range.
-        if (dateKept.size) { await stopAll(`Finished — no posts in the date range, nothing deleted${dateNote()}`); return; }
+        if (dateKept.size && !found) { await stopAll(`Finished — no posts in the date range, nothing deleted${dateNote()}`); return; }
+        // Items were found but none was done (each failed or was already gone): say so, not "none found".
+        if (found) return fallback(`${found} found, none ${DONE_VERB[action]}${dateNote()}`);
         return fallback(`No matching items returned by API${dateUnreadable.size ? ` (${dateUnreadable.size} without a readable date skipped)` : ''}`);
       }
       await stopAll(`Finished — ${succeeded} ${DONE_VERB[action]} via API${dateNote()}`);
