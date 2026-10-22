@@ -178,8 +178,9 @@ export async function installFakeX(context, state, { ct0 = 'csrf-test-token' } =
       // One-shot synthetic responses, including server deadlines. Tests can enqueue these
       // after the page's discovery request, so they target the extension worker alone.
       const forcedResponse = state.misbehave.responses[op]?.shift();
+      // Optional test-only barrier: the answer (forced, or the normal one with pass) waits for it.
+      await forcedResponse?.waitFor;
       if (forcedResponse && !forcedResponse.pass) {
-        await forcedResponse.waitFor; // optional test-only barrier for Stop while a page is in flight
         const headers = { ...(forcedResponse.headers || {}) };
         if (forcedResponse.resetSeconds != null) headers['x-rate-limit-reset'] = String(Math.ceil(Date.now() / 1000) + forcedResponse.resetSeconds);
         return json(route, forcedResponse.status ?? 429, forcedResponse.body || { errors: [{ code: forcedResponse.code ?? 88, message: 'synthetic restriction' }] }, headers);

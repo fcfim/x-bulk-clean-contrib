@@ -194,6 +194,10 @@
           const xhr = this;
           xhr.addEventListener('loadend', () => {
             try {
+              // Checked again when X answers: a scan that ended meanwhile reads nothing. A
+              // request the page aborted, or that failed, has no answer (status 0); like a
+              // fetch that rejects, it is left out, so the page can simply ask again.
+              if (!armed() || !xhr.status) return;
               const header = name => xhr.getResponseHeader(name);
               const type = xhr.responseType;
               const body = type === '' || type === 'text' ? xhr.responseText : type === 'json' ? JSON.stringify(xhr.response) : null;

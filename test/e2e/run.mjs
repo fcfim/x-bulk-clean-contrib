@@ -2104,14 +2104,53 @@ const SCENARIOS = [
       await nextPage();
       const disarmed = await drainCapture(env);
       const disarmedReads = await reads();
+      // Armed when the page asks, disarmed before X answers (a scan that ended meanwhile): the
+      // answer is not read.
+      await page.evaluate(ARM => sessionStorage.setItem('xbcPassiveScan', ARM), ARM);
+      let release;
+      state.misbehave.responses.UserTweetsAndReplies = [{ pass: true, waitFor: new Promise(resolve => { release = resolve; }) }];
+      const asked = pageReplies(state).length, drawn = await posts();
+      await scrollPage(env);
+      await waitFor(() => pageReplies(state).length > asked, { timeout: 10000, interval: 50, label: 'the held page request' });
+      await page.evaluate(() => sessionStorage.removeItem('xbcPassiveScan'));
+      release();
+      await waitFor(async () => (await posts()) > drawn, { timeout: 10000, interval: 50, label: 'the held page drawn' });
+      await settle();
+      const inFlight = await drainCapture(env);
+      const inFlightReads = await reads();
+      const pageRequests = repliesRequests(state);
+      // Armed, a request the page aborts has no answer: like a fetch that rejects, it is not
+      // handed to the scan (which would stop it), so the page can simply ask again.
+      await page.evaluate(ARM => sessionStorage.setItem('xbcPassiveScan', ARM), ARM);
+      await page.evaluate(async ({ transport, queryId }) => {
+        const url = '/i/api/graphql/' + queryId + '/UserTweetsAndReplies?' + new URLSearchParams({ variables: JSON.stringify({ userId: '42', count: 20 }), features: '{}' });
+        if (transport === 'fetch') {
+          const controller = new AbortController();
+          const asking = fetch(url, { signal: controller.signal, headers: { 'x-client-transaction-id': 'test-abort' } });
+          controller.abort();
+          await asking.catch(() => {});
+          return;
+        }
+        const request = new XMLHttpRequest();
+        request.open('GET', url);
+        request.setRequestHeader('x-client-transaction-id', 'test-abort');
+        request.responseType = transport === 'json' ? 'json' : '';
+        await new Promise(resolve => { request.addEventListener('loadend', resolve); request.send(); request.abort(); });
+      }, { transport, queryId: fakeQueryIds.UserTweetsAndReplies });
+      await settle();
+      const aborted = await drainCapture(env);
+      await page.evaluate(() => sessionStorage.removeItem('xbcPassiveScan'));
       return [
         ['capture.js marks the tab', marker.capture === '2', marker.capture],
-        ['the page asked by ' + (transport === 'fetch' ? 'fetch' : 'XMLHttpRequest') + ' for each of its 4 pages', pageReplies(state).length === 4 && extensionReplies(state).length === 0, repliesRequests(state)],
+        ['the page asked by ' + (transport === 'fetch' ? 'fetch' : 'XMLHttpRequest') + ' for each of its 5 pages', pageRequests.length === 5 && pageRequests.every(r => r.fromPage), pageRequests],
         ['unarmed: no response body cloned or read by anyone but the page', total(unarmedReads) === 0 && !/my reply/.test(marker.api), unarmedReads],
         ['unarmed, then armed with no new response: a drain hands over nothing', armedAfter.length === 0 && unarmed.length === 0, { armedAfter: armedAfter.length, unarmed: unarmed.length }],
         ['armed: the page\'s own response is handed over, for this account, with its status and cursor', armed.length === 1 && armed[0].status === 200 && armed[0].userId === ME.id && armed[0].cursor && /my reply/.test(armed[0].body) && !('headers' in armed[0]) && !armed[0].unreadable, armed.map(a => ({ ...a, body: a.body?.length }))],
         ['armed: the read is seen by the counters (so they would see an unarmed one)', (transport === 'fetch' ? armedReads.fetch : armedReads.xhr) > 0, armedReads],
-        ['disarmed again: nothing read or handed over', disarmed.length === 0 && total(disarmedReads) === total(armedReads), { disarmed: disarmed.length, armedReads, disarmedReads }]
+        ['disarmed again: nothing read or handed over', disarmed.length === 0 && total(disarmedReads) === total(armedReads), { disarmed: disarmed.length, armedReads, disarmedReads }],
+        ['disarmed while X answers: the answer is not read', inFlight.length === 0 && total(inFlightReads) === total(disarmedReads), { inFlight: inFlight.length, disarmedReads, inFlightReads }],
+        ['armed, a request the page aborts hands nothing to the scan', aborted.length === 0, aborted],
+        ['no request of the extension', extensionReplies(state).length === 0, extensionReplies(state)]
       ];
     }
   })),
