@@ -312,47 +312,67 @@ async function readFault(env) {
   });
 }
 
-// "Find & delete replies" with API mode on (VER-624). X builds change the UserTweetsAndReplies
-// query id; the page asks for its replies with the new id, sometimes only after the extension
-// started. The bundle is seeded, so these scenarios never fetch X's real main.js.
+// Replies in API mode (VER-624, VER-899). X refuses UserTweetsAndReplies without the
+// x-client-transaction-id its own page makes, so the scan reads the responses to the page's own
+// requests and never sends one. Each scenario seeds the web bundle cache, so no request reaches
+// X's CDN.
 const ROTATED_UTR = 'RotatedRepliesQueryId001';
 const FALLBACK_UTR = fakeQueryIds.UserTweetsAndReplies; // the fake's default ids are the extension's built-in ones
-const REPORTED_404 = 'Scan interrupted after 0 items: HTTP 404. Try again with API, or turn off API mode and start a new scan.';
 const idLabel = queryId => queryId === ROTATED_UTR ? 'rotated' : queryId === FALLBACK_UTR ? 'fallback' : 'other';
-const rotatedReplies = (pageRequest) => (state) => {
-  state.queryIds = { UserTweetsAndReplies: ROTATED_UTR };
-  state.pageRequest = pageRequest;
-  state.misbehave.emptyNotFound = true;
-};
 async function seedBundle(env, state, options) {
   await env.worker.evaluate(bundle => chrome.storage.local.set({ xbcBundleOps: bundle }), seededBundle(state, options));
 }
-async function scanRepliesByApi(env, state) {
+const repliesRequests = state => state.calls.filter(c => c.op === 'UserTweetsAndReplies').map(c => ({ at: c.at, fromPage: !!c.fromPage, refused: !!c.refused, cursor: c.variables?.cursor || null, id: idLabel(c.path.split('/').at(-2)) }));
+const extensionReplies = state => repliesRequests(state).filter(c => !c.fromPage);
+const pageReplies = state => repliesRequests(state).filter(c => c.fromPage);
+const cooldownKeys = async env => Object.keys(await env.worker.evaluate(() => chrome.storage.local.get(null))).filter(key => key.startsWith('xbcApiCooldown:'));
+// The arm record the scan keeps in the X tab's sessionStorage, read in the page's own world.
+const passiveArm = env => xPage(env).evaluate(() => sessionStorage.getItem('xbcPassiveScan'));
+// Asks capture.js, from the page's own world, for what it holds, as a scan would: each record it
+// hands over (parsed), so a test can tell whether X's responses were read.
+const drainCapture = env => xPage(env).evaluate(() => {
+  const got = [];
+  const listen = event => got.push(JSON.parse(event.detail));
+  document.addEventListener('xbc:passive-record', listen);
+  document.dispatchEvent(new CustomEvent('xbc:passive-drain'));
+  document.removeEventListener('xbc:passive-record', listen);
+  return got;
+});
+// Scrolls X's page to its bottom, as a person would, so the Replies page asks for its next page.
+const scrollPage = env => xPage(env).evaluate(() => { window.scrollTo(0, document.documentElement.scrollHeight); window.dispatchEvent(new Event('scroll')); });
+async function scanReplies(env, { replyScope = 'fast', apiMode = true } = {}) {
   const panel = await openExtensionPage(env.context, env.extensionId, 'sidepanel/sidepanel.html');
+  await panel.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
+  const clicked = Date.now();
+  await panel.evaluate(({ replyScope, apiMode }) => {
+    document.querySelector('input[name="previewType"][value="replies"]').click();
+    document.querySelector(`input[name="replyScope"][value="${replyScope}"]`).click();
+    const box = document.getElementById('previewApi');
+    if (box.checked !== apiMode) box.click();
+    document.getElementById('startScan').click();
+  }, { replyScope, apiMode });
+  return { panel, clicked };
+}
+// Waits for the scan to end, however it ends, and reads it from the X tab.
+async function scanEnd(env, panel, timeout = 90000) {
+  await panel.waitForFunction(() => document.getElementById('stopScan')?.textContent === 'New scan' && !/^Scanning/.test(document.getElementById('scanState')?.textContent || ''), null, { timeout });
+  const shown = await panel.evaluate(() => document.getElementById('scanState').textContent);
+  const scan = await env.worker.evaluate(async () => {
+    const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
+    const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
+      const P = window.__xbcPreview;
+      return P && { mode: P.mode, passive: !!P.passive, done: P.done, running: !!P.interval, issue: P.issue, startedAt: P.startedAt,
+        items: P.items.map(i => ({ id: i.id, type: i.type, classification: i.classification })) };
+    } });
+    return r?.result;
+  });
+  return { shown, scan };
+}
+async function scanRepliesByApi(env, state, options) {
+  const { panel, clicked } = await scanReplies(env, options);
   try {
-    await panel.waitForFunction(() => !document.getElementById('startScan').disabled, null, { timeout: 20000 });
-    const clicked = Date.now();
-    await panel.evaluate(() => {
-      document.querySelector('input[name="previewType"][value="replies"]').click();
-      document.querySelector('input[name="replyScope"][value="fast"]').click();
-      const box = document.getElementById('previewApi');
-      if (!box.checked) box.click();
-      document.getElementById('startScan').click();
-    });
-    await panel.waitForFunction(() => /Scan complete|Scan interrupted|Scan stopped/.test(document.getElementById('scanState')?.textContent || ''), null, { timeout: 60000 });
-    const seconds = (Date.now() - clicked) / 1000;
-    const scan = await env.worker.evaluate(async () => {
-      const [tab] = await chrome.tabs.query({ url: ['https://x.com/*'] });
-      const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
-        const P = window.__xbcPreview;
-        return P && { mode: P.mode, done: P.done, running: !!P.interval, issue: P.issue, startedAt: P.startedAt, items: P.items.length,
-          replies: P.items.filter(i => i.classification === 'definite').length, source: globalThis.__xbcApi?.sources().UserTweetsAndReplies || null };
-      } });
-      return r?.result;
-    });
-    // Only the cached id and its source: the cache also holds the bearer, which is never shown.
-    const entry = (await storage(env.worker, ['xbcApiCache'])).xbcApiCache?.ops?.UserTweetsAndReplies;
-    return { scan, seconds, cached: entry ? { id: idLabel(entry.queryId), source: entry.source ?? null } : null };
+    const { shown, scan } = await scanEnd(env, panel);
+    return { shown, scan, clicked, seconds: (Date.now() - clicked) / 1000 };
   } finally {
     await panel.close();
   }
@@ -427,7 +447,6 @@ async function stopDuringPace(env, state, before, pressStop) {
     lingered: sleeps.length ? Math.max(...sleeps.map(s => s.at + s.ms)) - job.completedAt : null
   };
 }
-const repliesRequests = state => state.calls.filter(c => c.op === 'UserTweetsAndReplies').map(c => ({ at: c.at, fromPage: !!c.fromPage, id: idLabel(c.path.split('/').at(-2)) }));
 
 // Date choice of "Delete all posts" (VER-636). Posts are dated far from the cutoff, so the
 // browser's time zone cannot move one across it. `dates` gives the first posts their dates.
@@ -1046,12 +1065,32 @@ const SCENARIOS = [
     name: 'preview: replies only, exact from the API',
     state: { own: 4, replies: 5, pageSize: 3 },
     async run(env, state) {
+      // VER-899: read from the responses to X's own page requests, page after page; none sent.
+      await seedBundle(env, state);
       const r = await previewAndAct(env, 'replies', { replyScope: 'fast' });
+      const page = pageReplies(state);
       return [
         ['scan ran via API', r.scan?.mode === 'api', r.scan],
         ['5 replies found, none of the other person\'s posts', r.scan?.items.length === 5 && r.scan.items.every(i => i.classification === 'definite' && /^8/.test(i.id)), r.scan?.items],
-        ['replies deleted, posts kept', state.tweets.filter(t => t.replyTo).length === 0 && state.tweets.length === 4, state.tweets.length],
+        ['X\'s page asked for every page itself, with its transaction id', page.length === 3 && page.every(c => !c.refused) && page.filter(c => c.cursor).length === 2, page],
+        ['the extension never asked for the replies list', extensionReplies(state).length === 0, extensionReplies(state)],
+        ['replies deleted by id, posts kept', state.calls.filter(c => c.op === 'DeleteTweet').length === 5 && state.tweets.filter(t => t.replyTo).length === 0 && state.tweets.length === 4, state.tweets.length],
         ['history: 5 replies', r.job.counts.replies === 5, r.job.counts]
+      ];
+    }
+  },
+  {
+    name: 'preview: posts + replies read from X\'s page include standalone posts',
+    state: { own: 4, replies: 5, pageSize: 3 },
+    async run(env, state) {
+      await seedBundle(env, state);
+      const r = await previewAndAct(env, 'replies', { replyScope: 'all' });
+      const items = r.scan?.items || [];
+      return [
+        ['scan ran via API', r.scan?.mode === 'api', r.scan],
+        ['5 replies and the 4 standalone posts', items.length === 9 && items.filter(i => i.classification === 'definite').length === 5 && items.filter(i => i.classification === 'standalone' && /^9/.test(i.id)).length === 4, items],
+        ['the extension never asked for the replies list', extensionReplies(state).length === 0 && pageReplies(state).length === 3, repliesRequests(state)],
+        ['everything selected deleted', state.tweets.length === 0 && r.job.total === 9, { left: state.tweets.length, job: r.job.total }]
       ];
     }
   },
@@ -1892,57 +1931,184 @@ const SCENARIOS = [
     }
   },
   {
-    name: 'replies api 404: a scan that starts before the page asks for its replies waits and uses the page id',
+    name: 'replies passive: a new query id and a late page request still list every reply, with no request of the extension',
     state: { own: 2, replies: 5, pageSize: 3 },
-    setup: rotatedReplies({ delay: 2500 }),
+    setup: (state) => { state.queryIds = { UserTweetsAndReplies: ROTATED_UTR }; state.pageRequest = { delay: 2500 }; state.misbehave.emptyNotFound = true; },
     async run(env, state) {
       await seedBundle(env, state, { omit: ['UserTweetsAndReplies'] });
       const r = await scanRepliesByApi(env, state);
       const requests = repliesRequests(state);
       return [
-        ['the scan does not end with the reported HTTP 404', r.scan?.issue !== REPORTED_404, r.scan?.issue],
-        ['the scan completes with every reply', r.scan?.mode === 'api' && r.scan.done && r.scan.issue === 'Scan complete' && r.scan.replies === 5 && r.scan.items === 5, r.scan],
-        ['the id is reported, and cached, as taken from the page', r.scan?.source === 'page' && r.cached?.source === 'page' && r.cached.id === 'rotated', { source: r.scan?.source, cached: r.cached }],
-        ['no request ever carries the fallback id', requests.length > 1 && requests.every(c => c.id !== 'fallback'), requests],
-        ["the extension asked only after the page's own request", requests.some(c => c.fromPage) && requests.filter(c => !c.fromPage).every(c => c.at >= requests.find(p => p.fromPage).at), requests]
+        ['the scan completes with every reply', r.scan?.mode === 'api' && r.scan.done && r.scan.issue === 'Scan complete' && r.scan.items.length === 5 && r.scan.items.every(i => i.classification === 'definite'), r.scan],
+        ['every request came from X\'s page, with its own id', requests.length >= 3 && requests.every(c => c.fromPage && c.id === 'rotated' && !c.refused), requests]
       ];
     }
   },
   {
-    name: 'replies api 404: with the id in the bundle the scan does not wait for the page',
+    name: 'replies passive: a tab already on the Replies page is loaded again so its first page is read',
+    state: { own: 0, replies: 7, pageSize: 3 },
+    async run(env, state) {
+      await seedBundle(env, state);
+      await xPage(env).goto('https://x.com/me/with_replies');
+      await xPage(env).waitForFunction(() => document.querySelectorAll('article[data-testid="tweet"]').length >= 6, null, { timeout: 15000 });
+      const r = await scanRepliesByApi(env, state);
+      const again = pageReplies(state).filter(c => c.at >= r.clicked);
+      return [
+        ['the scan completes with all 7 replies, the first page included', r.scan?.done && r.scan.issue === 'Scan complete' && r.scan.items.length === 7 && ['81000', '81001', '81002'].every(id => r.scan.items.some(i => i.id === id)), r.scan],
+        ['the page asked for its first page again after the scan started', again.length === 3 && !again[0].cursor, again],
+        ['the extension never asked for the replies list', extensionReplies(state).length === 0, extensionReplies(state)]
+      ];
+    }
+  },
+  {
+    name: 'replies passive: when X\'s page never asks, the scan stops without claiming completion',
     state: { own: 2, replies: 5, pageSize: 3 },
-    setup: rotatedReplies({ delay: 2500 }),
+    setup: (state) => { state.pageRequest = { skip: true }; },
     async run(env, state) {
       await seedBundle(env, state);
       const r = await scanRepliesByApi(env, state);
-      await waitFor(() => state.calls.some(c => c.op === 'UserTweetsAndReplies' && c.fromPage), { timeout: 15000, label: "the page's own delayed request" }).catch(() => null);
-      const requests = repliesRequests(state);
-      const first = requests.find(c => !c.fromPage), page = requests.find(c => c.fromPage);
       return [
-        ['the scan completes with every reply', r.scan?.mode === 'api' && r.scan.done && r.scan.issue === 'Scan complete' && r.scan.replies === 5, r.scan],
-        ['the id came from the bundle', r.scan?.source === 'bundle', r.scan?.source],
-        ["the extension's first request went before the page's delayed one", !!first && !!page && first.at < page.at, requests],
-        ['no request ever carries the fallback id', requests.every(c => c.id !== 'fallback'), requests]
+        ['the scan stops after about 20 s and says why', /^Scan stopped after 0 items: X's page did not load your replies within 20 s\./.test(r.scan?.issue || '') && r.shown === r.scan.issue && r.seconds >= 20 && r.seconds < 60, { issue: r.scan?.issue, seconds: r.seconds }],
+        ['not complete, nothing listed', r.scan?.mode === 'api' && !r.scan.done && !r.scan.running && r.scan.items.length === 0, r.scan],
+        ['no replies request at all, and nothing deleted or clicked', repliesRequests(state).length === 0 && !state.calls.some(c => c.method === 'POST' || c.method === 'DOM') && state.tweets.length === 7, state.calls.map(c => c.op || c.path)],
+        ['the tab is disarmed', (await passiveArm(env)) === null]
       ];
     }
   },
   {
-    name: 'replies api 404: when the page never asks, the scan stops naming the operation, the status and the id source',
+    name: 'replies passive: a refused page response (HTTP 404) stops with the reason and no cooldown',
     state: { own: 2, replies: 5, pageSize: 3 },
-    setup: rotatedReplies({ skip: true }),
+    setup: (state) => { state.misbehave.responses.UserTweetsAndReplies = [{ status: 404, body: { errors: [{ code: 34, message: 'Sorry, that page does not exist.' }] } }]; },
     async run(env, state) {
-      await seedBundle(env, state, { omit: ['UserTweetsAndReplies'] });
-      const tweets = state.tweets.length;
+      await seedBundle(env, state);
       const r = await scanRepliesByApi(env, state);
-      const requests = repliesRequests(state);
-      const sent = requests.filter(c => !c.fromPage);
-      const waited = sent[0] && r.scan ? sent[0].at - r.scan.startedAt : null;
       return [
-        ['the scan ends naming UserTweetsAndReplies, HTTP 404 and the fallback id', r.scan?.issue === 'Scan interrupted after 0 items: X did not accept the request for UserTweetsAndReplies (HTTP 404, id source: fallback). Start a new scan to try the API again, or turn off API mode to scan by clicking.', r.scan?.issue],
-        ['it waited about 8 s for the page, no longer', waited >= 7900 && waited <= 9500, { waited, seconds: r.seconds }],
-        ['one request, with the fallback id; the page sent none', sent.length === 1 && sent[0].id === 'fallback' && sent.length === requests.length, requests],
-        ['no click scan and no deletion', r.scan?.mode === 'api' && !r.scan.done && !r.scan.running && !state.calls.some(c => /^dom-/.test(c.op || '') || c.method === 'POST') && state.tweets.length === tweets, { mode: r.scan?.mode, done: r.scan?.done, tweets: state.tweets.length }],
-        ['no fallback-sourced UserTweetsAndReplies cached', !r.cached || (r.cached.source !== 'fallback' && r.cached.id !== 'fallback'), r.cached]
+        ['the scan names X\'s refusal and its status', r.scan?.issue === 'Scan stopped after 0 items: X refused its own request for your replies (HTTP 404, X code 34)' && r.shown === r.scan.issue, r.scan?.issue],
+        ['not complete', r.scan?.done === false && !r.scan.running, r.scan],
+        ['no cooldown written and no request of the extension', (await cooldownKeys(env)).length === 0 && extensionReplies(state).length === 0 && pageReplies(state).length === 1, { keys: await cooldownKeys(env), requests: repliesRequests(state) }]
+      ];
+    }
+  },
+  {
+    name: 'replies passive: X\'s rate limit on the page\'s request stops with the reset time',
+    state: { own: 0, replies: 7, pageSize: 3 },
+    setup: (state) => { state.misbehave.responses.UserTweetsAndReplies = [{ pass: true }, { status: 429, code: 88, resetSeconds: 600 }]; },
+    async run(env, state) {
+      await seedBundle(env, state);
+      const r = await scanRepliesByApi(env, state);
+      return [
+        ['the scan names the rate limit and when X allows more', /^Scan stopped after 3 items: X's rate limit stopped X's page from loading your replies; X allows more after \d{1,2}:\d{2}/.test(r.scan?.issue || ''), r.scan?.issue],
+        ['the first page is kept for review, not complete', r.scan?.done === false && r.scan.items.length === 3, r.scan],
+        ['no cooldown written and no request of the extension', (await cooldownKeys(env)).length === 0 && extensionReplies(state).length === 0, { keys: await cooldownKeys(env) }]
+      ];
+    }
+  },
+  {
+    name: 'replies passive: Stop mid-scan stops scrolling, disarms the tab and adds no late replies',
+    state: { own: 0, replies: 12, pageSize: 2 },
+    setup: (state) => { state.dom = { recordScroll: true }; },
+    async run(env, state) {
+      await seedBundle(env, state);
+      const { panel } = await scanReplies(env);
+      const during = await waitFor(async () => { const p = await readPreview(env); return p?.running && p.ids.length >= 4 && p.ids.length < 12 ? p : null; }, { timeout: 30000, interval: 100, label: 'a scan past its first scroll' });
+      await panel.evaluate(() => document.getElementById('stopScan').click());
+      const stopped = await waitFor(async () => { const p = await readPreview(env); return p && !p.running ? p : null; }, { timeout: 10000, label: 'the stopped scan' });
+      const scrolls = () => state.calls.filter(c => c.op === 'scroll').length;
+      const scrollsAtStop = scrolls();
+      await new Promise(resolve => setTimeout(resolve, 4000));
+      const scrollsLater = scrolls();
+      const arm = await passiveArm(env);
+      // A late response: the page asks for its next page after the scan stopped.
+      const pageBefore = pageReplies(state).length;
+      await scrollPage(env);
+      await waitFor(() => pageReplies(state).length > pageBefore, { timeout: 10000, label: 'a late page request' });
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      const after = await readPreview(env);
+      const held = await drainCapture(env);
+      await panel.close();
+      return [
+        ['stopped by the user mid-list', stopped.issue === 'Scan stopped by user' && !stopped.done && during.ids.length >= 4, { during, stopped }],
+        ['the scan scrolled the page, and no more after Stop', scrollsAtStop > 0 && scrollsLater === scrollsAtStop, { scrollsAtStop, scrollsLater }],
+        ['the arm is removed from the tab', arm === null, arm],
+        ['the late response is neither added nor held', JSON.stringify(after?.ids) === JSON.stringify(stopped.ids) && held.length === 0, { stopped: stopped.ids, after: after?.ids, held: held.length }],
+        ['the extension never asked for the replies list', extensionReplies(state).length === 0, extensionReplies(state)]
+      ];
+    }
+  },
+  {
+    name: 'replies passive: without an armed scan, the Replies page\'s responses are not read',
+    state: { own: 0, replies: 6, pageSize: 2 },
+    async run(env, state) {
+      const page = xPage(env);
+      await page.goto('https://x.com/me/with_replies');
+      await page.waitForFunction(() => document.querySelectorAll('article[data-testid="tweet"]').length >= 4, null, { timeout: 15000 });
+      const unarmed = await drainCapture(env);
+      const marker = await page.evaluate(() => ({ capture: document.documentElement.dataset.xbcCapture, api: document.documentElement.dataset.xbcApi || '' }));
+      // Control: armed by hand in the page, the next page's response is read and handed over.
+      await page.evaluate(() => sessionStorage.setItem('xbcPassiveScan', JSON.stringify({ id: 'test', until: Date.now() + 60000 })));
+      let count = pageReplies(state).length;
+      await scrollPage(env);
+      await waitFor(() => pageReplies(state).length > count, { timeout: 10000, label: 'the next page request' });
+      const armed = await waitFor(async () => { const got = await drainCapture(env); return got.length ? got : null; }, { timeout: 10000, label: 'an armed read' }).catch(() => []);
+      // Disarmed again: the following response is not read.
+      await page.evaluate(() => sessionStorage.removeItem('xbcPassiveScan'));
+      count = pageReplies(state).length;
+      await scrollPage(env);
+      await waitFor(() => pageReplies(state).length > count, { timeout: 10000, label: 'another page request' });
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const disarmed = await drainCapture(env);
+      return [
+        ['capture.js marks the tab', marker.capture === '2', marker.capture],
+        ['unarmed: nothing read from the page\'s responses', unarmed.length === 0 && !/my reply/.test(marker.api), { unarmed: unarmed.length }],
+        ['armed: the page\'s own response is handed over, for this account, with its status and cursor', armed.length === 1 && armed[0].status === 200 && armed[0].userId === ME.id && armed[0].cursor && /my reply/.test(armed[0].body) && !('headers' in armed[0]), armed.map(a => ({ ...a, body: a.body?.length }))],
+        ['disarmed again: nothing read', disarmed.length === 0, disarmed.length],
+        ['no request of the extension', extensionReplies(state).length === 0]
+      ];
+    }
+  },
+  {
+    name: 'replies passive: an X tab signed in to another account stops before listing',
+    state: { own: 0, replies: 5, pageSize: 3 },
+    setup: (state) => { state.dom = { switchedAccount: 'other' }; },
+    async run(env, state) {
+      await seedBundle(env, state);
+      const r = await scanRepliesByApi(env, state);
+      return [
+        ['the scan stops naming both accounts', r.scan?.issue === 'This tab is signed in to @other, not @me — scan stopped', r.scan?.issue],
+        ['nothing listed, not complete', r.scan?.items.length === 0 && !r.scan.done, r.scan],
+        ['the tab is disarmed and the extension asked nothing', (await passiveArm(env)) === null && extensionReplies(state).length === 0]
+      ];
+    }
+  },
+  {
+    name: 'replies passive: a Replies page that moved to another profile stops before listing',
+    state: { own: 0, replies: 5, pageSize: 3 },
+    setup: (state) => { state.dom = { repliesMovedTo: '/someone/with_replies' }; },
+    async run(env, state) {
+      await seedBundle(env, state);
+      const r = await scanRepliesByApi(env, state);
+      return [
+        ['the scan stops: not your Replies page', r.scan?.issue === 'Scan stopped: this is not your Replies page (@me), so nothing was listed', r.scan?.issue],
+        ['nothing listed, not complete', r.scan?.items.length === 0 && !r.scan.done, r.scan],
+        ['the tab is disarmed and the extension asked nothing', (await passiveArm(env)) === null && extensionReplies(state).length === 0]
+      ];
+    }
+  },
+  {
+    name: 'replies passive: the simulated X refuses the replies list without the page\'s transaction id',
+    state: { own: 0, replies: 2, pageSize: 3 },
+    async run(env, state) {
+      const ask = withTransaction => xPage(env).evaluate(async ({ withTransaction, bearer }) => {
+        const params = new URLSearchParams({ variables: JSON.stringify({ userId: '42', count: 20 }), features: '{}' });
+        const headers = { authorization: `Bearer ${bearer}`, 'x-csrf-token': document.cookie.match(/ct0=([^;]+)/)[1], 'x-twitter-auth-type': 'OAuth2Session' };
+        if (withTransaction) headers['x-client-transaction-id'] = 'test-stand-in';
+        const response = await fetch('/i/api/graphql/bnsYxFljT6y98rFwiGr3fw/UserTweetsAndReplies?' + params, { headers });
+        return { status: response.status, body: await response.text() };
+      }, { withTransaction, bearer: 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA' });
+      const without = await ask(false), withHeader = await ask(true);
+      return [
+        ['without the header: HTTP 404 with an empty body', without.status === 404 && without.body === '', without],
+        ['with the header: the list', withHeader.status === 200 && /my reply/.test(withHeader.body), withHeader.status]
       ];
     }
   },

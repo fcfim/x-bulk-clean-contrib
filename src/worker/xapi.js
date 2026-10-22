@@ -1,6 +1,9 @@
 // Client for X's own web API, injected into the X tab (isolated world) before a worker runs.
 // It sends the same requests x.com's web app sends when you click, so a job needs neither a
-// rendered page nor scrolling: it keeps running in a background tab.
+// rendered page nor scrolling: it keeps running in a background tab. The one exception is the
+// replies list (UserTweetsAndReplies): X accepts it only with an x-client-transaction-id made by
+// its own page, so it is never requested here (pages() refuses it, PASSIVE_ONLY); the Preview &
+// Select scan reads the responses to the page's own requests instead (inject/capture.js, ADR 0002).
 //
 // Request shapes come from X's web bundle (main.js): GraphQL at /i/api/graphql/<queryId>/<Op>,
 // mutations as POST {variables, queryId}, queries as GET with variables/features/fieldToggles,
@@ -22,7 +25,6 @@
     DeleteRetweet: 'ZyZigVsNiFO6v1dEks1eWg',
     UnfavoriteTweet: 'ZYKSe-w7KEslx3JhSIk5LA',
     UserTweets: '7_KBXBpG0zBPRN6UCIV0-w',
-    UserTweetsAndReplies: 'bnsYxFljT6y98rFwiGr3fw',
     Likes: 'mu4us66Q6RRNOywVQhGtRg',
     Following: 'ath0FIohYC_c3Hj3SsxoCg',
     Followers: 'stpzFPAIZ2qv8s2lRzPOnQ',
@@ -32,7 +34,6 @@
   // skipped when parsing). User lists send no fieldToggles at all.
   const LIST_DEFAULT_VARIABLES = {
     UserTweets: { count: 20, includePromotedContent: true, withQuickPromoteEligibilityTweetFields: true, withVoice: true },
-    UserTweetsAndReplies: { count: 20, includePromotedContent: true, withCommunity: true, withQuickPromoteEligibilityTweetFields: true, withVoice: true },
     Likes: { count: 20, includePromotedContent: false, withClientEventToken: false, withBirdwatchNotes: false, withVoice: true },
     Following: { count: 20, includePromotedContent: false, withGrokTranslatedBio: false },
     Followers: { count: 20, includePromotedContent: false, withGrokTranslatedBio: false },
@@ -40,7 +41,6 @@
   };
   const LIST_FIELD_TOGGLES = {
     UserTweets: { withPayments: false, withArticlePlainText: false },
-    UserTweetsAndReplies: { withPayments: false, withArticlePlainText: false },
     Likes: { withPayments: false, withArticlePlainText: false }
   };
   // Feature values of the build this was written against (its logged-out config), used only for
@@ -564,6 +564,9 @@
     return { tweets, users, bottom, terminated, recognized: groups > 0 && !invalid, partial: partial || groups > 1 };
   }
 
+  // Lists that are read only from the page's own responses, never requested (VER-899).
+  const PASSIVE_ONLY = new Set(['UserTweetsAndReplies']);
+
   const paginationError = (reason, message, kind = 'incomplete') => {
     const error = new Error(message);
     error.result = { kind, reason, message };
@@ -578,6 +581,9 @@
   // Normal return means an explicit bottom termination in a recognized timeline.
   // Every incomplete/cancelled path throws, so callers cannot mistake it for completion.
   async function* pages(name, { isActive, onWait, pause = 900 } = {}) {
+    // Before any wait or request: X refuses this list without its page's transaction id, and
+    // Postscrub never makes or copies that header.
+    if (PASSIVE_ONLY.has(name)) throw paginationError('passive_only', `${name} is read from X's own page, never requested by Postscrub`, 'refused');
     graphql(name);
     const job = state.job;
     await pageListOp(name, isActive);
